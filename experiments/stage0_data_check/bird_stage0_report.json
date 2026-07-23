@@ -1,0 +1,55 @@
+{
+  "bird_dir": "Data\\BIRD",
+  "exists": true,
+  "train": {
+    "split": "train",
+    "json_path": "Data\\BIRD\\train.json",
+    "db_root": "Data\\BIRD\\train_databases",
+    "record_count": 9428,
+    "unique_db_count": 69,
+    "sqlite_file_count": 69,
+    "missing_db_ids": [],
+    "sample_execution": {
+      "sample_limit": 5,
+      "attempted": 5,
+      "ok": 5,
+      "failed": 0,
+      "failed_examples": []
+    },
+    "first_record": {
+      "db_id": "movie_platform",
+      "question": "Name movie titles released in year 1945. Sort the listing by the descending order of movie popularity.",
+      "evidence": "released in the year 1945 refers to movie_release_year = 1945;",
+      "sql": "SELECT movie_title FROM movies WHERE movie_release_year = 1945 ORDER BY movie_popularity DESC LIMIT 1"
+    }
+  },
+  "dev": null,
+  "dev_tables": {
+    "exists": true,
+    "path": "Data\\BIRD\\dev_tables.json",
+    "db_count": 11,
+    "db_ids": [
+      "debit_card_specializing",
+      "financial",
+      "formula_1",
+      "california_schools",
+      "card_games",
+      "european_football_2",
+      "thrombosis_prediction",
+      "toxicology",
+      "student_club",
+      "superhero",
+      "codebase_community"
+    ],
+    "first_schema_keys": [
+      "db_id",
+      "table_names_original",
+      "table_names",
+      "column_names_original",
+      "column_names",
+      "column_types",
+      "primary_keys",
+      "foreign_keys"
+    ]
+  }
+}
