@@ -1,0 +1,14 @@
+{
+  "split": "dev",
+  "sample_count": 1534,
+  "schema_recall@10": 0.680224592707338,
+  "schema_recall@20": 0.8346602617832206,
+  "schema_recall@30": 0.8960864881803993,
+  "schema_precision@10": 0.44289439374185297,
+  "schema_mrr": 0.8755486781073484,
+  "table_recall@3": 0.7279009126466754,
+  "table_recall@5": 0.8508691873098662,
+  "column_recall@10": 0.7526211746190786,
+  "column_recall@20": 0.864880060741228,
+  "note": "PyTorch trainable R-GCN static schema grounder."
+}

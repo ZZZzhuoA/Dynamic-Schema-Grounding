@@ -1,0 +1,36 @@
+{
+  "schema_db_count": {
+    "train": 69,
+    "dev": 11
+  },
+  "train": {
+    "split": "train",
+    "processed_count": 9428,
+    "non_empty_label_count": 9408,
+    "non_empty_label_rate": 0.9978786593126856,
+    "avg_labels_per_sample": 6.887356809503606,
+    "failed_count": 20,
+    "stats": {
+      "empty_labels": 20
+    },
+    "source_label_counts": {
+      "hit_info": 62362,
+      "sql_parse": 61911,
+      "foreign_key": 13821
+    }
+  },
+  "dev": {
+    "split": "dev",
+    "processed_count": 1534,
+    "non_empty_label_count": 1534,
+    "non_empty_label_rate": 1.0,
+    "avg_labels_per_sample": 7.022816166883963,
+    "failed_count": 0,
+    "stats": {},
+    "source_label_counts": {
+      "hit_info": 0,
+      "sql_parse": 10237,
+      "foreign_key": 3208
+    }
+  }
+}

@@ -1,0 +1,13 @@
+{
+  "split": "dev",
+  "sample_count": 1534,
+  "schema_recall@10": 0.6396469105541408,
+  "schema_recall@20": 0.7753821116449577,
+  "schema_recall@30": 0.8316640624318552,
+  "schema_precision@10": 0.4176662320730118,
+  "schema_mrr": 0.888328254931758,
+  "table_recall@3": 0.7173076923076922,
+  "table_recall@5": 0.8174054758800522,
+  "column_recall@10": 0.6870942434618419,
+  "column_recall@20": 0.7811864703087479
+}

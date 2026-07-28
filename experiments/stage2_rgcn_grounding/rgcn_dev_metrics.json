@@ -1,0 +1,14 @@
+{
+  "split": "dev",
+  "sample_count": 1534,
+  "schema_recall@10": 0.39195598500424406,
+  "schema_recall@20": 0.5904391712378809,
+  "schema_recall@30": 0.6986376467778416,
+  "schema_precision@10": 0.2663624511082138,
+  "schema_mrr": 0.5479661675356141,
+  "table_recall@3": 0.5309973924380704,
+  "table_recall@5": 0.7204259017818341,
+  "column_recall@10": 0.40156730655446843,
+  "column_recall@20": 0.5640520523519015,
+  "note": "NumPy fixed-projection R-GCN-style encoder; scorer is trained."
+}

@@ -1,0 +1,19 @@
+# Raw datasets and database files
+/Data/
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Large experiment artifacts
+experiments/**/*.jsonl
+experiments/**/*.pt
+experiments/**/checkpoints/
+experiments/**/attention_maps/
+
+# Local environment / editor noise
+.env
+.venv/
+venv/
+.idea/
+.vscode/

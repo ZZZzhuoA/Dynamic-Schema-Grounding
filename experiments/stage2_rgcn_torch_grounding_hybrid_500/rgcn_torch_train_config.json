@@ -1,0 +1,29 @@
+{
+  "bird_dir": "Data/BIRD",
+  "train_input": "experiments/stage1_label_extraction/bird_train_grounding_labels.jsonl",
+  "dev_input": "experiments/stage1_label_extraction/bird_dev_grounding_labels.jsonl",
+  "output_dir": "experiments/stage2_rgcn_torch_grounding_hybrid_500",
+  "train_limit": 500,
+  "dev_limit": null,
+  "hash_dim": 256,
+  "hidden_dim": 64,
+  "num_layers": 2,
+  "dropout": 0.1,
+  "epochs": 2,
+  "lr": 0.001,
+  "weight_decay": 0.0001,
+  "pos_weight": 3.0,
+  "max_grad_norm": 1.0,
+  "top_k_examples": 20,
+  "include_same_table_edges": false,
+  "use_lexical_features": true,
+  "device": "cpu",
+  "torch_version": "2.12.0+cpu",
+  "relation_types": [
+    "self_loop",
+    "table_to_column",
+    "column_to_table",
+    "foreign_key_forward",
+    "foreign_key_backward"
+  ]
+}
