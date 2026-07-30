@@ -1,6 +1,7 @@
 # Stage 3B-server: vLLM Local 32B SQL Generation
 
 This stage runs local SQL generation on the server with vLLM and the local 32B model.
+The default command now uses one GPU.
 
 Known server paths:
 
@@ -60,14 +61,25 @@ experiments/stage3_prompt_sql_generation_v2/prompts_rgta_top30_dev.jsonl
 
 ## 3. Smoke test: R-GTA top30 v2, limit=5
 
+For one A800 80GB GPU, start conservatively:
+
+- `--tensor-parallel-size 1`
+- `--max-model-len 2048`
+- `--batch-size 1`
+- `--gpu-memory-utilization 0.90`
+
+If this is one A800 40GB GPU, a bf16 32B model is usually too large; use a quantized model or a smaller model.
+
 ```bash
 python src/generation/stage3_vllm_generate.py \
   --model-path /root/autodl-tmp/qwen_coder_32B \
   --prompt-file experiments/stage3_prompt_sql_generation_v2/prompts_rgta_top30_dev.jsonl \
   --output-file experiments/stage3_vllm_generation/generations_rgta_top30_v2_limit5.jsonl \
-  --tensor-parallel-size 8 \
+  --tensor-parallel-size 1 \
   --dtype bfloat16 \
-  --max-model-len 4096 \
+  --max-model-len 2048 \
+  --gpu-memory-utilization 0.90 \
+  --batch-size 1 \
   --max-tokens 512 \
   --limit 5
 ```
@@ -86,9 +98,11 @@ python src/generation/stage3_vllm_generate.py \
   --model-path /root/autodl-tmp/qwen_coder_32B \
   --prompt-file experiments/stage3_prompt_sql_generation_v2/prompts_rgta_top30_dev.jsonl \
   --output-file experiments/stage3_vllm_generation/generations_rgta_top30_v2_limit100.jsonl \
-  --tensor-parallel-size 8 \
+  --tensor-parallel-size 1 \
   --dtype bfloat16 \
-  --max-model-len 4096 \
+  --max-model-len 2048 \
+  --gpu-memory-utilization 0.90 \
+  --batch-size 1 \
   --max-tokens 512 \
   --limit 100
 ```
@@ -110,7 +124,17 @@ top_p = 1
 max_tokens = 512
 ```
 
-## 6. Acceptance criteria
+## 6. Optional: use 8 GPUs
+
+If all 8 A800 GPUs are available, use:
+
+```text
+--tensor-parallel-size 8
+--max-model-len 4096
+--batch-size 64
+```
+
+## 7. Acceptance criteria
 
 | Check | Target |
 |---|---|

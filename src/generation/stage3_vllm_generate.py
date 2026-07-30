@@ -76,7 +76,7 @@ def main():
     parser.add_argument("--model-path", required=True)
     parser.add_argument("--prompt-file", required=True)
     parser.add_argument("--output-file", required=True)
-    parser.add_argument("--tensor-parallel-size", type=int, default=8)
+    parser.add_argument("--tensor-parallel-size", type=int, default=1)
     parser.add_argument("--dtype", default="bfloat16")
     parser.add_argument("--max-model-len", type=int, default=4096)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.90)
