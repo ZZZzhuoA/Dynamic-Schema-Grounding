@@ -131,7 +131,17 @@ def predicted_sets(prediction_record, k):
     elif k <= 30:
         top = prediction_record.get("top_30", [])[:k]
     else:
-        top = []
+        available = sorted(
+            int(key.split("_", 1)[1])
+            for key in prediction_record
+            if key.startswith("top_") and key.split("_", 1)[1].isdigit()
+        )
+        larger_or_equal = [value for value in available if value >= k]
+        if larger_or_equal:
+            fallback_key = f"top_{min(larger_or_equal)}"
+            top = prediction_record.get(fallback_key, [])[:k]
+        else:
+            top = []
     names = {item.get("name") for item in top if item.get("name")}
     tables = set()
     columns = set()
