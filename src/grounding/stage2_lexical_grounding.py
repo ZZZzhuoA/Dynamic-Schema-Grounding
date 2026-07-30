@@ -212,7 +212,7 @@ def mean(values):
     return sum(values) / len(values) if values else 0.0
 
 
-def evaluate(records, output_dir: Path, split: str, top_k_examples: int):
+def evaluate(records, output_dir: Path, split: str, top_k_examples: int, output_top_k: int):
     idf = compute_idf(records)
     predictions = []
 
@@ -250,15 +250,16 @@ def evaluate(records, output_dir: Path, split: str, top_k_examples: int):
         column_recall_10.append(recall_at_k(gold_column_ids, ranked_column_ids[:10]))
         column_recall_20.append(recall_at_k(gold_column_ids, ranked_column_ids[:20]))
 
-        predictions.append(
-            {
-                "db_id": record["db_id"],
-                "question": record.get("question"),
-                "evidence": record.get("evidence"),
-                "gold_label_names": record.get("label_names", []),
-                "top_30": ranked[:30],
-            }
-        )
+        prediction = {
+            "db_id": record["db_id"],
+            "question": record.get("question"),
+            "evidence": record.get("evidence"),
+            "gold_label_names": record.get("label_names", []),
+            "top_30": ranked[:30],
+        }
+        if output_top_k != 30:
+            prediction[f"top_{output_top_k}"] = ranked[:output_top_k]
+        predictions.append(prediction)
 
     metrics = {
         "split": split,
@@ -291,7 +292,8 @@ def evaluate(records, output_dir: Path, split: str, top_k_examples: int):
             for name in item["gold_label_names"]:
                 f.write(f"- `{name}`\n")
             f.write("\n**Top predictions:**\n\n")
-            for row in item["top_30"][:15]:
+            top_key = f"top_{output_top_k}" if f"top_{output_top_k}" in item else "top_30"
+            for row in item[top_key][:15]:
                 f.write(f"- `{row['name']}` ({row['type']}), score={row['score']:.4f}\n")
             f.write("\n")
 
@@ -308,12 +310,13 @@ def main():
     parser.add_argument("--split", default="dev")
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--top-k-examples", type=int, default=20)
+    parser.add_argument("--output-top-k", type=int, default=30)
     args = parser.parse_args()
 
     records = read_jsonl(Path(args.input))
     if args.limit is not None:
         records = records[: args.limit]
-    metrics = evaluate(records, Path(args.output_dir), args.split, args.top_k_examples)
+    metrics = evaluate(records, Path(args.output_dir), args.split, args.top_k_examples, args.output_top_k)
     print(json.dumps(metrics, ensure_ascii=False, indent=2))
     print(f"\nOutputs written to: {args.output_dir}")
 

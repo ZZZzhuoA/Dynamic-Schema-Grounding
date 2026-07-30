@@ -131,7 +131,19 @@ def selected_oracle_ids(record):
 
 
 def selected_prediction_ids(prediction, top_k):
-    return [item["id"] for item in prediction["top_30"][:top_k]]
+    top_key = f"top_{top_k}"
+    if top_key in prediction:
+        return [item["id"] for item in prediction[top_key][:top_k]]
+    if "top_30" in prediction and top_k <= 30:
+        return [item["id"] for item in prediction["top_30"][:top_k]]
+    available = sorted(
+        int(key.split("_", 1)[1])
+        for key in prediction
+        if key.startswith("top_") and key.split("_", 1)[1].isdigit()
+    )
+    raise ValueError(
+        f"Prediction does not contain top_{top_k}; available top-k fields: {available}"
+    )
 
 
 def build_fk_text(dev_table_entry, selected_schema):
@@ -267,6 +279,16 @@ def main():
     )
     parser.add_argument("--output-dir", default="experiments/stage3_prompt_sql_generation")
     parser.add_argument("--limit", type=int, default=None)
+    parser.add_argument(
+        "--prediction-top-ks",
+        default="20,30",
+        help="Comma-separated prediction top-k settings to build, e.g. 20,30,50,80.",
+    )
+    parser.add_argument(
+        "--prediction-methods",
+        default="lexical,rgcn,rgta",
+        help="Comma-separated prediction methods to build: lexical,rgcn,rgta.",
+    )
     args = parser.parse_args()
 
     output_dir = Path(args.output_dir)
@@ -284,16 +306,30 @@ def main():
             f"rgcn={len(rgcn)}, rgta={len(rgta)}"
         )
 
+    prediction_top_ks = [int(value.strip()) for value in args.prediction_top_ks.split(",") if value.strip()]
+    prediction_methods = {
+        value.strip()
+        for value in args.prediction_methods.split(",")
+        if value.strip()
+    }
+
     settings = {
         "full_schema": lambda idx, rec: selected_full_schema_ids(rec),
         "oracle_schema": lambda idx, rec: selected_oracle_ids(rec),
-        "lexical_top20": lambda idx, rec: selected_prediction_ids(lexical[idx], 20),
-        "lexical_top30": lambda idx, rec: selected_prediction_ids(lexical[idx], 30),
-        "rgcn_top20": lambda idx, rec: selected_prediction_ids(rgcn[idx], 20),
-        "rgcn_top30": lambda idx, rec: selected_prediction_ids(rgcn[idx], 30),
-        "rgta_top20": lambda idx, rec: selected_prediction_ids(rgta[idx], 20),
-        "rgta_top30": lambda idx, rec: selected_prediction_ids(rgta[idx], 30),
     }
+    for top_k in prediction_top_ks:
+        if "lexical" in prediction_methods:
+            settings[f"lexical_top{top_k}"] = (
+                lambda idx, rec, top_k=top_k: selected_prediction_ids(lexical[idx], top_k)
+            )
+        if "rgcn" in prediction_methods:
+            settings[f"rgcn_top{top_k}"] = (
+                lambda idx, rec, top_k=top_k: selected_prediction_ids(rgcn[idx], top_k)
+            )
+        if "rgta" in prediction_methods:
+            settings[f"rgta_top{top_k}"] = (
+                lambda idx, rec, top_k=top_k: selected_prediction_ids(rgta[idx], top_k)
+            )
 
     statistics = {}
     for setting, fn in settings.items():
@@ -305,7 +341,11 @@ def main():
         json.dump(statistics, f, ensure_ascii=False, indent=2)
 
     # Human-readable sample across key settings.
-    sample_settings = ["full_schema", "lexical_top30", "rgcn_top30", "rgta_top30", "oracle_schema"]
+    sample_settings = [
+        setting
+        for setting in ["full_schema", "lexical_top30", "rgcn_top30", "rgta_top30", "rgta_top50", "rgta_top80", "oracle_schema"]
+        if setting in settings
+    ]
     with (output_dir / "prompt_examples.md").open("w", encoding="utf-8") as f:
         for setting in sample_settings:
             path = output_dir / f"prompts_{setting}_dev.jsonl"

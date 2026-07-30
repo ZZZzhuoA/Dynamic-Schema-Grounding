@@ -125,7 +125,13 @@ def gold_sets(label_record):
 
 
 def predicted_sets(prediction_record, k):
-    top = prediction_record.get("top_30", [])[:k]
+    top_key = f"top_{k}"
+    if top_key in prediction_record:
+        top = prediction_record.get(top_key, [])[:k]
+    elif k <= 30:
+        top = prediction_record.get("top_30", [])[:k]
+    else:
+        top = []
     names = {item.get("name") for item in top if item.get("name")}
     tables = set()
     columns = set()
@@ -317,7 +323,10 @@ def grounding_recall_report(labels, predictions_by_name, ks):
     for method, predictions in predictions_by_name.items():
         max_available = 0
         if predictions:
-            max_available = max(len(item.get("top_30", [])) for item in predictions)
+            for item in predictions:
+                for key, value in item.items():
+                    if key.startswith("top_") and isinstance(value, list):
+                        max_available = max(max_available, len(value))
         method_report = {"max_available_k": max_available, "by_k": {}}
         for k in ks:
             if k > max_available:

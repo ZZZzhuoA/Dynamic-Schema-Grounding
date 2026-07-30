@@ -511,7 +511,7 @@ def mean(values):
 
 
 @torch.no_grad()
-def evaluate(model, records, schema_cache, hash_dim, device, output_dir, split, top_k_examples):
+def evaluate(model, records, schema_cache, hash_dim, device, output_dir, split, top_k_examples, output_top_k):
     model.eval()
     predictions = []
     schema_recall_10, schema_recall_20, schema_recall_30 = [], [], []
@@ -548,24 +548,25 @@ def evaluate(model, records, schema_cache, hash_dim, device, output_dir, split, 
         column_recall_10.append(recall_at_k(gold_column_ids, ranked_column_ids[:10]))
         column_recall_20.append(recall_at_k(gold_column_ids, ranked_column_ids[:20]))
 
-        top_30 = [
+        top_ranked = [
             {
                 "id": int(i),
                 "type": schema_items_by_id[i]["type"],
                 "name": schema_items_by_id[i]["name"],
                 "score": float(scores[i]),
             }
-            for i in ranked_ids[:30]
+            for i in ranked_ids[:output_top_k]
         ]
-        predictions.append(
-            {
-                "db_id": record["db_id"],
-                "question": record.get("question"),
-                "evidence": record.get("evidence"),
-                "gold_label_names": record.get("label_names", []),
-                "top_30": top_30,
-            }
-        )
+        prediction = {
+            "db_id": record["db_id"],
+            "question": record.get("question"),
+            "evidence": record.get("evidence"),
+            "gold_label_names": record.get("label_names", []),
+            "top_30": top_ranked[:30],
+        }
+        if output_top_k != 30:
+            prediction[f"top_{output_top_k}"] = top_ranked
+        predictions.append(prediction)
 
     metrics = {
         "split": split,
@@ -597,7 +598,8 @@ def evaluate(model, records, schema_cache, hash_dim, device, output_dir, split, 
             for name in item["gold_label_names"]:
                 f.write(f"- `{name}`\n")
             f.write("\n**Top predictions:**\n\n")
-            for row in item["top_30"][:15]:
+            top_key = f"top_{output_top_k}" if f"top_{output_top_k}" in item else "top_30"
+            for row in item[top_key][:15]:
                 f.write(f"- `{row['name']}` ({row['type']}), score={row['score']:.4f}\n")
             f.write("\n")
     return metrics
@@ -627,10 +629,16 @@ def main():
     parser.add_argument("--pos-weight", type=float, default=3.0)
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
     parser.add_argument("--top-k-examples", type=int, default=20)
+    parser.add_argument("--output-top-k", type=int, default=30)
     parser.add_argument("--include-same-table-edges", action="store_true")
     parser.add_argument("--use-lexical-features", action="store_true")
     parser.add_argument("--encoder-type", choices=["rgcn", "rgta"], default="rgcn")
     parser.add_argument("--device", default="cpu")
+    parser.add_argument(
+        "--eval-only-model-path",
+        default=None,
+        help="Load an existing model checkpoint and only export dev predictions.",
+    )
     args = parser.parse_args()
 
     output_dir = Path(args.output_dir)
@@ -676,13 +684,17 @@ def main():
     with (output_dir / "rgcn_torch_train_config.json").open("w", encoding="utf-8") as f:
         json.dump(config, f, ensure_ascii=False, indent=2)
 
-    train_model(
-        model,
-        train_record_cache,
-        train_schema_cache,
-        args,
-        output_dir / "rgcn_torch_train_log.jsonl",
-    )
+    if args.eval_only_model_path:
+        model.load_state_dict(torch.load(args.eval_only_model_path, map_location=device))
+        print(f"Loaded model checkpoint: {args.eval_only_model_path}")
+    else:
+        train_model(
+            model,
+            train_record_cache,
+            train_schema_cache,
+            args,
+            output_dir / "rgcn_torch_train_log.jsonl",
+        )
     metrics = evaluate(
         model,
         dev_records,
@@ -692,8 +704,10 @@ def main():
         output_dir,
         "dev",
         args.top_k_examples,
+        args.output_top_k,
     )
-    torch.save(model.state_dict(), output_dir / "rgcn_torch_model.pt")
+    if not args.eval_only_model_path:
+        torch.save(model.state_dict(), output_dir / "rgcn_torch_model.pt")
     print(json.dumps(metrics, ensure_ascii=False, indent=2))
     print(f"\nOutputs written to: {output_dir}")
 
