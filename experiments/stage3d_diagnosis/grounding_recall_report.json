@@ -1,0 +1,130 @@
+{
+  "config": {
+    "labels_file": "experiments/stage1_label_extraction/bird_dev_grounding_labels.jsonl",
+    "rgta_predictions": "experiments/stage2_rgta_torch_grounding_hybrid_500/rgcn_torch_dev_predictions.jsonl",
+    "lexical_predictions": "experiments/stage2_static_grounding/lexical_dev_predictions.jsonl",
+    "full_generation": "experiments/stage3_online_llm_generation/generations_full_schema_v2_limit100.jsonl",
+    "rgta_generation": "experiments/stage3_online_llm_generation/generations_rgta_top30_v2_limit100.jsonl",
+    "lexical_generation": "experiments/stage3_online_llm_generation/generations_lexical_top30_v2_limit100.jsonl",
+    "db_root": "Data/BIRD/dev_databases",
+    "output_dir": "experiments/stage3d_diagnosis",
+    "limit": 100
+  },
+  "generation_metrics": {
+    "full_schema": {
+      "sample_count": 100,
+      "execution_accuracy": 0.31,
+      "pred_execution_success_rate": 0.89,
+      "api_error_rate": 0.0,
+      "correct_count": 31,
+      "pred_exec_ok_count": 89,
+      "api_error_count": 0
+    },
+    "rgta_top30": {
+      "sample_count": 100,
+      "execution_accuracy": 0.17,
+      "pred_execution_success_rate": 0.81,
+      "api_error_rate": 0.0,
+      "correct_count": 17,
+      "pred_exec_ok_count": 81,
+      "api_error_count": 0
+    },
+    "lexical_top30": {
+      "sample_count": 100,
+      "execution_accuracy": 0.18,
+      "pred_execution_success_rate": 0.7,
+      "api_error_rate": 0.0,
+      "correct_count": 18,
+      "pred_exec_ok_count": 70,
+      "api_error_count": 0
+    }
+  },
+  "grounding_recall": {
+    "rgta": {
+      "max_available_k": 30,
+      "by_k": {
+        "10": {
+          "available": true,
+          "schema_recall": 0.6473694083694084,
+          "table_recall": 0.956,
+          "column_recall": 0.5209071569896312,
+          "fk_endpoint_recall": 0.5735677083333334,
+          "empty_gold_column_count": 3
+        },
+        "20": {
+          "available": true,
+          "schema_recall": 0.7540607864357863,
+          "table_recall": 0.983,
+          "column_recall": 0.644005965397718,
+          "fk_endpoint_recall": 0.7434895833333334,
+          "empty_gold_column_count": 3
+        },
+        "30": {
+          "available": true,
+          "schema_recall": 0.8163190836940837,
+          "table_recall": 0.988,
+          "column_recall": 0.7320115737641512,
+          "fk_endpoint_recall": 0.8548177083333334,
+          "empty_gold_column_count": 3
+        },
+        "50": {
+          "available": false
+        },
+        "80": {
+          "available": false
+        }
+      }
+    },
+    "lexical": {
+      "max_available_k": 30,
+      "by_k": {
+        "10": {
+          "available": true,
+          "schema_recall": 0.4199433621933622,
+          "table_recall": 0.8540000000000001,
+          "column_recall": 0.39404910667797266,
+          "fk_endpoint_recall": 0.12630208333333334,
+          "empty_gold_column_count": 3
+        },
+        "20": {
+          "available": true,
+          "schema_recall": 0.5596430375180375,
+          "table_recall": 0.89,
+          "column_recall": 0.49704035941149344,
+          "fk_endpoint_recall": 0.3489583333333333,
+          "empty_gold_column_count": 3
+        },
+        "30": {
+          "available": true,
+          "schema_recall": 0.5972988816738817,
+          "table_recall": 0.89,
+          "column_recall": 0.5403237083649455,
+          "fk_endpoint_recall": 0.4166666666666667,
+          "empty_gold_column_count": 3
+        },
+        "50": {
+          "available": false
+        },
+        "80": {
+          "available": false
+        }
+      }
+    }
+  },
+  "case_counts": {
+    "full_correct_rgta_wrong": 20,
+    "rgta_correct_full_wrong": 6,
+    "rgta_correct_lexical_wrong": 3,
+    "lexical_correct_rgta_wrong": 4,
+    "full_correct_rgta_wrong_missing_column_count": 17,
+    "full_correct_rgta_wrong_missing_table_count": 1
+  },
+  "rgta_error_buckets": {
+    "correct": 17,
+    "semantic_mismatch": 64,
+    "no_such_column": 17,
+    "syntax_error": 1,
+    "execution_error": 1
+  },
+  "preliminary_diagnosis": "Among full_schema-correct but rgta_top30-wrong cases, 17/20 (85.0%) miss at least one gold column in R-GTA top30, and 1/20 (5.0%) miss at least one gold table. If missing-column rate is high, top-k recall is the primary bottleneck; otherwise prompt/reasoning/value grounding is likely dominant."
+}
