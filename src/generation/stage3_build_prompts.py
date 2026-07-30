@@ -141,6 +141,10 @@ def selected_prediction_ids(prediction, top_k):
         for key in prediction
         if key.startswith("top_") and key.split("_", 1)[1].isdigit()
     )
+    larger_or_equal = [value for value in available if value >= top_k]
+    if larger_or_equal:
+        fallback_key = f"top_{min(larger_or_equal)}"
+        return [item["id"] for item in prediction[fallback_key][:top_k]]
     raise ValueError(
         f"Prediction does not contain top_{top_k}; available top-k fields: {available}"
     )
