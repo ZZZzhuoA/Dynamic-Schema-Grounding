@@ -57,6 +57,71 @@ def group_schema_items(schema_items, selected_ids):
     return dict(sorted(tables.items(), key=lambda x: x[0]))
 
 
+def schema_item_indexes(schema_items):
+    by_full_name = {}
+    table_items = {}
+    for item in schema_items:
+        if item["type"] == "table":
+            table_items[item["name"]] = item["id"]
+        else:
+            by_full_name[(item.get("table"), item.get("column"))] = item["id"]
+    return table_items, by_full_name
+
+
+def add_fk_endpoint_closure(schema_items, selected_ids, dev_table_entry):
+    """Add owning tables and FK endpoint columns for selected schema.
+
+    This avoids prompts that mention a foreign key while omitting the endpoint
+    columns under their tables, and it prevents fake placeholders such as
+    "[no selected columns]".
+    """
+    selected = set(selected_ids)
+    table_items, column_items = schema_item_indexes(schema_items)
+    selected_tables = set()
+    selected_columns = set()
+    for item in schema_items:
+        if item["id"] not in selected:
+            continue
+        if item["type"] == "table":
+            selected_tables.add(item["name"])
+        else:
+            selected_tables.add(item.get("table"))
+            selected_columns.add((item.get("table"), item.get("column")))
+
+    for table in list(selected_tables):
+        if table in table_items:
+            selected.add(table_items[table])
+
+    if not dev_table_entry:
+        return sorted(selected)
+
+    tables = dev_table_entry.get("table_names_original", [])
+    columns = dev_table_entry.get("column_names_original", [])
+    for left_idx, right_idx in dev_table_entry.get("foreign_keys", []):
+        if left_idx >= len(columns) or right_idx >= len(columns):
+            continue
+        left_table_idx, left_col = columns[left_idx]
+        right_table_idx, right_col = columns[right_idx]
+        if left_table_idx < 0 or right_table_idx < 0:
+            continue
+        left_table = tables[left_table_idx]
+        right_table = tables[right_table_idx]
+        left_pair = (left_table, left_col)
+        right_pair = (right_table, right_col)
+
+        table_pair_selected = left_table in selected_tables and right_table in selected_tables
+        column_pair_selected = left_pair in selected_columns or right_pair in selected_columns
+        if table_pair_selected or column_pair_selected:
+            for table, col in [left_pair, right_pair]:
+                if table in table_items:
+                    selected.add(table_items[table])
+                col_id = column_items.get((table, col))
+                if col_id is not None:
+                    selected.add(col_id)
+
+    return sorted(selected)
+
+
 def selected_full_schema_ids(record):
     return [item["id"] for item in record["schema_items"]]
 
@@ -103,9 +168,7 @@ def schema_to_text(grouped_schema, foreign_keys):
         if columns:
             for column in sorted(columns, key=lambda x: x["name"]):
                 dtype = f" ({column['type']})" if column.get("type") else ""
-                lines.append(f"- {column['name']}{dtype}")
-        else:
-            lines.append("- [no selected columns]")
+                lines.append(f"- `{column['name']}`{dtype}")
         lines.append("")
     if foreign_keys:
         lines.append("Foreign keys:")
@@ -118,7 +181,13 @@ def schema_to_text(grouped_schema, foreign_keys):
 def build_prompt(question, evidence, schema_text):
     evidence_block = f"\nEvidence:\n{evidence}\n" if evidence else ""
     return (
-        "You are an expert SQL generator.\n\n"
+        "You are an expert SQLite SQL generator.\n\n"
+        "Rules:\n"
+        "1. Use only the exact table and column names listed in the schema.\n"
+        "2. Do not invent columns or tables.\n"
+        "3. Use SQLite syntax only.\n"
+        "4. Quote column names with backticks if they contain spaces, parentheses, %, /, or hyphens.\n"
+        "5. Return only one SQL query, with no explanation.\n\n"
         "Given the database schema and question, generate a valid SQLite SQL query.\n\n"
         f"Database schema:\n{schema_text}\n\n"
         f"Question:\n{question}\n"
@@ -128,6 +197,7 @@ def build_prompt(question, evidence, schema_text):
 
 
 def make_prompt_record(record, setting, selected_ids, dev_table_entry):
+    selected_ids = add_fk_endpoint_closure(record["schema_items"], selected_ids, dev_table_entry)
     grouped = group_schema_items(record["schema_items"], selected_ids)
     fks = build_fk_text(dev_table_entry, grouped)
     schema_text = schema_to_text(grouped, fks)

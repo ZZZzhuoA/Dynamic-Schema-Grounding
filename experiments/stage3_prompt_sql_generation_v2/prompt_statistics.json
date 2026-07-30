@@ -1,0 +1,50 @@
+{
+  "full_schema": {
+    "count": 1534,
+    "avg_prompt_chars": 2845.919817470665,
+    "max_prompt_chars": 7520,
+    "avg_selected_schema_items": 82.63363754889178
+  },
+  "oracle_schema": {
+    "count": 1534,
+    "avg_prompt_chars": 1047.8402868318124,
+    "max_prompt_chars": 2919,
+    "avg_selected_schema_items": 11.538461538461538
+  },
+  "lexical_top20": {
+    "count": 1534,
+    "avg_prompt_chars": 1631.7620599739244,
+    "max_prompt_chars": 3786,
+    "avg_selected_schema_items": 29.552151238591918
+  },
+  "lexical_top30": {
+    "count": 1534,
+    "avg_prompt_chars": 1807.3813559322034,
+    "max_prompt_chars": 4089,
+    "avg_selected_schema_items": 36.803780964797916
+  },
+  "rgcn_top20": {
+    "count": 1534,
+    "avg_prompt_chars": 1626.9876140808344,
+    "max_prompt_chars": 3835,
+    "avg_selected_schema_items": 28.233376792698827
+  },
+  "rgcn_top30": {
+    "count": 1534,
+    "avg_prompt_chars": 1751.9615384615386,
+    "max_prompt_chars": 4024,
+    "avg_selected_schema_items": 33.83116036505867
+  },
+  "rgta_top20": {
+    "count": 1534,
+    "avg_prompt_chars": 1627.447848761408,
+    "max_prompt_chars": 3873,
+    "avg_selected_schema_items": 28.436114732724903
+  },
+  "rgta_top30": {
+    "count": 1534,
+    "avg_prompt_chars": 1757.509778357236,
+    "max_prompt_chars": 4094,
+    "avg_selected_schema_items": 34.295306388526726
+  }
+}

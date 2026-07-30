@@ -1,0 +1,12 @@
+{
+  "generation_file": "experiments\\stage3_online_llm_generation\\generations_rgta_top30_v2_limit100.jsonl",
+  "sample_count": 100,
+  "execution_accuracy": 0.17,
+  "pred_execution_success_rate": 0.81,
+  "gold_execution_success_rate": 1.0,
+  "api_error_rate": 0.0,
+  "correct_count": 17,
+  "pred_exec_ok_count": 81,
+  "gold_exec_ok_count": 100,
+  "api_error_count": 0
+}
