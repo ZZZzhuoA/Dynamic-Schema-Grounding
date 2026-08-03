@@ -281,6 +281,11 @@ def main():
         "--rgta-predictions",
         default="experiments/stage2_rgta_torch_grounding_hybrid_500/rgcn_torch_dev_predictions.jsonl",
     )
+    parser.add_argument(
+        "--dsg-predictions",
+        default=None,
+        help="Optional Stage 5 DSG grounder predictions jsonl.",
+    )
     parser.add_argument("--output-dir", default="experiments/stage3_prompt_sql_generation")
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument(
@@ -291,7 +296,7 @@ def main():
     parser.add_argument(
         "--prediction-methods",
         default="lexical,rgcn,rgta",
-        help="Comma-separated prediction methods to build: lexical,rgcn,rgta.",
+        help="Comma-separated prediction methods to build: lexical,rgcn,rgta,dsg.",
     )
     args = parser.parse_args()
 
@@ -300,22 +305,31 @@ def main():
 
     records = read_jsonl(Path(args.dev_labels), limit=args.limit)
     dev_tables = load_dev_tables(Path(args.dev_tables))
-    lexical = load_prediction_topk(Path(args.lexical_predictions), limit=args.limit)
-    rgcn = load_prediction_topk(Path(args.rgcn_predictions), limit=args.limit)
-    rgta = load_prediction_topk(Path(args.rgta_predictions), limit=args.limit)
-
-    if not (len(records) == len(lexical) == len(rgcn) == len(rgta)):
-        raise ValueError(
-            f"Input length mismatch: labels={len(records)}, lexical={len(lexical)}, "
-            f"rgcn={len(rgcn)}, rgta={len(rgta)}"
-        )
-
     prediction_top_ks = [int(value.strip()) for value in args.prediction_top_ks.split(",") if value.strip()]
     prediction_methods = {
         value.strip()
         for value in args.prediction_methods.split(",")
         if value.strip()
     }
+
+    predictions = {}
+    if "lexical" in prediction_methods:
+        predictions["lexical"] = load_prediction_topk(Path(args.lexical_predictions), limit=args.limit)
+    if "rgcn" in prediction_methods:
+        predictions["rgcn"] = load_prediction_topk(Path(args.rgcn_predictions), limit=args.limit)
+    if "rgta" in prediction_methods:
+        predictions["rgta"] = load_prediction_topk(Path(args.rgta_predictions), limit=args.limit)
+    if "dsg" in prediction_methods:
+        if not args.dsg_predictions:
+            raise ValueError("--dsg-predictions is required when prediction-methods includes dsg")
+        predictions["dsg"] = load_prediction_topk(Path(args.dsg_predictions), limit=args.limit)
+
+    for method, method_predictions in predictions.items():
+        if len(records) != len(method_predictions):
+            raise ValueError(
+                f"Input length mismatch for {method}: labels={len(records)}, "
+                f"{method}={len(method_predictions)}"
+            )
 
     settings = {
         "full_schema": lambda idx, rec: selected_full_schema_ids(rec),
@@ -324,15 +338,19 @@ def main():
     for top_k in prediction_top_ks:
         if "lexical" in prediction_methods:
             settings[f"lexical_top{top_k}"] = (
-                lambda idx, rec, top_k=top_k: selected_prediction_ids(lexical[idx], top_k)
+                lambda idx, rec, top_k=top_k: selected_prediction_ids(predictions["lexical"][idx], top_k)
             )
         if "rgcn" in prediction_methods:
             settings[f"rgcn_top{top_k}"] = (
-                lambda idx, rec, top_k=top_k: selected_prediction_ids(rgcn[idx], top_k)
+                lambda idx, rec, top_k=top_k: selected_prediction_ids(predictions["rgcn"][idx], top_k)
             )
         if "rgta" in prediction_methods:
             settings[f"rgta_top{top_k}"] = (
-                lambda idx, rec, top_k=top_k: selected_prediction_ids(rgta[idx], top_k)
+                lambda idx, rec, top_k=top_k: selected_prediction_ids(predictions["rgta"][idx], top_k)
+            )
+        if "dsg" in prediction_methods:
+            settings[f"dsg_top{top_k}"] = (
+                lambda idx, rec, top_k=top_k: selected_prediction_ids(predictions["dsg"][idx], top_k)
             )
 
     statistics = {}
@@ -347,7 +365,18 @@ def main():
     # Human-readable sample across key settings.
     sample_settings = [
         setting
-        for setting in ["full_schema", "lexical_top30", "rgcn_top30", "rgta_top30", "rgta_top50", "rgta_top80", "oracle_schema"]
+        for setting in [
+            "full_schema",
+            "lexical_top30",
+            "rgcn_top30",
+            "rgta_top30",
+            "rgta_top50",
+            "rgta_top80",
+            "dsg_top30",
+            "dsg_top50",
+            "dsg_top80",
+            "oracle_schema",
+        ]
         if setting in settings
     ]
     with (output_dir / "prompt_examples.md").open("w", encoding="utf-8") as f:

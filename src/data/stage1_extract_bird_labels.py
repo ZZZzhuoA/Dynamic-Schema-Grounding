@@ -233,12 +233,60 @@ def extract_table_aliases(sql, schema):
     return used_tables, aliases, normalized_sql
 
 
+def add_column_label_for_name(labels, schema, norm_column, candidate_tables):
+    occurrences = schema["column_norm_to_originals"].get(norm_column, [])
+    if not occurrences:
+        return
+    filtered = [(table, item_id) for table, item_id in occurrences if table in candidate_tables]
+    if len(filtered) == 1:
+        labels.add(filtered[0][1])
+    elif len(filtered) > 1:
+        for _, item_id in filtered:
+            labels.add(item_id)
+
+
+def add_delimited_identifier_labels(sql, schema, labels, used_tables, aliases):
+    """Recover SQL-used columns quoted as `multi word column` or [multi word column].
+
+    The earlier normalized-token matcher works for simple identifiers such as
+    T1.AvgScrMath, but it loses multi-word quoted identifiers because
+    `County Name` becomes separate tokens. This function parses those delimited
+    identifiers before SQL normalization and maps them back to schema columns.
+    """
+    candidate_tables = used_tables or set(schema["table_item_ids"].keys())
+
+    qualified_patterns = [
+        r"(?i)([A-Za-z_][A-Za-z0-9_]*)\s*\.\s*`([^`]+)`",
+        r"(?i)([A-Za-z_][A-Za-z0-9_]*)\s*\.\s*\[([^\]]+)\]",
+    ]
+    for pattern in qualified_patterns:
+        for prefix, column_name in re.findall(pattern, sql or ""):
+            norm_prefix = normalize_name(prefix)
+            norm_table = aliases.get(norm_prefix, norm_prefix)
+            norm_column = normalize_name(column_name)
+            item_id = schema["column_item_ids"].get((norm_table, norm_column))
+            if item_id is not None:
+                labels.add(item_id)
+
+    standalone_identifiers = []
+    standalone_identifiers.extend(re.findall(r"`([^`]+)`", sql or ""))
+    standalone_identifiers.extend(re.findall(r"\[([^\]]+)\]", sql or ""))
+    for identifier in standalone_identifiers:
+        norm_identifier = normalize_name(identifier)
+        if norm_identifier in schema["table_item_ids"]:
+            labels.add(schema["table_item_ids"][norm_identifier])
+            continue
+        add_column_label_for_name(labels, schema, norm_identifier, candidate_tables)
+
+
 def sql_parse_labels(sql, schema):
     labels = set()
     used_tables, aliases, normalized_sql = extract_table_aliases(sql, schema)
 
     for norm_table in used_tables:
         labels.add(schema["table_item_ids"][norm_table])
+
+    add_delimited_identifier_labels(sql, schema, labels, used_tables, aliases)
 
     # Fully qualified or alias-qualified column references.
     for (norm_table, norm_column), item_id in schema["column_item_ids"].items():
@@ -258,14 +306,9 @@ def sql_parse_labels(sql, schema):
     for norm_column, occurrences in schema["column_norm_to_originals"].items():
         if not re.search(rf"(?<![a-z0-9_]){re.escape(norm_column)}(?![a-z0-9_])", normalized_sql):
             continue
-        filtered = [(table, item_id) for table, item_id in occurrences if table in candidate_tables]
-        if len(filtered) == 1:
-            labels.add(filtered[0][1])
-        elif len(filtered) > 1:
-            # Ambiguous columns are still SQL-used signals, but we mark all
-            # candidates among used tables. Later stages can refine this.
-            for _, item_id in filtered:
-                labels.add(item_id)
+        # Ambiguous columns are still SQL-used signals, but we mark all
+        # candidates among used tables. Later stages can refine this.
+        add_column_label_for_name(labels, schema, norm_column, candidate_tables)
 
     return labels, used_tables
 
