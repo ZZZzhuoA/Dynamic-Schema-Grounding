@@ -227,6 +227,7 @@ def main():
                 "token_sequence_count": len(token_sequences),
                 "intervention": args.intervention,
                 "boost": args.boost,
+                "processor_diagnostics": processor.diagnostics(),
                 "top_sequences": summarize_token_sequences(token_sequences) if args.debug_token_map else [],
             },
         }

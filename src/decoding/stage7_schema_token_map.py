@@ -64,6 +64,25 @@ def schema_name_variants(table: str | None, column: str | None = None) -> list[s
     return deduped
 
 
+def contextual_surface_variants(surface: str) -> list[str]:
+    """Add common SQL left-context variants for tokenizer matching.
+
+    Many code tokenizers encode ``" column"`` differently from ``"column"``.
+    If we only bias the no-leading-space token ids, the control signal can miss
+    the actual token used during SQL generation.  These variants make the
+    bias act at realistic identifier boundaries.
+    """
+
+    surface = normalize_name(surface)
+    if not surface:
+        return []
+    prefixes = ["", " ", "\n", "\t", "(", ", ", "."] 
+    variants = []
+    for prefix in prefixes:
+        variants.append(prefix + surface)
+    return variants
+
+
 @dataclass(frozen=True)
 class GroundedSchemaItem:
     full_name: str
@@ -261,8 +280,9 @@ def normalize_scores(items: list[GroundedSchemaItem]) -> list[GroundedSchemaItem
     scores = [item.score for item in items]
     lo, hi = min(scores), max(scores)
     if hi <= lo:
+        constant_score = max(0.0, min(1.0, float(lo)))
         return [
-            GroundedSchemaItem(item.full_name, item.table, item.column, 1.0, item.source, item.role)
+            GroundedSchemaItem(item.full_name, item.table, item.column, constant_score, item.source, item.role)
             for item in items
         ]
     return [
@@ -300,20 +320,21 @@ def build_schema_token_sequences(
             continue
         variants = schema_name_variants(item.table, item.column)
         for variant in variants:
-            token_ids = tokenizer.encode(variant, add_special_tokens=False)
-            if not token_ids:
-                continue
-            key = tuple(int(token_id) for token_id in token_ids)
-            if key in seen:
-                continue
-            seen.add(key)
-            sequences.append(
-                {
-                    "schema": item.full_name,
-                    "role": item.role,
-                    "score": float(item.score),
-                    "variant": variant,
-                    "token_ids": list(key),
-                }
-            )
+            for surface in contextual_surface_variants(variant):
+                token_ids = tokenizer.encode(surface, add_special_tokens=False)
+                if not token_ids:
+                    continue
+                key = tuple(int(token_id) for token_id in token_ids)
+                if key in seen:
+                    continue
+                seen.add(key)
+                sequences.append(
+                    {
+                        "schema": item.full_name,
+                        "role": item.role,
+                        "score": float(item.score),
+                        "variant": surface,
+                        "token_ids": list(key),
+                    }
+                )
     return sequences

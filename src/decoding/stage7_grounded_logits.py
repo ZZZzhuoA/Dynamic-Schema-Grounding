@@ -51,8 +51,12 @@ class GroundedSchemaLogitsProcessor(LogitsProcessor):
         self.first_token_boost_ratio = float(first_token_boost_ratio)
         self.continuation_boost_ratio = float(continuation_boost_ratio)
         self.max_bias_per_token = float(max_bias_per_token)
+        self.call_count = 0
+        self.total_biased_tokens = 0
+        self.max_observed_bias = 0.0
 
     def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor) -> torch.FloatTensor:
+        self.call_count += 1
         batch_size = input_ids.shape[0]
         for row in range(batch_size):
             prompt_len = self.prompt_lengths[row] if row < len(self.prompt_lengths) else 0
@@ -76,10 +80,23 @@ class GroundedSchemaLogitsProcessor(LogitsProcessor):
 
             if not token_bias:
                 continue
+            self.total_biased_tokens += len(token_bias)
+            self.max_observed_bias = max(self.max_observed_bias, max(float(value) for value in token_bias.values()))
             for token_id, bias in token_bias.items():
                 if 0 <= token_id < scores.shape[-1]:
                     scores[row, token_id] += min(float(bias), self.max_bias_per_token)
         return scores
+
+    def diagnostics(self) -> dict[str, Any]:
+        return {
+            "processor_call_count": self.call_count,
+            "total_biased_tokens": self.total_biased_tokens,
+            "avg_biased_tokens_per_call": (
+                self.total_biased_tokens / self.call_count if self.call_count else 0.0
+            ),
+            "max_observed_bias_before_cap": self.max_observed_bias,
+            "max_bias_per_token": self.max_bias_per_token,
+        }
 
 
 def summarize_token_sequences(schema_token_sequences: list[dict[str, Any]], limit: int = 20) -> list[dict[str, Any]]:
