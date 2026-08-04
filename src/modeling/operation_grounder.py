@@ -188,3 +188,81 @@ class OperationConditionedGrounder(nn.Module):
             "schema_node_embeddings": node_states,
             "operation_embedding": operation_state,
         }
+
+
+class OperationFusionGrounder(nn.Module):
+    """Multi-task operation grounder with learnable whole-schema fusion.
+
+    Stage 8-C treats operation-specific beliefs as latent variables.  The model
+    first computes one schema belief distribution per SQL operation, then learns
+    a separate fusion network that maps the operation-belief matrix into the
+    whole-SQL schema belief.  This removes hand-written operation budgets from
+    the training objective.
+    """
+
+    def __init__(
+        self,
+        hash_dim=256,
+        hidden_dim=128,
+        num_layers=2,
+        dropout=0.1,
+        relations=None,
+        operations=None,
+        lexical_dim=6,
+    ):
+        super().__init__()
+        self.operations = operations or list(DEFAULT_OPERATIONS)
+        self.lexical_dim = lexical_dim
+        self.operation_grounder = OperationConditionedGrounder(
+            hash_dim=hash_dim,
+            hidden_dim=hidden_dim,
+            num_layers=num_layers,
+            dropout=dropout,
+            relations=relations,
+            operations=self.operations,
+            lexical_dim=lexical_dim,
+        )
+        fusion_dim = len(self.operations) * 2 + 2 + lexical_dim
+        self.whole_fusion = nn.Sequential(
+            nn.Linear(fusion_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, 1),
+        )
+
+    def forward(self, query_features, node_features, edges, lex_features=None):
+        operation_logits = []
+        operation_embeddings = []
+        for operation_id in range(len(self.operations)):
+            op_tensor = torch.tensor([operation_id], dtype=torch.long, device=node_features.device)
+            output = self.operation_grounder(
+                query_features,
+                node_features,
+                edges,
+                op_tensor,
+                lex_features,
+            )
+            operation_logits.append(output["logits"])
+            operation_embeddings.append(output["operation_embedding"])
+        op_logits = torch.stack(operation_logits, dim=-1)
+        op_probs = torch.sigmoid(op_logits)
+        max_logit = op_logits.max(dim=-1, keepdim=True).values
+        mean_logit = op_logits.mean(dim=-1, keepdim=True)
+        fusion_input = [op_logits, op_probs, max_logit, mean_logit]
+        if self.lexical_dim:
+            if lex_features is None:
+                lex_features = torch.zeros(
+                    (node_features.shape[0], self.lexical_dim),
+                    dtype=node_features.dtype,
+                    device=node_features.device,
+                )
+            fusion_input.append(lex_features)
+        whole_logits = self.whole_fusion(torch.cat(fusion_input, dim=-1)).squeeze(-1)
+        return {
+            "operation_logits": op_logits,
+            "whole_logits": whole_logits,
+            "operation_embeddings": torch.stack(operation_embeddings, dim=0),
+        }
