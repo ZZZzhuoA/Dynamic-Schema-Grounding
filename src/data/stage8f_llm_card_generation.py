@@ -138,6 +138,7 @@ def table_record_to_schema_items(table_record):
                 "node_type": "table",
                 "qualified_name": table_name,
                 "table_name": table_name,
+                "table_id": table_id,
                 "normalized_name": normalized_tables[table_id] if table_id < len(normalized_tables) else table_name,
             }
         )
@@ -153,6 +154,7 @@ def table_record_to_schema_items(table_record):
                 "node_type": "column",
                 "qualified_name": f"{table_name}.{column_name}",
                 "table_name": table_name,
+                "table_id": table_id,
                 "column_name": column_name,
                 "normalized_name": normalized_column,
                 "data_type": column_types[column_index] if column_index < len(column_types) else "",
@@ -173,12 +175,21 @@ def flatten_primary_keys(primary_keys):
     return out
 
 
-def fk_descriptions(table_record):
+def column_schema_item_id(table_record, column_index):
+    return len(table_record.get("table_names_original", [])) + column_index - 1
+
+
+def fk_descriptions(table_record, allowed_item_ids=None):
+    allowed_item_ids = set(allowed_item_ids or [])
     tables = table_record.get("table_names_original", [])
     columns = table_record.get("column_names_original", [])
     descriptions = []
     for left, right in table_record.get("foreign_keys", []):
         if left >= len(columns) or right >= len(columns):
+            continue
+        left_item_id = column_schema_item_id(table_record, left)
+        right_item_id = column_schema_item_id(table_record, right)
+        if allowed_item_ids and left_item_id not in allowed_item_ids and right_item_id not in allowed_item_ids:
             continue
         lt, lc = columns[left]
         rt, rc = columns[right]
@@ -188,24 +199,29 @@ def fk_descriptions(table_record):
             {
                 "left": f"{tables[lt]}.{lc}",
                 "right": f"{tables[rt]}.{rc}",
+                "left_schema_item_id": left_item_id,
+                "right_schema_item_id": right_item_id,
             }
         )
     return descriptions
 
 
-def schema_prompt(table_record):
+def schema_prompt(table_record, schema_items=None):
+    schema_items = schema_items or table_record_to_schema_items(table_record)
+    schema_item_ids = {item["schema_item_id"] for item in schema_items}
     return {
         "task": (
             "Create semantic cards for text-to-SQL schema grounding. Use only the provided schema names, "
             "types, primary/foreign-key flags, and foreign-key graph. Do not use any question, SQL, answer, "
-            "label, or dataset-specific gold information. Infer likely meanings from names only."
+            "label, or dataset-specific gold information. Infer likely meanings from names only. "
+            "Return exactly one item for each provided schema_item_id."
         ),
         "db_id": table_record["db_id"],
         "allowed_value_types": ALLOWED_VALUE_TYPES,
         "allowed_sql_roles": ALLOWED_SQL_ROLES,
         "allowed_relation_types": ALLOWED_RELATION_TYPES,
-        "schema_items": table_record_to_schema_items(table_record),
-        "foreign_keys": fk_descriptions(table_record),
+        "schema_items": schema_items,
+        "foreign_keys": fk_descriptions(table_record, schema_item_ids),
         "output_format": {
             "items": [
                 {
@@ -219,6 +235,29 @@ def schema_prompt(table_record):
                 }
             ]
         },
+    }
+
+
+def fallback_schema_card(raw, split, db_id):
+    return {
+        "split": split,
+        "db_id": db_id,
+        "schema_item_id": raw["schema_item_id"],
+        "node_type": raw["node_type"],
+        "qualified_name": raw["qualified_name"],
+        "raw_name": raw.get("column_name") or raw.get("table_name") or raw["qualified_name"],
+        "table_name_original": raw.get("table_name"),
+        "column_name_original": raw.get("column_name"),
+        "data_type": raw.get("data_type", ""),
+        "semantic_name": raw["qualified_name"],
+        "description": "",
+        "aliases": [raw["qualified_name"]],
+        "value_type": "table" if raw["node_type"] == "table" else "text",
+        "likely_sql_roles": [],
+        "relation_types": [],
+        "is_primary_key": bool(raw.get("is_primary_key", False)),
+        "is_foreign_key_endpoint": bool(raw.get("is_foreign_key_endpoint", False)),
+        "source": "llm_fallback",
     }
 
 
@@ -255,15 +294,16 @@ def sanitize_schema_card(card, raw_by_id, split, db_id):
     }
 
 
-def generate_schema_cards_for_db(table_record, split, client, args):
+def generate_schema_cards_for_items(table_record, split, client, args, schema_items):
     raw_items = table_record_to_schema_items(table_record)
     raw_by_id = {item["schema_item_id"]: item for item in raw_items}
+    requested_ids = {item["schema_item_id"] for item in schema_items}
     messages = [
         {
             "role": "system",
             "content": "You are a database semantic parser for text-to-SQL. Return strict JSON only.",
         },
-        {"role": "user", "content": json.dumps(schema_prompt(table_record), ensure_ascii=False)},
+        {"role": "user", "content": json.dumps(schema_prompt(table_record, schema_items), ensure_ascii=False)},
     ]
     text = client.chat(
         messages,
@@ -277,36 +317,57 @@ def generate_schema_cards_for_db(table_record, split, client, args):
     cards = []
     seen = set()
     for item in items:
-        if not isinstance(item, dict) or item.get("schema_item_id") not in raw_by_id:
+        if not isinstance(item, dict) or item.get("schema_item_id") not in requested_ids:
             continue
         cards.append(sanitize_schema_card(item, raw_by_id, split, table_record["db_id"]))
         seen.add(int(item["schema_item_id"]))
     # Fill missing items with source=llm_fallback, still no handcrafted domain aliases.
-    for item_id, raw in raw_by_id.items():
+    for item_id in requested_ids:
         if item_id in seen:
             continue
-        cards.append(
-            {
-                "split": split,
-                "db_id": table_record["db_id"],
-                "schema_item_id": item_id,
-                "node_type": raw["node_type"],
-                "qualified_name": raw["qualified_name"],
-                "raw_name": raw.get("column_name") or raw.get("table_name") or raw["qualified_name"],
-                "table_name_original": raw.get("table_name"),
-                "column_name_original": raw.get("column_name"),
-                "data_type": raw.get("data_type", ""),
-                "semantic_name": raw["qualified_name"],
-                "description": "",
-                "aliases": [raw["qualified_name"]],
-                "value_type": "table" if raw["node_type"] == "table" else "text",
-                "likely_sql_roles": [],
-                "relation_types": [],
-                "is_primary_key": bool(raw.get("is_primary_key", False)),
-                "is_foreign_key_endpoint": bool(raw.get("is_foreign_key_endpoint", False)),
-                "source": "llm_fallback",
-            }
-        )
+        cards.append(fallback_schema_card(raw_by_id[item_id], split, table_record["db_id"]))
+    return sorted(cards, key=lambda x: x["schema_item_id"])
+
+
+def schema_item_chunks(table_record, mode):
+    raw_items = table_record_to_schema_items(table_record)
+    if mode == "db":
+        return [raw_items]
+    table_items = [item for item in raw_items if item["node_type"] == "table"]
+    chunks = []
+    for table_item in table_items:
+        table_id = table_item.get("table_id")
+        chunk = [table_item] + [
+            item
+            for item in raw_items
+            if item["node_type"] == "column" and item.get("table_id") == table_id
+        ]
+        chunks.append(chunk)
+    return chunks
+
+
+def generate_schema_cards_for_db(table_record, split, client, args):
+    cards = []
+    seen = set()
+    chunk_errors = []
+    for chunk_index, chunk in enumerate(schema_item_chunks(table_record, args.schema_card_mode), start=1):
+        try:
+            chunk_cards = generate_schema_cards_for_items(table_record, split, client, args, chunk)
+        except Exception as exc:  # noqa: BLE001 - fallback only for the failed chunk.
+            chunk_cards = [fallback_schema_card(item, split, table_record["db_id"]) for item in chunk]
+            chunk_errors.append({"chunk_index": chunk_index, "error": repr(exc)})
+        for card in chunk_cards:
+            item_id = card["schema_item_id"]
+            if item_id in seen:
+                continue
+            seen.add(item_id)
+            cards.append(card)
+        if args.sleep > 0:
+            time.sleep(args.sleep)
+    if chunk_errors:
+        for card in cards:
+            if card.get("source") == "llm_fallback":
+                card["chunk_errors"] = chunk_errors[:3]
     return sorted(cards, key=lambda x: x["schema_item_id"])
 
 
@@ -427,6 +488,7 @@ def main():
     parser.add_argument("--top-p", type=float, default=1.0)
     parser.add_argument("--max-tokens", type=int, default=8192)
     parser.add_argument("--question-max-tokens", type=int, default=2048)
+    parser.add_argument("--schema-card-mode", choices=["table", "db"], default="table")
     parser.add_argument("--timeout", type=int, default=300)
     parser.add_argument("--sleep", type=float, default=0.0)
     parser.add_argument("--disable-thinking", action="store_true")
