@@ -35,6 +35,13 @@ from src.training.stage5j_train_relation_grounder import (  # noqa: E402
     load_aligned_records,
     make_relation_examples,
 )
+from src.assembly.stage8b_calibrated_assembly import (  # noqa: E402
+    DEFAULT_OPERATION_BUDGETS,
+    DEFAULT_OPERATION_WEIGHTS,
+    assemble_calibrated,
+    evaluate_assembled_rows,
+    parse_float_map,
+)
 
 
 def import_torch_and_features():
@@ -98,6 +105,35 @@ def split_gold_ids(example):
     gold_ids = example["training_targets"].get("grounding_label_ids", [])
     column_ids = [item_id for item_id in gold_ids if nodes.get(item_id, {}).get("type") == "column"]
     return gold_ids, column_ids
+
+
+def assemble_operation_predictions(predictions, aligned_records, args):
+    if args.assembly_method == "legacy":
+        return assemble_predictions(
+            predictions,
+            aligned_records,
+            output_top_k=args.output_top_k,
+            budgets=args.assembly_budgets,
+        )
+    return assemble_calibrated(
+        operation_predictions=predictions,
+        aligned_records=aligned_records,
+        output_top_k=args.output_top_k,
+        operation_budgets=args.operation_budgets,
+        operation_weights=args.operation_weights,
+        rank_weight=args.calibration_rank_weight,
+        z_weight=args.calibration_z_weight,
+        table_column_bonus=args.table_column_bonus,
+        fk_bonus=args.fk_bonus,
+        max_tables=args.max_tables,
+        include_tables=not args.exclude_tables,
+    )
+
+
+def evaluate_assembled_predictions(rows, args):
+    if args.assembly_method == "legacy":
+        return evaluate_assembled(rows)
+    return evaluate_assembled_rows(rows)
 
 
 def train_one_epoch(model, examples, helpers, args, optimizer, criterion, device, relations, operations):
@@ -237,9 +273,24 @@ def main():
             "METRIC_TARGET:4,VALUE_ANCHOR:2,TEMPORAL_FILTER:1,ORDER_KEY:1"
         ),
     )
+    parser.add_argument("--assembly-method", choices=["legacy", "calibrated"], default="calibrated")
+    parser.add_argument(
+        "--operation-budgets",
+        type=parse_budget_text,
+        default=",".join(f"{key}:{value}" for key, value in DEFAULT_OPERATION_BUDGETS.items()),
+    )
+    parser.add_argument("--operation-weights", type=lambda text: parse_float_map(text, DEFAULT_OPERATION_WEIGHTS), default=None)
+    parser.add_argument("--calibration-rank-weight", type=float, default=0.7)
+    parser.add_argument("--calibration-z-weight", type=float, default=0.3)
+    parser.add_argument("--table-column-bonus", type=float, default=0.2)
+    parser.add_argument("--fk-bonus", type=float, default=0.1)
+    parser.add_argument("--max-tables", type=int, default=4)
+    parser.add_argument("--exclude-tables", action="store_true")
     parser.add_argument("--no-save-model", action="store_true")
     parser.add_argument("--dry-run-data-check", action="store_true")
     args = parser.parse_args()
+    if args.operation_weights is None:
+        args.operation_weights = dict(DEFAULT_OPERATION_WEIGHTS)
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -265,9 +316,19 @@ def main():
         "operation_types": args.operation_types,
         "include_empty_operation_examples": args.include_empty_operation_examples,
         "assembly_budgets": args.assembly_budgets,
+        "assembly_method": args.assembly_method,
+        "operation_budgets": args.operation_budgets,
+        "operation_weights": args.operation_weights,
+        "calibration_rank_weight": args.calibration_rank_weight,
+        "calibration_z_weight": args.calibration_z_weight,
+        "table_column_bonus": args.table_column_bonus,
+        "fk_bonus": args.fk_bonus,
+        "max_tables": args.max_tables,
+        "include_tables": not args.exclude_tables,
         "innovation": (
             "Operation embeddings condition RGTA message passing, so schema graph propagation "
-            "changes for different SQL relational operations instead of using static R-GCN/RGTA encodings."
+            "changes for different SQL relational operations instead of using static R-GCN/RGTA encodings. "
+            "Stage 8-B additionally calibrates operation-specific belief distributions before schema assembly."
         ),
     }
     write_json(output_dir / "data_report.json", data_report)
@@ -312,13 +373,8 @@ def main():
             dev_operation_metrics, dev_operation_predictions = evaluate_operation_examples(
                 model, dev_examples, helpers, args, device, graph_relations, operations
             )
-            assembled_rows = assemble_predictions(
-                dev_operation_predictions,
-                dev_aligned,
-                output_top_k=args.output_top_k,
-                budgets=args.assembly_budgets,
-            )
-            assembled_metrics = evaluate_assembled(assembled_rows)
+            assembled_rows = assemble_operation_predictions(dev_operation_predictions, dev_aligned, args)
+            assembled_metrics = evaluate_assembled_predictions(assembled_rows, args)
             dev_metrics = {**dev_operation_metrics, **assembled_metrics}
             selected_value = get_metric(dev_metrics, args.selection_metric)
             improved = is_better_metric(selected_value, best_value, args.selection_mode, args.min_delta)
@@ -363,13 +419,8 @@ def main():
     last_operation_metrics, last_operation_predictions = evaluate_operation_examples(
         model, dev_examples, helpers, args, device, graph_relations, operations, output_dir=output_dir, split="dev_last"
     )
-    last_assembled = assemble_predictions(
-        last_operation_predictions,
-        dev_aligned,
-        output_top_k=args.output_top_k,
-        budgets=args.assembly_budgets,
-    )
-    last_assembled_metrics = evaluate_assembled(last_assembled)
+    last_assembled = assemble_operation_predictions(last_operation_predictions, dev_aligned, args)
+    last_assembled_metrics = evaluate_assembled_predictions(last_assembled, args)
     write_jsonl(output_dir / "dev_last_assembled_predictions.jsonl", last_assembled)
     if not args.no_save_model:
         torch.save(model.state_dict(), output_dir / "operation_grounder_last_model.pt")
@@ -379,13 +430,8 @@ def main():
         final_operation_metrics, final_operation_predictions = evaluate_operation_examples(
             model, dev_examples, helpers, args, device, graph_relations, operations, output_dir=output_dir, split="dev"
         )
-        final_assembled = assemble_predictions(
-            final_operation_predictions,
-            dev_aligned,
-            output_top_k=args.output_top_k,
-            budgets=args.assembly_budgets,
-        )
-        final_assembled_metrics = evaluate_assembled(final_assembled)
+        final_assembled = assemble_operation_predictions(final_operation_predictions, dev_aligned, args)
+        final_assembled_metrics = evaluate_assembled_predictions(final_assembled, args)
         write_jsonl(output_dir / "dev_assembled_predictions.jsonl", final_assembled)
     else:
         final_operation_metrics = last_operation_metrics
