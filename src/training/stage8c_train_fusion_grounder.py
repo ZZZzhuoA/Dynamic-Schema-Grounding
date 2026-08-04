@@ -83,6 +83,28 @@ def item_to_tensors(item, helpers, args, relations, operations, device):
     }
 
 
+def pairwise_ranking_loss(logits, labels, torch, margin=1.0, max_negatives=30):
+    """Top-k oriented ranking loss for whole-schema grounding.
+
+    BCE learns independent node labels; this loss directly enforces gold schema
+    nodes to outrank high-scoring non-gold nodes.  Negative indices are selected
+    from current model scores with detach(), while the margin loss remains fully
+    differentiable for the selected logit pairs.
+    """
+
+    positive_mask = labels > 0.5
+    negative_mask = ~positive_mask
+    if positive_mask.sum() == 0 or negative_mask.sum() == 0:
+        return logits.new_tensor(0.0)
+    positive_logits = logits[positive_mask]
+    negative_logits = logits[negative_mask]
+    if max_negatives > 0 and negative_logits.numel() > max_negatives:
+        _, hard_negative_indices = torch.topk(negative_logits.detach(), k=max_negatives)
+        negative_logits = negative_logits[hard_negative_indices]
+    pair_losses = margin - positive_logits.unsqueeze(1) + negative_logits.unsqueeze(0)
+    return torch.relu(pair_losses).mean()
+
+
 def split_gold_ids_from_graph(graph_example, gold_ids):
     nodes = {int(node["id"]): node for node in graph_example["inference_inputs"]["schema_nodes"]}
     column_ids = [int(item_id) for item_id in gold_ids if nodes.get(int(item_id), {}).get("type") == "column"]
@@ -142,6 +164,7 @@ def train_one_epoch(model, aligned_records, helpers, args, optimizer, op_criteri
     losses = []
     op_losses = []
     whole_losses = []
+    rank_losses = []
     for item in aligned_records:
         tensors = item_to_tensors(item, helpers, args, relations, operations, device)
         output = model(
@@ -152,7 +175,18 @@ def train_one_epoch(model, aligned_records, helpers, args, optimizer, op_criteri
         )
         op_loss = op_criterion(output["operation_logits"], tensors["operation_labels"])
         whole_loss = whole_criterion(output["whole_logits"], tensors["whole_labels"])
-        loss = args.operation_loss_weight * op_loss + args.whole_loss_weight * whole_loss
+        rank_loss = pairwise_ranking_loss(
+            output["whole_logits"],
+            tensors["whole_labels"],
+            helpers["torch"],
+            margin=args.ranking_margin,
+            max_negatives=args.ranking_max_negatives,
+        )
+        loss = (
+            args.operation_loss_weight * op_loss
+            + args.whole_loss_weight * whole_loss
+            + args.ranking_loss_weight * rank_loss
+        )
         optimizer.zero_grad()
         loss.backward()
         helpers["torch"].nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
@@ -160,10 +194,12 @@ def train_one_epoch(model, aligned_records, helpers, args, optimizer, op_criteri
         losses.append(float(loss.detach().cpu()))
         op_losses.append(float(op_loss.detach().cpu()))
         whole_losses.append(float(whole_loss.detach().cpu()))
+        rank_losses.append(float(rank_loss.detach().cpu()))
     return {
         "loss": mean(losses),
         "operation_loss": mean(op_losses),
         "whole_loss": mean(whole_losses),
+        "ranking_loss": mean(rank_losses),
     }
 
 
@@ -179,6 +215,7 @@ def evaluate(model, aligned_records, helpers, args, device, relations, operation
     losses = []
     op_losses = []
     whole_losses = []
+    rank_losses = []
     by_operation = {
         operation: {
             "recall@5": [],
@@ -208,10 +245,22 @@ def evaluate(model, aligned_records, helpers, args, device, relations, operation
             )
             op_loss = op_criterion(output["operation_logits"], tensors["operation_labels"])
             whole_loss = whole_criterion(output["whole_logits"], tensors["whole_labels"])
-            loss = args.operation_loss_weight * op_loss + args.whole_loss_weight * whole_loss
+            rank_loss = pairwise_ranking_loss(
+                output["whole_logits"],
+                tensors["whole_labels"],
+                torch,
+                margin=args.ranking_margin,
+                max_negatives=args.ranking_max_negatives,
+            )
+            loss = (
+                args.operation_loss_weight * op_loss
+                + args.whole_loss_weight * whole_loss
+                + args.ranking_loss_weight * rank_loss
+            )
             losses.append(float(loss.detach().cpu()))
             op_losses.append(float(op_loss.detach().cpu()))
             whole_losses.append(float(whole_loss.detach().cpu()))
+            rank_losses.append(float(rank_loss.detach().cpu()))
 
             graph_example = item["graph_example"]
             relation_record = item["clause_record"]
@@ -250,6 +299,7 @@ def evaluate(model, aligned_records, helpers, args, device, relations, operation
         "loss": mean(losses),
         "operation_loss": mean(op_losses),
         "whole_loss": mean(whole_losses),
+        "ranking_loss": mean(rank_losses),
         "whole_schema_recall@30": mean(whole_recalls),
         "whole_schema_precision@30": mean(whole_precisions),
         "whole_column_recall@30": mean(whole_column_recalls),
@@ -294,6 +344,9 @@ def main():
     parser.add_argument("--whole-pos-weight", type=float, default=3.0)
     parser.add_argument("--operation-loss-weight", type=float, default=1.0)
     parser.add_argument("--whole-loss-weight", type=float, default=1.0)
+    parser.add_argument("--ranking-loss-weight", type=float, default=0.2)
+    parser.add_argument("--ranking-margin", type=float, default=1.0)
+    parser.add_argument("--ranking-max-negatives", type=int, default=30)
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--output-top-k", type=int, default=30)
@@ -318,7 +371,8 @@ def main():
         "innovation": (
             "Stage 8-C learns whole-schema fusion from operation-conditioned graph beliefs. "
             "Operation logits are latent variables supervised by relation labels, while whole logits "
-            "are directly supervised by whole-SQL schema labels."
+            "are directly supervised by whole-SQL schema labels. Stage 8-D1 adds pairwise ranking "
+            "loss so gold schema nodes outrank hard negative schema nodes."
         ),
     }
     write_json(output_dir / "data_report.json", data_report)
@@ -393,6 +447,7 @@ def main():
                 "train_loss": train_metrics["loss"],
                 "train_operation_loss": train_metrics["operation_loss"],
                 "train_whole_loss": train_metrics["whole_loss"],
+                "train_ranking_loss": train_metrics["ranking_loss"],
                 "selection_metric": args.selection_metric,
                 "selection_value": selected_value,
                 "best_epoch": best_epoch,
