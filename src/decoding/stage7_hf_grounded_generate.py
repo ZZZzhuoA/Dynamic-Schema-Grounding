@@ -4,7 +4,11 @@ from pathlib import Path
 
 import torch
 
-from stage7_grounded_logits import GroundedSchemaLogitsProcessor, summarize_token_sequences
+from stage7_grounded_logits import (
+    GroundedSchemaLogitsProcessor,
+    parse_operation_boosts,
+    summarize_token_sequences,
+)
 from stage7_schema_token_map import (
     apply_intervention,
     build_schema_token_sequences,
@@ -138,6 +142,14 @@ def main():
     parser.add_argument("--min-grounding-score", type=float, default=0.0)
     parser.add_argument("--enable-operation-gate", action="store_true")
     parser.add_argument("--require-identifier-position", action="store_true")
+    parser.add_argument("--use-operation-specific-gate", action="store_true")
+    parser.add_argument(
+        "--operation-boosts",
+        default="",
+        help="Comma-separated operation multipliers, e.g. PROJECT:1.0,FILTER:1.8,COMPUTE:1.2.",
+    )
+    parser.add_argument("--repetition-decay", type=float, default=0.0)
+    parser.add_argument("--max-schema-mentions", type=int, default=0)
     parser.add_argument("--disable-table-bias", action="store_true")
     parser.add_argument("--disallow-unknown-role", action="store_true")
     parser.add_argument("--intervention", choices=["none", "zero", "random", "reverse"], default="none")
@@ -203,6 +215,10 @@ def main():
             enable_operation_gate=args.enable_operation_gate,
             allow_unknown_role=not args.disallow_unknown_role,
             require_identifier_position=args.require_identifier_position,
+            operation_boosts=parse_operation_boosts(args.operation_boosts),
+            use_operation_specific_gate=args.use_operation_specific_gate,
+            repetition_decay=args.repetition_decay,
+            max_schema_mentions=args.max_schema_mentions,
         )
         processors = LogitsProcessorList([processor])
 
@@ -238,6 +254,10 @@ def main():
                 "boost": args.boost,
                 "enable_operation_gate": args.enable_operation_gate,
                 "require_identifier_position": args.require_identifier_position,
+                "use_operation_specific_gate": args.use_operation_specific_gate,
+                "operation_boosts": args.operation_boosts,
+                "repetition_decay": args.repetition_decay,
+                "max_schema_mentions": args.max_schema_mentions,
                 "disable_table_bias": args.disable_table_bias,
                 "disallow_unknown_role": args.disallow_unknown_role,
                 "processor_diagnostics": processor.diagnostics(),

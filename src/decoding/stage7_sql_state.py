@@ -58,6 +58,7 @@ class SQLOperationState:
     operation: str
     should_bias_schema: bool
     reason: str
+    operation_should_bias_schema: bool
 
 
 def normalize_sql(text: str) -> str:
@@ -143,6 +144,40 @@ def ends_like_identifier_position(sql: str) -> bool:
     return False
 
 
+def operation_specific_should_bias(sql: str, operation: str) -> bool:
+    """Operation-specific gate, less brittle than one global identifier gate."""
+
+    raw = str(sql or "")
+    tail = recent_text(raw, chars=128)
+    if ends_like_identifier_position(raw):
+        return True
+    if has_unclosed_identifier(raw):
+        return True
+
+    if operation in {OP_PROJECT, OP_COMPUTE, OP_AGGREGATE}:
+        return True
+    if operation == OP_FILTER:
+        # WHERE/FILTER needs stronger grounding, but only near predicate
+        # construction sites.  After a full predicate has been generated, this
+        # becomes false until AND/OR/comparison/function context appears again.
+        if re.search(r"\b(where|and|or)\s+[`\\[a-zA-Z_]", tail):
+            return True
+        if re.search(r"(=|>|<|>=|<=|<>|!=)\s*$", tail):
+            return True
+        if tail.endswith(" and") or tail.endswith(" or") or tail.endswith(" where"):
+            return True
+        return False
+    if operation == OP_JOIN:
+        return " on " in tail or tail.endswith(" on") or " join " in tail or tail.endswith(" join")
+    if operation == OP_ORDER:
+        return " order by " in tail or tail.endswith(" order by") or tail.endswith(",")
+    if operation == OP_GROUP:
+        return " group by " in tail or tail.endswith(" group by") or tail.endswith(",")
+    if operation == OP_WINDOW:
+        return " over " in tail or " partition by " in tail or " order by " in tail
+    return False
+
+
 def detect_operation_state(partial_sql: str) -> SQLOperationState:
     sql = str(partial_sql or "")
     norm = normalize_sql(sql)
@@ -151,22 +186,30 @@ def detect_operation_state(partial_sql: str) -> SQLOperationState:
     should_bias = ends_like_identifier_position(sql)
 
     if " over " in tail or tail.endswith(" over") or "partition by" in tail:
-        return SQLOperationState(OP_WINDOW, should_bias, "window keyword")
+        op = OP_WINDOW
+        return SQLOperationState(op, should_bias, "window keyword", operation_specific_should_bias(sql, op))
     if " order by " in tail or clause == "ORDER":
-        return SQLOperationState(OP_ORDER, should_bias, "order clause")
+        op = OP_ORDER
+        return SQLOperationState(op, should_bias, "order clause", operation_specific_should_bias(sql, op))
     if " group by " in tail or clause == "GROUP":
-        return SQLOperationState(OP_GROUP, should_bias, "group clause")
+        op = OP_GROUP
+        return SQLOperationState(op, should_bias, "group clause", operation_specific_should_bias(sql, op))
     if " join " in tail or " on " in tail or clause == "JOIN":
-        return SQLOperationState(OP_JOIN, should_bias, "join/on clause")
+        op = OP_JOIN
+        return SQLOperationState(op, should_bias, "join/on clause", operation_specific_should_bias(sql, op))
     if clause == "WHERE" or re.search(r"\b(where|and|or)\b", tail):
-        return SQLOperationState(OP_FILTER, should_bias, "filter clause")
+        op = OP_FILTER
+        return SQLOperationState(op, should_bias, "filter clause", operation_specific_should_bias(sql, op))
     if any(op in tail for op in [" + ", " - ", " * ", " / ", "cast(", "avg(", "sum(", "max(", "min(", "count("]):
-        return SQLOperationState(OP_COMPUTE, should_bias, "expression/function context")
+        op = OP_COMPUTE
+        return SQLOperationState(op, should_bias, "expression/function context", operation_specific_should_bias(sql, op))
     if clause == "SELECT" or norm.startswith("select"):
-        return SQLOperationState(OP_PROJECT, should_bias, "select projection")
+        op = OP_PROJECT
+        return SQLOperationState(op, should_bias, "select projection", operation_specific_should_bias(sql, op))
     if clause == "FROM":
-        return SQLOperationState(OP_JOIN, should_bias, "from source")
-    return SQLOperationState(OP_UNKNOWN, should_bias, "fallback")
+        op = OP_JOIN
+        return SQLOperationState(op, should_bias, "from source", operation_specific_should_bias(sql, op))
+    return SQLOperationState(OP_UNKNOWN, should_bias, "fallback", operation_specific_should_bias(sql, OP_UNKNOWN))
 
 
 ROLE_TO_OPERATIONS = {

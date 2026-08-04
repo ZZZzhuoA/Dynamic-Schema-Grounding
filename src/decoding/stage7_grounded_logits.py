@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from collections import defaultdict
 from typing import Any
+import math
+import re
 
 import torch
 
@@ -30,6 +32,40 @@ def _suffix_matches_prefix(generated: list[int], sequence: list[int]) -> int:
     return 0
 
 
+def parse_operation_boosts(text: str | None) -> dict[str, float]:
+    boosts: dict[str, float] = {}
+    if not text:
+        return boosts
+    for chunk in str(text).split(","):
+        if not chunk.strip() or ":" not in chunk:
+            continue
+        key, value = chunk.split(":", 1)
+        try:
+            boosts[key.strip().upper()] = float(value)
+        except ValueError:
+            continue
+    return boosts
+
+
+def normalize_for_count(text: str) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", str(text or "").lower()).strip()
+
+
+def schema_mention_count(generated_text: str, schema_name: str) -> int:
+    if not generated_text or not schema_name:
+        return 0
+    candidates = [schema_name]
+    if "." in schema_name:
+        candidates.append(schema_name.split(".", 1)[1])
+    norm_text = f" {normalize_for_count(generated_text)} "
+    count = 0
+    for candidate in candidates:
+        norm_candidate = normalize_for_count(candidate)
+        if norm_candidate:
+            count = max(count, norm_text.count(f" {norm_candidate} "))
+    return count
+
+
 class GroundedSchemaLogitsProcessor(LogitsProcessor):
     """Bias next-token logits toward schema token sequences.
 
@@ -50,6 +86,10 @@ class GroundedSchemaLogitsProcessor(LogitsProcessor):
         enable_operation_gate: bool = False,
         allow_unknown_role: bool = True,
         require_identifier_position: bool = False,
+        operation_boosts: dict[str, float] | None = None,
+        use_operation_specific_gate: bool = False,
+        repetition_decay: float = 0.0,
+        max_schema_mentions: int = 0,
     ):
         self.schema_token_sequences = schema_token_sequences
         self.prompt_lengths = prompt_lengths
@@ -61,12 +101,19 @@ class GroundedSchemaLogitsProcessor(LogitsProcessor):
         self.enable_operation_gate = bool(enable_operation_gate)
         self.allow_unknown_role = bool(allow_unknown_role)
         self.require_identifier_position = bool(require_identifier_position)
+        self.operation_boosts = operation_boosts or {}
+        self.use_operation_specific_gate = bool(use_operation_specific_gate)
+        self.repetition_decay = float(repetition_decay)
+        self.max_schema_mentions = int(max_schema_mentions)
         self.call_count = 0
         self.total_biased_tokens = 0
         self.max_observed_bias = 0.0
         self.gated_off_calls = 0
+        self.operation_specific_gated_off_calls = 0
         self.operation_counts = defaultdict(int)
         self.role_filtered_sequences = 0
+        self.repetition_filtered_sequences = 0
+        self.repetition_decayed_sequences = 0
 
     def _generated_text(self, generated_ids: list[int]) -> str:
         if self.tokenizer is None or not generated_ids:
@@ -85,6 +132,9 @@ class GroundedSchemaLogitsProcessor(LogitsProcessor):
             if self.enable_operation_gate and self.require_identifier_position and not state.should_bias_schema:
                 self.gated_off_calls += 1
                 continue
+            if self.enable_operation_gate and self.use_operation_specific_gate and not state.operation_should_bias_schema:
+                self.operation_specific_gated_off_calls += 1
+                continue
             token_bias = defaultdict(float)
             sequences = self.schema_token_sequences[row] if row < len(self.schema_token_sequences) else []
 
@@ -100,8 +150,19 @@ class GroundedSchemaLogitsProcessor(LogitsProcessor):
                 if not token_ids:
                     continue
                 weight = self.boost * float(item.get("score", 1.0))
+                if state.operation in self.operation_boosts:
+                    weight *= self.operation_boosts[state.operation]
                 if weight <= 0:
                     continue
+                mention_count = schema_mention_count(generated_text, str(item.get("schema") or ""))
+                if self.max_schema_mentions > 0 and mention_count >= self.max_schema_mentions:
+                    self.repetition_filtered_sequences += 1
+                    continue
+                if self.repetition_decay > 0 and mention_count > 0:
+                    weight *= math.exp(-self.repetition_decay * mention_count)
+                    self.repetition_decayed_sequences += 1
+                    if weight <= 0:
+                        continue
 
                 matched = _suffix_matches_prefix(generated, token_ids)
                 if matched > 0 and matched < len(token_ids):
@@ -128,10 +189,17 @@ class GroundedSchemaLogitsProcessor(LogitsProcessor):
             "max_observed_bias_before_cap": self.max_observed_bias,
             "max_bias_per_token": self.max_bias_per_token,
             "gated_off_calls": self.gated_off_calls,
+            "operation_specific_gated_off_calls": self.operation_specific_gated_off_calls,
             "operation_counts": dict(self.operation_counts),
             "role_filtered_sequences": self.role_filtered_sequences,
+            "repetition_filtered_sequences": self.repetition_filtered_sequences,
+            "repetition_decayed_sequences": self.repetition_decayed_sequences,
             "enable_operation_gate": self.enable_operation_gate,
             "require_identifier_position": self.require_identifier_position,
+            "use_operation_specific_gate": self.use_operation_specific_gate,
+            "operation_boosts": self.operation_boosts,
+            "repetition_decay": self.repetition_decay,
+            "max_schema_mentions": self.max_schema_mentions,
         }
 
 
