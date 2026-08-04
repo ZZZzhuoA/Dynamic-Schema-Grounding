@@ -60,6 +60,62 @@ def load_schema_semantic_cards(path: Path | None):
     return cards_by_db
 
 
+def load_question_cards(path: Path | None):
+    if path is None:
+        return {}
+    cards = {}
+    for index, card in enumerate(read_jsonl(path)):
+        db_id = card.get("db_id")
+        question_id = card.get("question_id")
+        record_index = card.get("record_index", index)
+        if db_id is not None and question_id is not None:
+            cards[("qid", db_id, question_id)] = card
+        cards[("idx", record_index)] = card
+    return cards
+
+
+def question_card_key(record, record_index):
+    if record.get("db_id") is not None and record.get("question_id") is not None:
+        return ("qid", record.get("db_id"), record.get("question_id"))
+    return ("idx", record_index)
+
+
+def question_semantic_text(card):
+    if not card:
+        return None
+    parts = []
+    for key in ["normalized_question", "intent"]:
+        value = card.get(key)
+        if value:
+            parts.append(str(value))
+    mentions = []
+    for mention in card.get("mentions", [])[:12]:
+        if not isinstance(mention, dict):
+            continue
+        fields = [
+            mention.get("phrase"),
+            mention.get("semantic_hint"),
+            mention.get("operation"),
+            mention.get("relation_type"),
+            mention.get("value_hint"),
+        ]
+        text = " / ".join(str(x) for x in fields if x)
+        if text:
+            mentions.append(text)
+    if mentions:
+        parts.append("mentions: " + "; ".join(mentions))
+    for key, label in [
+        ("operation_hints", "operations"),
+        ("value_hints", "values"),
+        ("formula_hints", "formulas"),
+        ("ordering_hints", "ordering"),
+    ]:
+        values = card.get(key) or []
+        if values:
+            parts.append(label + ": " + "; ".join(str(x) for x in values[:12]))
+    return " | ".join(parts)
+
+
 def semantic_text_from_card(card):
     if not card:
         return None
@@ -217,7 +273,14 @@ def table_column_label_splits(record):
     return table_ids, column_ids
 
 
-def make_example(record, table_entry, record_index, include_same_table_edges=False, semantic_cards_by_id=None):
+def make_example(
+    record,
+    table_entry,
+    record_index,
+    include_same_table_edges=False,
+    semantic_cards_by_id=None,
+    question_card=None,
+):
     nodes = schema_nodes(record["schema_items"], semantic_cards_by_id)
     edges = schema_edges(record["schema_items"], table_entry, include_same_table_edges)
     label_vector = grounding_vector(record)
@@ -232,6 +295,9 @@ def make_example(record, table_entry, record_index, include_same_table_edges=Fal
         "schema_nodes": nodes,
         "schema_edges": edges,
     }
+    if question_card:
+        inference_inputs["question_card"] = question_card
+        inference_inputs["question_semantic_text"] = question_semantic_text(question_card)
     training_targets = {
         "sql": record.get("sql"),
         "grounding_label_ids": record.get("whole_sql_labels", []),
@@ -249,6 +315,7 @@ def make_example(record, table_entry, record_index, include_same_table_edges=Fal
         "used_tables_from_sql": record.get("used_tables_from_sql", []),
         "hit_unmapped": record.get("hit_unmapped", []),
         "schema_semantic_cards_attached": bool(semantic_cards_by_id),
+        "question_card_attached": bool(question_card),
     }
     stable_id = record.get("question_id")
     if stable_id is None:
@@ -261,7 +328,13 @@ def make_example(record, table_entry, record_index, include_same_table_edges=Fal
     }
 
 
-def build_split(records, table_entries, include_same_table_edges=False, semantic_cards_by_db=None):
+def build_split(
+    records,
+    table_entries,
+    include_same_table_edges=False,
+    semantic_cards_by_db=None,
+    question_cards=None,
+):
     semantic_cards_by_db = semantic_cards_by_db or {}
     examples = []
     for index, record in enumerate(records):
@@ -273,6 +346,7 @@ def build_split(records, table_entries, include_same_table_edges=False, semantic
                 index,
                 include_same_table_edges,
                 semantic_cards_by_db.get(record["db_id"], {}),
+                (question_cards or {}).get(question_card_key(record, index)) or (question_cards or {}).get(("idx", index)),
             )
         )
     return examples
@@ -289,6 +363,7 @@ def summarize_examples(examples):
     missing_question_ids = 0
     leakage_violations = []
     semantic_node_counts = []
+    question_card_count = 0
 
     forbidden_inference_keys = {
         "sql",
@@ -308,6 +383,8 @@ def summarize_examples(examples):
         edges = inputs.get("schema_edges", [])
         node_counts.append(len(nodes))
         semantic_node_counts.append(sum(1 for node in nodes if node.get("semantic_text")))
+        if inputs.get("question_semantic_text"):
+            question_card_count += 1
         edge_counts.append(len(edges))
         label_counts.append(len(targets.get("grounding_label_ids", [])))
         table_label_counts.append(len(targets.get("grounding_table_label_ids", [])))
@@ -340,6 +417,7 @@ def summarize_examples(examples):
         "semantic_node_attachment_rate": (
             sum(semantic_node_counts) / sum(node_counts) if sum(node_counts) else 0
         ),
+        "question_card_attachment_rate": question_card_count / len(examples) if examples else 0,
         "edge_type_counts": dict(sorted(relation_counter.items())),
         "inference_target_leakage_violation_count": len(leakage_violations),
         "inference_target_leakage_examples": leakage_violations[:5],
@@ -362,6 +440,8 @@ def write_example_markdown(path: Path, examples_by_split):
             f.write(f"- Question: {inputs.get('question')}\n")
             if inputs.get("evidence"):
                 f.write(f"- Evidence: {inputs.get('evidence')}\n")
+            if inputs.get("question_semantic_text"):
+                f.write(f"- Question semantic text: {inputs.get('question_semantic_text')[:300]}\n")
             f.write(f"- Schema nodes: {len(inputs.get('schema_nodes', []))}\n")
             f.write(f"- Schema edges: {len(inputs.get('schema_edges', []))}\n\n")
             f.write("First schema nodes:\n\n")
@@ -398,6 +478,8 @@ def main():
     parser.add_argument("--dev-tables", default="Data/BIRD/dev_tables.json")
     parser.add_argument("--train-schema-semantic-cards", default=None)
     parser.add_argument("--dev-schema-semantic-cards", default=None)
+    parser.add_argument("--train-question-cards", default=None)
+    parser.add_argument("--dev-question-cards", default=None)
     parser.add_argument("--output-dir", default="experiments/stage5_dsg_data")
     parser.add_argument("--train-limit", type=int, default=None)
     parser.add_argument("--dev-limit", type=int, default=None)
@@ -415,18 +497,22 @@ def main():
     dev_semantic_cards = load_schema_semantic_cards(
         Path(args.dev_schema_semantic_cards) if args.dev_schema_semantic_cards else None
     )
+    train_question_cards = load_question_cards(Path(args.train_question_cards) if args.train_question_cards else None)
+    dev_question_cards = load_question_cards(Path(args.dev_question_cards) if args.dev_question_cards else None)
 
     train_examples = build_split(
         train_records,
         train_tables,
         args.include_same_table_edges,
         train_semantic_cards,
+        train_question_cards,
     )
     dev_examples = build_split(
         dev_records,
         dev_tables,
         args.include_same_table_edges,
         dev_semantic_cards,
+        dev_question_cards,
     )
 
     write_jsonl(output_dir / "train_examples.jsonl", train_examples)

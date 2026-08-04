@@ -45,7 +45,15 @@ def hash_vector(text, dim):
 
 
 def query_text(inference_inputs):
-    return f"{inference_inputs.get('question') or ''} {inference_inputs.get('evidence') or ''}"
+    return " ".join(
+        str(part)
+        for part in [
+            inference_inputs.get("question") or "",
+            inference_inputs.get("evidence") or "",
+            inference_inputs.get("question_semantic_text") or "",
+        ]
+        if part
+    )
 
 
 def node_text(node):
