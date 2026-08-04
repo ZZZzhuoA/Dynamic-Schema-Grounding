@@ -136,6 +136,10 @@ def main():
     parser.add_argument("--max-bias-per-token", type=float, default=6.0)
     parser.add_argument("--max-schema-items", type=int, default=80)
     parser.add_argument("--min-grounding-score", type=float, default=0.0)
+    parser.add_argument("--enable-operation-gate", action="store_true")
+    parser.add_argument("--require-identifier-position", action="store_true")
+    parser.add_argument("--disable-table-bias", action="store_true")
+    parser.add_argument("--disallow-unknown-role", action="store_true")
     parser.add_argument("--intervention", choices=["none", "zero", "random", "reverse"], default="none")
     parser.add_argument("--seed", type=int, default=13)
     parser.add_argument("--dtype", choices=["auto", "float16", "bfloat16", "float32"], default="bfloat16")
@@ -187,13 +191,18 @@ def main():
             grounded_items,
             max_items=args.max_schema_items,
             min_score=args.min_grounding_score,
+            include_tables=not args.disable_table_bias,
         )
         processor = GroundedSchemaLogitsProcessor(
             [token_sequences],
             [prompt_len],
+            tokenizer=tokenizer,
             boost=args.boost,
             first_token_boost_ratio=args.first_token_boost_ratio,
             max_bias_per_token=args.max_bias_per_token,
+            enable_operation_gate=args.enable_operation_gate,
+            allow_unknown_role=not args.disallow_unknown_role,
+            require_identifier_position=args.require_identifier_position,
         )
         processors = LogitsProcessorList([processor])
 
@@ -227,6 +236,10 @@ def main():
                 "token_sequence_count": len(token_sequences),
                 "intervention": args.intervention,
                 "boost": args.boost,
+                "enable_operation_gate": args.enable_operation_gate,
+                "require_identifier_position": args.require_identifier_position,
+                "disable_table_bias": args.disable_table_bias,
+                "disallow_unknown_role": args.disallow_unknown_role,
                 "processor_diagnostics": processor.diagnostics(),
                 "top_sequences": summarize_token_sequences(token_sequences) if args.debug_token_map else [],
             },

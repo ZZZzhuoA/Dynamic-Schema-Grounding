@@ -7,6 +7,8 @@ from typing import Any
 
 import torch
 
+from stage7_sql_state import detect_operation_state, role_allowed_for_operation
+
 try:
     from transformers import LogitsProcessor
 except ImportError:  # pragma: no cover - imported on the server runtime.
@@ -40,20 +42,36 @@ class GroundedSchemaLogitsProcessor(LogitsProcessor):
         self,
         schema_token_sequences: list[list[dict[str, Any]]],
         prompt_lengths: list[int],
+        tokenizer: Any | None = None,
         boost: float = 1.5,
         first_token_boost_ratio: float = 0.35,
         continuation_boost_ratio: float = 1.0,
         max_bias_per_token: float = 6.0,
+        enable_operation_gate: bool = False,
+        allow_unknown_role: bool = True,
+        require_identifier_position: bool = False,
     ):
         self.schema_token_sequences = schema_token_sequences
         self.prompt_lengths = prompt_lengths
+        self.tokenizer = tokenizer
         self.boost = float(boost)
         self.first_token_boost_ratio = float(first_token_boost_ratio)
         self.continuation_boost_ratio = float(continuation_boost_ratio)
         self.max_bias_per_token = float(max_bias_per_token)
+        self.enable_operation_gate = bool(enable_operation_gate)
+        self.allow_unknown_role = bool(allow_unknown_role)
+        self.require_identifier_position = bool(require_identifier_position)
         self.call_count = 0
         self.total_biased_tokens = 0
         self.max_observed_bias = 0.0
+        self.gated_off_calls = 0
+        self.operation_counts = defaultdict(int)
+        self.role_filtered_sequences = 0
+
+    def _generated_text(self, generated_ids: list[int]) -> str:
+        if self.tokenizer is None or not generated_ids:
+            return ""
+        return self.tokenizer.decode(generated_ids, skip_special_tokens=True)
 
     def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor) -> torch.FloatTensor:
         self.call_count += 1
@@ -61,10 +79,23 @@ class GroundedSchemaLogitsProcessor(LogitsProcessor):
         for row in range(batch_size):
             prompt_len = self.prompt_lengths[row] if row < len(self.prompt_lengths) else 0
             generated = input_ids[row, prompt_len:].tolist()
+            generated_text = self._generated_text(generated)
+            state = detect_operation_state(generated_text)
+            self.operation_counts[state.operation] += 1
+            if self.enable_operation_gate and self.require_identifier_position and not state.should_bias_schema:
+                self.gated_off_calls += 1
+                continue
             token_bias = defaultdict(float)
             sequences = self.schema_token_sequences[row] if row < len(self.schema_token_sequences) else []
 
             for item in sequences:
+                if self.enable_operation_gate and not role_allowed_for_operation(
+                    item.get("role"),
+                    state.operation,
+                    allow_unknown_role=self.allow_unknown_role,
+                ):
+                    self.role_filtered_sequences += 1
+                    continue
                 token_ids = item.get("token_ids") or []
                 if not token_ids:
                     continue
@@ -96,6 +127,11 @@ class GroundedSchemaLogitsProcessor(LogitsProcessor):
             ),
             "max_observed_bias_before_cap": self.max_observed_bias,
             "max_bias_per_token": self.max_bias_per_token,
+            "gated_off_calls": self.gated_off_calls,
+            "operation_counts": dict(self.operation_counts),
+            "role_filtered_sequences": self.role_filtered_sequences,
+            "enable_operation_gate": self.enable_operation_gate,
+            "require_identifier_position": self.require_identifier_position,
         }
 
 

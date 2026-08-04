@@ -115,6 +115,16 @@ def _score_from_object(obj: dict[str, Any], default: float) -> float:
     return default
 
 
+def _role_from_object(obj: dict[str, Any]) -> str | None:
+    return (
+        obj.get("role")
+        or obj.get("relation")
+        or obj.get("clause")
+        or obj.get("source_clause")
+        or obj.get("operation")
+    )
+
+
 def _append_item(
     items: list[GroundedSchemaItem],
     full_name: str,
@@ -201,7 +211,7 @@ def items_from_prediction_record(record: dict[str, Any], top_k: int | None = Non
                         full_name,
                         _score_from_object(obj, default_score),
                         key,
-                        role=obj.get("role") or obj.get("relation") or obj.get("clause"),
+                        role=_role_from_object(obj),
                     )
 
     # Relation-role outputs may be stored as buckets: {"WHERE": [...], ...}.
