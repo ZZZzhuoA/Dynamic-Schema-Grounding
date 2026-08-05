@@ -50,6 +50,11 @@ def load_table_entries(path: Path):
 def load_schema_semantic_cards(path: Path | None):
     if path is None:
         return {}
+    if not path.exists():
+        raise FileNotFoundError(
+            f"Schema semantic card file not found: {path}. "
+            "Stage 8F writes files like dev_schema_semantic_cards.jsonl."
+        )
     cards_by_db = defaultdict(dict)
     for card in read_jsonl(path):
         db_id = card.get("db_id")
@@ -63,6 +68,11 @@ def load_schema_semantic_cards(path: Path | None):
 def load_question_cards(path: Path | None):
     if path is None:
         return {}
+    if not path.exists():
+        raise FileNotFoundError(
+            f"Question card file not found: {path}. "
+            "Stage 8F writes files like dev_question_cards.jsonl."
+        )
     cards = {}
     for index, card in enumerate(read_jsonl(path)):
         db_id = card.get("db_id")
@@ -476,10 +486,30 @@ def main():
         default="Data/BIRD/train_databases/train_databases/train_tables.json",
     )
     parser.add_argument("--dev-tables", default="Data/BIRD/dev_tables.json")
-    parser.add_argument("--train-schema-semantic-cards", default=None)
-    parser.add_argument("--dev-schema-semantic-cards", default=None)
-    parser.add_argument("--train-question-cards", default=None)
-    parser.add_argument("--dev-question-cards", default=None)
+    parser.add_argument(
+        "--train-schema-semantic-cards",
+        "--train-schema-cards",
+        dest="train_schema_semantic_cards",
+        default=None,
+    )
+    parser.add_argument(
+        "--dev-schema-semantic-cards",
+        "--dev-schema-cards",
+        dest="dev_schema_semantic_cards",
+        default=None,
+    )
+    parser.add_argument(
+        "--train-question-cards",
+        "--train-question-semantic-cards",
+        dest="train_question_cards",
+        default=None,
+    )
+    parser.add_argument(
+        "--dev-question-cards",
+        "--dev-question-semantic-cards",
+        dest="dev_question_cards",
+        default=None,
+    )
     parser.add_argument("--output-dir", default="experiments/stage5_dsg_data")
     parser.add_argument("--train-limit", type=int, default=None)
     parser.add_argument("--dev-limit", type=int, default=None)
