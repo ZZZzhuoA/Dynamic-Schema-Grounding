@@ -315,3 +315,96 @@ class DSGGrounder(nn.Module):
             "logits": logits,
             "schema_node_embeddings": node_states,
         }
+
+
+class RelationConditionedDSGGrounder(DSGGrounder):
+    """DSG grounder with an explicit operation relation and semantic prior.
+
+    Dense embedding caches are built once per question, so relation markers
+    inserted later by ``make_relation_examples`` are absent from cached query
+    vectors.  This module makes the relation an explicit latent input and adds
+    a non-negative, relation-specific cosine prior to the learned graph score.
+    """
+
+    def __init__(
+        self,
+        *args,
+        operation_relations,
+        use_relation_embedding=True,
+        prior_init=1.0,
+        join_prior_init=0.1,
+        **kwargs,
+    ):
+        super().__init__(*args, **kwargs)
+        if not operation_relations:
+            raise ValueError("operation_relations must not be empty")
+        self.operation_relations = list(operation_relations)
+        self.use_relation_embedding = bool(use_relation_embedding)
+        self.operation_embedding = nn.Embedding(len(self.operation_relations), self.hidden_dim)
+        self.operation_norm = nn.LayerNorm(self.hidden_dim)
+
+        initial_scales = []
+        for relation in self.operation_relations:
+            value = join_prior_init if relation == "JOIN_BRIDGE" else prior_init
+            value = max(float(value), 1e-6)
+            initial_scales.append(math.log(math.expm1(value)))
+        self.raw_prior_scales = nn.Parameter(torch.tensor(initial_scales, dtype=torch.float32))
+
+    def prior_scales(self):
+        return F.softplus(self.raw_prior_scales)
+
+    def forward(
+        self,
+        query_features,
+        node_features,
+        edges,
+        lex_features=None,
+        relation_id=None,
+        similarity_prior=None,
+    ):
+        if relation_id is None:
+            raise ValueError("relation_id is required for RelationConditionedDSGGrounder")
+        if not torch.is_tensor(relation_id):
+            relation_id = torch.tensor(relation_id, dtype=torch.long, device=query_features.device)
+        relation_id = relation_id.reshape(())
+
+        query = self.query_input(query_features).squeeze(0)
+        if self.use_relation_embedding:
+            relation_state = self.operation_embedding(relation_id)
+            conditioned_query = self.operation_norm(query + relation_state)
+        else:
+            conditioned_query = query
+        node_states = self.encode_schema(node_features, edges)
+        query_matrix = conditioned_query.unsqueeze(0).expand_as(node_states)
+        pair = torch.cat(
+            [
+                query_matrix,
+                node_states,
+                query_matrix * node_states,
+                torch.abs(query_matrix - node_states),
+            ],
+            dim=-1,
+        )
+        if self.lexical_dim:
+            if lex_features is None:
+                lex_features = torch.zeros(
+                    (node_states.shape[0], self.lexical_dim),
+                    dtype=node_states.dtype,
+                    device=node_states.device,
+                )
+            pair = torch.cat([pair, lex_features], dim=-1)
+
+        neural_logits = self.scorer(pair).squeeze(-1)
+        prior_scale = self.prior_scales()[relation_id]
+        if similarity_prior is None:
+            logits = neural_logits
+        else:
+            logits = neural_logits + prior_scale * similarity_prior.to(neural_logits.dtype)
+        return {
+            "logits": logits,
+            "neural_logits": neural_logits,
+            "similarity_prior": similarity_prior,
+            "prior_scale": prior_scale,
+            "schema_node_embeddings": node_states,
+            "conditioned_query_embedding": conditioned_query,
+        }

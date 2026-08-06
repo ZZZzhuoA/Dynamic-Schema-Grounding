@@ -44,6 +44,7 @@ def import_runtime():
     from src.modeling.dsg_grounder import (
         DEFAULT_RELATIONS,
         DSGGrounder,
+        RelationConditionedDSGGrounder,
         lexical_features,
         make_edge_tensors,
         make_node_features,
@@ -56,6 +57,7 @@ def import_runtime():
         "nn": nn,
         "DEFAULT_RELATIONS": DEFAULT_RELATIONS,
         "DSGGrounder": DSGGrounder,
+        "RelationConditionedDSGGrounder": RelationConditionedDSGGrounder,
         "lexical_features": lexical_features,
         "make_edge_tensors": make_edge_tensors,
         "make_node_features": make_node_features,
@@ -101,6 +103,8 @@ def build_feature_tensors(example, cache, runtime, args, graph_relations, device
     inputs = example["inference_inputs"]
     query_parts = []
     node_parts = []
+    dense_query = None
+    dense_nodes = None
     if args.feature_mode in {"hash", "hash_dense"}:
         query_parts.append(runtime["make_query_features"](inputs, args.hash_dim).to(device))
         node_parts.append(runtime["make_node_features"](inputs, args.hash_dim).to(device))
@@ -111,6 +115,10 @@ def build_feature_tensors(example, cache, runtime, args, graph_relations, device
             dense_nodes = torch.nn.functional.normalize(dense_nodes, p=2, dim=-1)
         query_parts.append(dense_query)
         node_parts.append(dense_nodes)
+    if args.use_similarity_prior and dense_query is None:
+        dense_query, dense_nodes = dense_features_for_example(example, cache, runtime, device)
+        dense_query = torch.nn.functional.normalize(dense_query, p=2, dim=-1)
+        dense_nodes = torch.nn.functional.normalize(dense_nodes, p=2, dim=-1)
     if not query_parts or not node_parts:
         raise ValueError(f"Unsupported feature_mode: {args.feature_mode}")
     query_features = torch.cat(query_parts, dim=-1)
@@ -126,13 +134,48 @@ def build_feature_tensors(example, cache, runtime, args, graph_relations, device
         dtype=torch.float32,
         device=device,
     )
+    similarity_prior = None
+    if args.use_similarity_prior:
+        normalized_query = torch.nn.functional.normalize(dense_query, p=2, dim=-1)
+        normalized_nodes = torch.nn.functional.normalize(dense_nodes, p=2, dim=-1)
+        similarity_prior = (normalized_nodes * normalized_query).sum(dim=-1)
+        if args.similarity_prior_normalization == "zscore":
+            similarity_prior = (similarity_prior - similarity_prior.mean()) / similarity_prior.std(
+                unbiased=False
+            ).clamp_min(1e-6)
+        elif args.similarity_prior_normalization == "center":
+            similarity_prior = similarity_prior - similarity_prior.mean()
+        similarity_prior = similarity_prior.clamp(
+            min=-args.similarity_prior_clip,
+            max=args.similarity_prior_clip,
+        )
     return {
         "query_features": query_features,
         "node_features": node_features,
         "edge_tensors": edge_tensors,
         "lexical_features": lex,
         "labels": labels,
+        "similarity_prior": similarity_prior,
     }
+
+
+def forward_model(model, example, tensors, args):
+    if args.use_relation_conditioning or args.use_similarity_prior:
+        relation_id = args.relation_to_id[example["relation_type"]]
+        return model(
+            tensors["query_features"],
+            tensors["node_features"],
+            tensors["edge_tensors"],
+            tensors["lexical_features"],
+            relation_id=relation_id,
+            similarity_prior=tensors["similarity_prior"],
+        )
+    return model(
+        tensors["query_features"],
+        tensors["node_features"],
+        tensors["edge_tensors"],
+        tensors["lexical_features"],
+    )
 
 
 def split_gold_ids(example):
@@ -147,12 +190,7 @@ def train_one_epoch(model, examples, cache, runtime, args, optimizer, criterion,
     total_loss = 0.0
     for example in examples:
         tensors = build_feature_tensors(example, cache, runtime, args, graph_relations, device)
-        output = model(
-            tensors["query_features"],
-            tensors["node_features"],
-            tensors["edge_tensors"],
-            tensors["lexical_features"],
-        )
+        output = forward_model(model, example, tensors, args)
         loss = criterion(output["logits"], tensors["labels"])
         optimizer.zero_grad()
         loss.backward()
@@ -185,12 +223,7 @@ def evaluate_relation_examples(model, examples, cache, runtime, args, device, gr
     with torch.no_grad():
         for example in examples:
             tensors = build_feature_tensors(example, cache, runtime, args, graph_relations, device)
-            output = model(
-                tensors["query_features"],
-                tensors["node_features"],
-                tensors["edge_tensors"],
-                tensors["lexical_features"],
-            )
+            output = forward_model(model, example, tensors, args)
             loss = criterion(output["logits"], tensors["labels"])
             losses.append(float(loss.detach().cpu()))
             scores = output["logits"].detach().cpu().tolist()
@@ -220,6 +253,11 @@ def evaluate_relation_examples(model, examples, cache, runtime, args, device, gr
                     "relation_type": relation,
                     "gold_label_ids": gold_ids,
                     "gold_label_names": example["training_targets"].get("grounding_label_names", []),
+                    "similarity_prior_scale": (
+                        float(output["prior_scale"].detach().cpu())
+                        if args.use_similarity_prior
+                        else None
+                    ),
                     f"top_{args.output_top_k}": top_rows,
                 }
             )
@@ -279,6 +317,32 @@ def main():
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--output-top-k", type=int, default=30)
     parser.add_argument("--use-lexical-features", action="store_true")
+    parser.add_argument(
+        "--use-relation-conditioned-prior",
+        action="store_true",
+        help=(
+            "Convenience switch enabling both --use-relation-conditioning and "
+            "--use-similarity-prior."
+        ),
+    )
+    parser.add_argument(
+        "--use-relation-conditioning",
+        action="store_true",
+        help="Condition the query state on a trainable operation-relation embedding.",
+    )
+    parser.add_argument(
+        "--use-similarity-prior",
+        action="store_true",
+        help="Fuse cosine similarity through a trainable relation-specific non-negative scale.",
+    )
+    parser.add_argument("--similarity-prior-init", type=float, default=1.0)
+    parser.add_argument("--join-prior-init", type=float, default=0.1)
+    parser.add_argument(
+        "--similarity-prior-normalization",
+        choices=["none", "center", "zscore"],
+        default="zscore",
+    )
+    parser.add_argument("--similarity-prior-clip", type=float, default=4.0)
     parser.add_argument("--selection-metric", default="assembled_schema_recall@30")
     parser.add_argument("--selection-mode", choices=["max", "min"], default="max")
     parser.add_argument("--patience", type=int, default=3)
@@ -294,6 +358,10 @@ def main():
     parser.add_argument("--no-save-model", action="store_true")
     parser.add_argument("--dry-run-data-check", action="store_true")
     args = parser.parse_args()
+    if args.use_relation_conditioned_prior:
+        args.use_relation_conditioning = True
+        args.use_similarity_prior = True
+    args.relation_to_id = {relation: index for index, relation in enumerate(args.relation_types)}
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -328,8 +396,9 @@ def main():
         "dev_query_dim": dev_cache["query_dim"],
         "dev_node_dim": dev_cache["node_dim"],
         "innovation": (
-            "Dense semantic-card embeddings are injected into schema/query features before graph propagation, "
-            "so the graph grounder consumes neural semantic representations instead of only hashed strings."
+            "Dense semantic-card embeddings are injected into schema/query features before graph propagation. "
+            "Relation conditioning makes the operation an explicit latent input; similarity-prior mode "
+            "preserves direct semantic evidence through a learned relation-specific residual score."
         ),
     }
     write_json(output_dir / "data_report.json", data_report)
@@ -340,7 +409,12 @@ def main():
     torch = runtime["torch"]
     device = torch.device(args.device)
     graph_relations = list(runtime["DEFAULT_RELATIONS"])
-    model = runtime["DSGGrounder"](
+    model_cls = (
+        runtime["RelationConditionedDSGGrounder"]
+        if args.use_relation_conditioning or args.use_similarity_prior
+        else runtime["DSGGrounder"]
+    )
+    model_kwargs = dict(
         hash_dim=input_dim,
         hidden_dim=args.hidden_dim,
         num_layers=args.num_layers,
@@ -348,12 +422,21 @@ def main():
         relations=graph_relations,
         encoder_type=args.encoder_type,
         lexical_dim=6 if args.use_lexical_features else 0,
-    ).to(device)
+    )
+    if args.use_relation_conditioning or args.use_similarity_prior:
+        model_kwargs.update(
+            operation_relations=args.relation_types,
+            use_relation_embedding=args.use_relation_conditioning,
+            prior_init=args.similarity_prior_init,
+            join_prior_init=args.join_prior_init,
+        )
+    model = model_cls(**model_kwargs).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     criterion = runtime["nn"].BCEWithLogitsLoss(
         pos_weight=torch.tensor(args.pos_weight, dtype=torch.float32, device=device)
     )
     config = vars(args).copy()
+    config.pop("relation_to_id", None)
     config["torch_version"] = torch.__version__
     config["graph_relations"] = graph_relations
     config["input_dim"] = input_dim
@@ -380,6 +463,14 @@ def main():
             )
             assembled_metrics = evaluate_assembled(assembled_rows)
             dev_metrics = {**dev_relation_metrics, **assembled_metrics}
+            if args.use_similarity_prior:
+                dev_metrics["learned_similarity_prior_scales"] = {
+                    relation: float(scale)
+                    for relation, scale in zip(
+                        args.relation_types,
+                        model.prior_scales().detach().cpu().tolist(),
+                    )
+                }
             selected_value = get_metric(dev_metrics, args.selection_metric)
             improved = is_better_metric(selected_value, best_value, args.selection_mode, args.min_delta)
             if improved:
@@ -450,6 +541,14 @@ def main():
         final_assembled_metrics = last_assembled_metrics
 
     final_metrics = {**final_relation_metrics, **final_assembled_metrics}
+    if args.use_similarity_prior:
+        final_metrics["learned_similarity_prior_scales"] = {
+            relation: float(scale)
+            for relation, scale in zip(
+                args.relation_types,
+                model.prior_scales().detach().cpu().tolist(),
+            )
+        }
     write_json(output_dir / "dev_metrics.json", final_metrics)
     summary = {
         "best_epoch": best_epoch,
