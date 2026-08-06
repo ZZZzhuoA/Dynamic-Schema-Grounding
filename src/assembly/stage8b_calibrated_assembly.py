@@ -362,11 +362,19 @@ def assemble_calibrated(
 def evaluate_assembled_rows(assembled_rows):
     recalls = [row["assembled_recall@30"] for row in assembled_rows]
     precisions = [row["assembled_precision@30"] for row in assembled_rows]
+    sample_count = len(assembled_rows)
+    missing_count = sum(
+        1 for row in assembled_rows if (row["assembled_recall@30"] or 0) < 1.0
+    )
+    complete_count = sample_count - missing_count
     return {
-        "assembled_sample_count": len(assembled_rows),
+        "assembled_sample_count": sample_count,
         "assembled_schema_recall@30": mean(recalls),
         "assembled_schema_precision@30": mean(precisions),
-        "assembled_missing_samples@30": sum(1 for row in assembled_rows if (row["assembled_recall@30"] or 0) < 1.0),
+        "assembled_complete_samples@30": complete_count,
+        "assembled_complete_coverage@30": complete_count / sample_count if sample_count else 0.0,
+        "assembled_missing_samples@30": missing_count,
+        "assembled_missing_rate@30": missing_count / sample_count if sample_count else 0.0,
     }
 
 
