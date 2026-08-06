@@ -1,5 +1,6 @@
 import argparse
 import json
+import random
 import sys
 from pathlib import Path
 
@@ -289,6 +290,46 @@ def infer_input_dim(args, cache):
     return dim
 
 
+def configure_reproducibility(seed, runtime, deterministic=False):
+    np = runtime["np"]
+    torch = runtime["torch"]
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    if hasattr(torch.backends, "cudnn"):
+        torch.backends.cudnn.benchmark = False
+        torch.backends.cudnn.deterministic = bool(deterministic)
+    if deterministic:
+        torch.use_deterministic_algorithms(True, warn_only=True)
+
+
+def build_grounder(args, runtime, input_dim, graph_relations, device):
+    model_cls = (
+        runtime["RelationConditionedDSGGrounder"]
+        if args.use_relation_conditioning or args.use_similarity_prior
+        else runtime["DSGGrounder"]
+    )
+    model_kwargs = dict(
+        hash_dim=input_dim,
+        hidden_dim=args.hidden_dim,
+        num_layers=args.num_layers,
+        dropout=args.dropout,
+        relations=graph_relations,
+        encoder_type=args.encoder_type,
+        lexical_dim=6 if args.use_lexical_features else 0,
+    )
+    if args.use_relation_conditioning or args.use_similarity_prior:
+        model_kwargs.update(
+            operation_relations=args.relation_types,
+            use_relation_embedding=args.use_relation_conditioning,
+            prior_init=args.similarity_prior_init,
+            join_prior_init=args.join_prior_init,
+        )
+    return model_cls(**model_kwargs).to(device)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--train-relation-file", default="experiments/stage5j_relation_labels_v1/train_relation_labels.jsonl")
@@ -313,6 +354,12 @@ def main():
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--pos-weight", type=float, default=3.0)
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--deterministic",
+        action="store_true",
+        help="Request deterministic PyTorch kernels when available (may reduce throughput).",
+    )
     parser.add_argument("--encoder-type", choices=["rgcn", "rgta"], default="rgcn")
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--output-top-k", type=int, default=30)
@@ -366,6 +413,7 @@ def main():
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     runtime = import_runtime()
+    configure_reproducibility(args.seed, runtime, deterministic=args.deterministic)
     train_aligned = load_aligned_records(Path(args.train_relation_file), Path(args.train_graph_file), args.train_limit)
     dev_aligned = load_aligned_records(Path(args.dev_relation_file), Path(args.dev_graph_file), args.dev_limit)
     train_examples = make_relation_examples(
@@ -409,28 +457,7 @@ def main():
     torch = runtime["torch"]
     device = torch.device(args.device)
     graph_relations = list(runtime["DEFAULT_RELATIONS"])
-    model_cls = (
-        runtime["RelationConditionedDSGGrounder"]
-        if args.use_relation_conditioning or args.use_similarity_prior
-        else runtime["DSGGrounder"]
-    )
-    model_kwargs = dict(
-        hash_dim=input_dim,
-        hidden_dim=args.hidden_dim,
-        num_layers=args.num_layers,
-        dropout=args.dropout,
-        relations=graph_relations,
-        encoder_type=args.encoder_type,
-        lexical_dim=6 if args.use_lexical_features else 0,
-    )
-    if args.use_relation_conditioning or args.use_similarity_prior:
-        model_kwargs.update(
-            operation_relations=args.relation_types,
-            use_relation_embedding=args.use_relation_conditioning,
-            prior_init=args.similarity_prior_init,
-            join_prior_init=args.join_prior_init,
-        )
-    model = model_cls(**model_kwargs).to(device)
+    model = build_grounder(args, runtime, input_dim, graph_relations, device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     criterion = runtime["nn"].BCEWithLogitsLoss(
         pos_weight=torch.tensor(args.pos_weight, dtype=torch.float32, device=device)
