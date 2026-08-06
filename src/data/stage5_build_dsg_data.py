@@ -93,6 +93,8 @@ def question_card_key(record, record_index):
 def question_semantic_text(card):
     if not card:
         return None
+    if card.get("compact_text"):
+        return str(card.get("compact_text"))
     parts = []
     for key in ["normalized_question", "intent"]:
         value = card.get(key)
@@ -129,6 +131,8 @@ def question_semantic_text(card):
 def semantic_text_from_card(card):
     if not card:
         return None
+    if card.get("compact_text"):
+        return str(card.get("compact_text"))
     parts = []
     for key in ["qualified_name", "semantic_name", "description", "value_type"]:
         value = card.get(key)
