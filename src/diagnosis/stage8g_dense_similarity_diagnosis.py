@@ -76,10 +76,19 @@ def scores_for_example(record_index, cache, np, normalize=True):
     if index_row is None:
         raise KeyError(f"No embedding-cache index for example_index={record_index}")
     query_index = int(index_row["query_embedding_index"])
-    node_start = int(index_row["node_embedding_start"])
     node_count = int(index_row["node_count"])
     query_embedding = cache["query_embeddings"][query_index]
-    node_embeddings = cache["node_embeddings"][node_start : node_start + node_count]
+    if "node_embedding_indices" in index_row:
+        node_indices = [int(index) for index in index_row["node_embedding_indices"]]
+        if len(node_indices) != node_count:
+            raise ValueError(
+                f"Deduplicated cache node-count mismatch for record_index={record_index}: "
+                f"indices={len(node_indices)} expected={node_count}"
+            )
+        node_embeddings = cache["node_embeddings"][node_indices]
+    else:
+        node_start = int(index_row["node_embedding_start"])
+        node_embeddings = cache["node_embeddings"][node_start : node_start + node_count]
     scores = normalized_dot_scores(query_embedding, node_embeddings, np, normalize=normalize)
     if len(scores) != node_count:
         raise ValueError(f"Score/node mismatch at example {record_index}: scores={len(scores)} nodes={node_count}")

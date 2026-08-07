@@ -201,51 +201,81 @@ def embed_texts(texts, tokenizer, model, runtime, args):
     return np.concatenate(all_embeddings, axis=0).astype("float32")
 
 
-def collect_split_texts(examples):
+def collect_split_texts(examples, deduplicate_node_texts=False):
     query_texts = []
     node_texts = []
     index_rows = []
     text_rows = []
     node_cursor = 0
+    node_text_to_index = {}
+    node_occurrence_count = 0
     for example_index, example in enumerate(examples):
         inputs = example["inference_inputs"]
         query_text = query_embedding_text(inputs)
         query_texts.append(query_text)
         nodes = inputs.get("schema_nodes", [])
         start = node_cursor
+        node_embedding_indices = []
         for node in nodes:
             text = node_embedding_text(node)
-            node_texts.append(text)
-            text_rows.append(
-                {
-                    "example_index": example_index,
-                    "example_id": example.get("example_id"),
-                    "node_id": node.get("id"),
-                    "node_name": node.get("name"),
-                    "node_type": node.get("type"),
-                    "text": text,
-                }
-            )
-            node_cursor += 1
-        index_rows.append(
-            {
-                "example_index": example_index,
-                "example_id": example.get("example_id"),
-                "record_index": example.get("metadata", {}).get("record_index"),
-                "db_id": inputs.get("db_id"),
-                "question_id": example.get("metadata", {}).get("question_id"),
-                "query_embedding_index": example_index,
-                "node_embedding_start": start,
-                "node_count": len(nodes),
-            }
-        )
-    return query_texts, node_texts, index_rows, text_rows
+            node_occurrence_count += 1
+            if deduplicate_node_texts:
+                embedding_index = node_text_to_index.get(text)
+                if embedding_index is None:
+                    embedding_index = len(node_texts)
+                    node_text_to_index[text] = embedding_index
+                    node_texts.append(text)
+                    text_rows.append(
+                        {
+                            "embedding_index": embedding_index,
+                            "first_example_index": example_index,
+                            "first_example_id": example.get("example_id"),
+                            "first_db_id": inputs.get("db_id"),
+                            "first_node_id": node.get("id"),
+                            "node_name": node.get("name"),
+                            "node_type": node.get("type"),
+                            "text": text,
+                        }
+                    )
+                node_embedding_indices.append(embedding_index)
+            else:
+                node_texts.append(text)
+                text_rows.append(
+                    {
+                        "embedding_index": node_cursor,
+                        "example_index": example_index,
+                        "example_id": example.get("example_id"),
+                        "db_id": inputs.get("db_id"),
+                        "node_id": node.get("id"),
+                        "node_name": node.get("name"),
+                        "node_type": node.get("type"),
+                        "text": text,
+                    }
+                )
+                node_cursor += 1
+        index_row = {
+            "example_index": example_index,
+            "example_id": example.get("example_id"),
+            "record_index": example.get("metadata", {}).get("record_index"),
+            "db_id": inputs.get("db_id"),
+            "question_id": example.get("metadata", {}).get("question_id"),
+            "query_embedding_index": example_index,
+            "node_count": len(nodes),
+        }
+        if deduplicate_node_texts:
+            index_row["node_embedding_indices"] = node_embedding_indices
+        else:
+            index_row["node_embedding_start"] = start
+        index_rows.append(index_row)
+    return query_texts, node_texts, index_rows, text_rows, node_occurrence_count
 
 
 def build_split_cache(split, example_path, output_dir, tokenizer, model, runtime, args):
     np = runtime["np"]
     examples = read_jsonl(Path(example_path), args.limit)
-    query_texts, node_texts, index_rows, text_rows = collect_split_texts(examples)
+    query_texts, node_texts, index_rows, text_rows, node_occurrence_count = collect_split_texts(
+        examples, deduplicate_node_texts=args.deduplicate_node_texts
+    )
     print(
         json.dumps(
             {
@@ -254,6 +284,8 @@ def build_split_cache(split, example_path, output_dir, tokenizer, model, runtime
                 "example_count": len(examples),
                 "query_text_count": len(query_texts),
                 "node_text_count": len(node_texts),
+                "node_occurrence_count": node_occurrence_count,
+                "deduplicate_node_texts": args.deduplicate_node_texts,
             },
             ensure_ascii=False,
         )
@@ -281,6 +313,11 @@ def build_split_cache(split, example_path, output_dir, tokenizer, model, runtime
         "example_count": len(examples),
         "query_embedding_shape": list(query_embeddings.shape),
         "node_embedding_shape": list(node_embeddings.shape),
+        "node_occurrence_count": node_occurrence_count,
+        "unique_node_text_count": len(node_texts),
+        "node_deduplication_ratio": (
+            1.0 - len(node_texts) / node_occurrence_count if node_occurrence_count else 0.0
+        ),
         "index_file": str(output_dir / f"{split}_index.json"),
         "query_embedding_file": str(output_dir / f"{split}_query_embeddings.npy"),
         "node_embedding_file": str(output_dir / f"{split}_node_embeddings.npy"),
@@ -304,6 +341,11 @@ def main():
     parser.add_argument("--trust-remote-code", action="store_true")
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--write-texts", action="store_true")
+    parser.add_argument(
+        "--deduplicate-node-texts",
+        action="store_true",
+        help="Embed each distinct schema-node text once and store per-example embedding indices.",
+    )
     args = parser.parse_args()
 
     output_dir = Path(args.output_dir)
@@ -344,6 +386,7 @@ def main():
             "dtype": args.dtype,
             "trust_remote_code": args.trust_remote_code,
             "limit": args.limit,
+            "deduplicate_node_texts": args.deduplicate_node_texts,
         },
         "splits": summaries,
         "note": (

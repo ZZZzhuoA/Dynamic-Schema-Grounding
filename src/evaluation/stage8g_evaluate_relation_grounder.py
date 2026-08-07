@@ -212,7 +212,8 @@ def main():
         "relation_example_count": len(examples),
         "offset": cli.offset,
         "limit": cli.limit,
-        "seed": cli.seed,
+        "training_seed": train_config.get("seed"),
+        "evaluation_seed": cli.seed,
         "deterministic": cli.deterministic,
         "metrics": metrics,
         "note": (

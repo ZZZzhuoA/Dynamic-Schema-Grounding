@@ -39,6 +39,22 @@ def add_derived_metrics(metrics):
     return metrics
 
 
+def resolve_training_seed(payload):
+    for key in ["training_seed", "checkpoint_training_seed"]:
+        if payload.get(key) is not None:
+            return payload[key]
+    checkpoint_dir = payload.get("checkpoint_dir")
+    if checkpoint_dir:
+        config_path = Path(checkpoint_dir) / "train_config.json"
+        if config_path.exists():
+            config = read_json(config_path)
+            if config.get("seed") is not None:
+                return config["seed"]
+    # Compatibility fallback for summaries produced before training/evaluation
+    # seeds were stored separately. This may represent the evaluation seed.
+    return payload.get("seed")
+
+
 def parse_group(spec):
     if "=" not in spec:
         raise argparse.ArgumentTypeError("Expected GROUP=FILE[,FILE,...]")
@@ -125,7 +141,8 @@ def main():
             runs.append(
                 {
                     "path": str(path),
-                    "seed": payload.get("seed"),
+                    "training_seed": resolve_training_seed(payload),
+                    "evaluation_seed": payload.get("evaluation_seed", payload.get("seed")),
                     "checkpoint_dir": payload.get("checkpoint_dir"),
                     "metrics": metrics,
                 }

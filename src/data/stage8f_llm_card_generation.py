@@ -79,6 +79,42 @@ def write_jsonl(path: Path, records):
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
+def read_jsonl_if_exists(path: Path):
+    return read_jsonl(path) if path.exists() else []
+
+
+def append_jsonl(path: Path, records):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as f:
+        for record in records:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        f.flush()
+
+
+def latest_by(records, key_fn):
+    result = {}
+    for record in records:
+        result[key_fn(record)] = record
+    return result
+
+
+def validate_resumed_question(card, record, index):
+    if int(card.get("record_index", -1)) != index:
+        raise ValueError(f"Resume question record_index mismatch at {index}")
+    if card.get("db_id") != record.get("db_id"):
+        raise ValueError(
+            f"Resume question db_id mismatch at {index}: "
+            f"cached={card.get('db_id')} source={record.get('db_id')}"
+        )
+    cached_question_id = card.get("question_id")
+    source_question_id = record.get("question_id")
+    if cached_question_id is not None and source_question_id is not None and cached_question_id != source_question_id:
+        raise ValueError(
+            f"Resume question_id mismatch at {index}: "
+            f"cached={cached_question_id} source={source_question_id}"
+        )
+
+
 class OpenAICompatibleClient:
     def __init__(self, base_url, api_key, model, timeout):
         self.base_url = base_url.rstrip("/")
@@ -492,7 +528,19 @@ def main():
     parser.add_argument("--timeout", type=int, default=300)
     parser.add_argument("--sleep", type=float, default=0.0)
     parser.add_argument("--disable-thinking", action="store_true")
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Continue from existing card/status JSONL files and append each completed item immediately.",
+    )
+    parser.add_argument(
+        "--retry-errors",
+        action="store_true",
+        help="With --resume, regenerate records whose latest status contains an error.",
+    )
     args = parser.parse_args()
+    if args.retry_errors and not args.resume:
+        parser.error("--retry-errors requires --resume")
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -511,9 +559,43 @@ def main():
             table_records = read_json(table_path_for_split(args, split))
             if args.db_limit is not None:
                 table_records = table_records[: args.db_limit]
-            schema_cards = []
-            status_rows = []
+            card_path = output_dir / f"{split}_schema_semantic_cards.jsonl"
+            status_path = output_dir / f"{split}_schema_status.jsonl"
+            if not args.resume:
+                write_jsonl(card_path, [])
+                write_jsonl(status_path, [])
+            schema_by_key = latest_by(
+                read_jsonl_if_exists(card_path),
+                lambda row: (row.get("db_id"), int(row.get("schema_item_id", -1))),
+            )
+            status_by_db = latest_by(
+                read_jsonl_if_exists(status_path), lambda row: row.get("db_id")
+            )
+            generated_count = 0
+            reused_count = 0
             for index, table_record in enumerate(table_records, start=1):
+                db_id = table_record["db_id"]
+                previous_status = status_by_db.get(db_id)
+                expected_item_ids = {
+                    int(item["schema_item_id"])
+                    for item in table_record_to_schema_items(table_record)
+                }
+                cached_item_ids = {
+                    item_id for cached_db_id, item_id in schema_by_key if cached_db_id == db_id
+                }
+                cache_complete = expected_item_ids.issubset(cached_item_ids)
+                reuse = previous_status is not None and cache_complete and not (
+                    args.retry_errors and previous_status.get("error")
+                )
+                if reuse:
+                    reused_count += 1
+                    print(
+                        json.dumps(
+                            {"split": split, "kind": "schema", "index": index, "db_id": db_id, "event": "resume_skip"},
+                            ensure_ascii=False,
+                        )
+                    )
+                    continue
                 error = None
                 try:
                     cards = generate_schema_cards_for_db(table_record, split, client, args)
@@ -525,21 +607,61 @@ def main():
                             error = f"{error} body={exc.read().decode('utf-8', errors='replace')}"
                         except Exception:
                             pass
-                schema_cards.extend(cards)
-                status = {"split": split, "kind": "schema", "index": index, "db_id": table_record["db_id"], "card_count": len(cards), "error": error}
-                status_rows.append(status)
+                status = {"split": split, "kind": "schema", "index": index, "db_id": db_id, "card_count": len(cards), "error": error}
+                append_jsonl(card_path, cards)
+                append_jsonl(status_path, [status])
+                for card in cards:
+                    schema_by_key[(db_id, int(card["schema_item_id"]))] = card
+                status_by_db[db_id] = status
+                generated_count += 1
                 print(json.dumps(status, ensure_ascii=False))
                 if args.sleep > 0:
                     time.sleep(args.sleep)
-            write_jsonl(output_dir / f"{split}_schema_semantic_cards.jsonl", schema_cards)
-            write_jsonl(output_dir / f"{split}_schema_status.jsonl", status_rows)
+            db_order = {record["db_id"]: index for index, record in enumerate(table_records)}
+            schema_cards = sorted(
+                [card for (db_id, _), card in schema_by_key.items() if db_id in db_order],
+                key=lambda card: (db_order[card["db_id"]], int(card["schema_item_id"])),
+            )
+            status_rows = [status_by_db[record["db_id"]] for record in table_records if record["db_id"] in status_by_db]
+            write_jsonl(card_path, schema_cards)
+            write_jsonl(status_path, status_rows)
+            split_summary["schema_db_target_count"] = len(table_records)
+            split_summary["schema_db_completed_count"] = len(status_rows)
+            split_summary["schema_db_generated_this_run"] = generated_count
+            split_summary["schema_db_reused_count"] = reused_count
             split_summary["schema_card_count"] = len(schema_cards)
             split_summary["schema_error_count"] = sum(1 for row in status_rows if row["error"])
         if args.card_types in {"question", "both"}:
             records = read_jsonl(label_path_for_split(args, split), args.question_limit)
-            question_cards = []
-            status_rows = []
+            card_path = output_dir / f"{split}_question_cards.jsonl"
+            status_path = output_dir / f"{split}_question_status.jsonl"
+            if not args.resume:
+                write_jsonl(card_path, [])
+                write_jsonl(status_path, [])
+            question_by_index = latest_by(
+                read_jsonl_if_exists(card_path), lambda row: int(row.get("record_index", -1))
+            )
+            status_by_index = latest_by(
+                read_jsonl_if_exists(status_path), lambda row: int(row.get("index", -1))
+            )
+            generated_count = 0
+            reused_count = 0
             for index, record in enumerate(records):
+                previous_card = question_by_index.get(index)
+                previous_status = status_by_index.get(index)
+                reuse = previous_card is not None and previous_status is not None and not (
+                    args.retry_errors and previous_status.get("error")
+                )
+                if reuse:
+                    validate_resumed_question(previous_card, record, index)
+                    reused_count += 1
+                    print(
+                        json.dumps(
+                            {"split": split, "kind": "question", "index": index, "db_id": record.get("db_id"), "question_id": record.get("question_id"), "event": "resume_skip"},
+                            ensure_ascii=False,
+                        )
+                    )
+                    continue
                 error = None
                 try:
                     card = generate_question_card(record, split, index, client, args)
@@ -562,14 +684,23 @@ def main():
                         "llm_error": repr(exc),
                     }
                     error = repr(exc)
-                question_cards.append(card)
                 status = {"split": split, "kind": "question", "index": index, "db_id": record.get("db_id"), "question_id": record.get("question_id"), "error": error}
-                status_rows.append(status)
+                append_jsonl(card_path, [card])
+                append_jsonl(status_path, [status])
+                question_by_index[index] = card
+                status_by_index[index] = status
+                generated_count += 1
                 print(json.dumps(status, ensure_ascii=False))
                 if args.sleep > 0:
                     time.sleep(args.sleep)
-            write_jsonl(output_dir / f"{split}_question_cards.jsonl", question_cards)
-            write_jsonl(output_dir / f"{split}_question_status.jsonl", status_rows)
+            question_cards = [question_by_index[index] for index in range(len(records)) if index in question_by_index]
+            status_rows = [status_by_index[index] for index in range(len(records)) if index in status_by_index]
+            write_jsonl(card_path, question_cards)
+            write_jsonl(status_path, status_rows)
+            split_summary["question_target_count"] = len(records)
+            split_summary["question_completed_count"] = len(question_cards)
+            split_summary["question_generated_this_run"] = generated_count
+            split_summary["question_reused_count"] = reused_count
             split_summary["question_card_count"] = len(question_cards)
             split_summary["question_error_count"] = sum(1 for row in status_rows if row["error"])
         summary["splits"][split] = split_summary

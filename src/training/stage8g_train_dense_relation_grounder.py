@@ -88,10 +88,19 @@ def dense_features_for_example(example, cache, runtime, device):
     index_row = cache["by_example_index"].get(record_index)
     if index_row is None:
         raise KeyError(f"No embedding cache index for record_index={record_index}")
-    node_start = int(index_row["node_embedding_start"])
     node_count = int(index_row["node_count"])
     query_index = int(index_row["query_embedding_index"])
-    node_embeddings = cache["node"][node_start : node_start + node_count]
+    if "node_embedding_indices" in index_row:
+        node_indices = [int(index) for index in index_row["node_embedding_indices"]]
+        if len(node_indices) != node_count:
+            raise ValueError(
+                f"Deduplicated cache node-count mismatch for record_index={record_index}: "
+                f"indices={len(node_indices)} expected={node_count}"
+            )
+        node_embeddings = cache["node"][node_indices]
+    else:
+        node_start = int(index_row["node_embedding_start"])
+        node_embeddings = cache["node"][node_start : node_start + node_count]
     query_embedding = cache["query"][query_index : query_index + 1]
     return (
         torch.tensor(query_embedding, dtype=torch.float32, device=device),
