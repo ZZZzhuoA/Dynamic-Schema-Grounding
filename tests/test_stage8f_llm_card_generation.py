@@ -30,6 +30,14 @@ class FakeClient:
 
 
 class Stage8FParallelGenerationTest(unittest.TestCase):
+    def test_schema_card_quality_counts_fallbacks(self):
+        quality = MODULE.schema_card_quality(
+            [{"source": "llm"}, {"source": "llm_fallback"}, {"source": "llm_fallback"}]
+        )
+        self.assertEqual(quality["card_count"], 3)
+        self.assertEqual(quality["fallback_card_count"], 2)
+        self.assertAlmostEqual(quality["fallback_rate"], 2 / 3)
+
     def test_normalized_cache_content_ignores_case_and_whitespace(self):
         card = {"question": "How Many Users?", "evidence": " count   users "}
         record = {"question": "how many users?", "evidence": "COUNT users"}

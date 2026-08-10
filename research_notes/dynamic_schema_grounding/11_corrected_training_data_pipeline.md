@@ -110,6 +110,139 @@ Every completed result is appended by the main thread, so workers never write th
 concurrently. Final files are canonicalized into source order. Start with 8 workers and increase to
 16 only if vLLM has spare GPU capacity and stable latency.
 
+Stage 8F now records `schema_fallback_card_count`, `schema_fallback_rate`, and
+`schema_chunk_error_count`. The command fails by default if more than 25% of schema cards use the
+fallback representation. `--retry-errors` also regenerates an old database cache when its cached
+fallback rate exceeds this threshold, even if an older status file incorrectly recorded
+`error: null`. Do not use `--allow-excessive-schema-fallback` for model training.
+
+Stage 5J also requires `METRIC_TARGET`, `TEMPORAL_FILTER`, and `FORMULA_COMPONENT` to be non-empty
+on the full dev split. This prevents a syntactically successful run from silently collapsing the
+relation-label space because of low-quality semantic cards.
+
+## Full corrected LLM-card training pipeline
+
+After a two-GPU vLLM server is available at `http://127.0.0.1:9019/v1`, regenerate failed schema
+card caches and changed question cards:
+
+```bash
+export LLM_API_KEY=dummy
+
+python src/data/stage8f_llm_card_generation.py \
+  --train-labels experiments/stage1_label_extraction_corrected/bird_train_grounding_labels.jsonl \
+  --dev-labels experiments/stage1_label_extraction_corrected/bird_dev_grounding_labels.jsonl \
+  --output-dir experiments/stage8f_llm_cards_corrected_incremental \
+  --reuse-card-dir experiments/stage8f_llm_cards_qwen25_train1000 \
+  --reuse-card-dir experiments/stage8f_llm_cards_qwen25_dev \
+  --splits train,dev \
+  --card-types both \
+  --base-url http://127.0.0.1:9019/v1 \
+  --model qwen2.5-coder-32b \
+  --workers 16 \
+  --schema-card-mode table \
+  --max-tokens 8192 \
+  --question-max-tokens 1024 \
+  --disable-thinking \
+  --resume \
+  --retry-errors \
+  --max-schema-fallback-rate 0.05
+```
+
+Compact cards, then rebuild relation supervision and graph examples from the same card source:
+
+```bash
+python src/data/stage8f_compact_llm_cards.py \
+  --train-schema-cards experiments/stage8f_llm_cards_corrected_incremental/train_schema_semantic_cards.jsonl \
+  --train-question-cards experiments/stage8f_llm_cards_corrected_incremental/train_question_cards.jsonl \
+  --dev-schema-cards experiments/stage8f_llm_cards_corrected_incremental/dev_schema_semantic_cards.jsonl \
+  --dev-question-cards experiments/stage8f_llm_cards_corrected_incremental/dev_question_cards.jsonl \
+  --output-dir experiments/stage8f_compact_llm_cards_corrected
+
+python src/data/stage5j_build_relation_labels.py \
+  --train-clause-labels experiments/stage5g_clause_labels_corrected/train_clause_labels.jsonl \
+  --dev-clause-labels experiments/stage5g_clause_labels_corrected/dev_clause_labels.jsonl \
+  --train-schema-semantic-cards experiments/stage8f_compact_llm_cards_corrected/train_schema_semantic_cards.jsonl \
+  --dev-schema-semantic-cards experiments/stage8f_compact_llm_cards_corrected/dev_schema_semantic_cards.jsonl \
+  --output-dir experiments/stage5j_relation_labels_corrected_llm_cards
+
+python src/data/stage5_build_dsg_data.py \
+  --train-labels experiments/stage1_label_extraction_corrected/bird_train_grounding_labels.jsonl \
+  --dev-labels experiments/stage1_label_extraction_corrected/bird_dev_grounding_labels.jsonl \
+  --train-tables Data/BIRD/train_databases/train_databases/train_tables.json \
+  --dev-tables Data/BIRD/dev_tables.json \
+  --train-schema-semantic-cards experiments/stage8f_compact_llm_cards_corrected/train_schema_semantic_cards.jsonl \
+  --dev-schema-semantic-cards experiments/stage8f_compact_llm_cards_corrected/dev_schema_semantic_cards.jsonl \
+  --train-question-cards experiments/stage8f_compact_llm_cards_corrected/train_question_cards.jsonl \
+  --dev-question-cards experiments/stage8f_compact_llm_cards_corrected/dev_question_cards.jsonl \
+  --output-dir experiments/stage8g_dsg_data_corrected_llm_cards
+```
+
+Build the dense embedding cache once:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python src/embedding/stage8g_build_embedding_cache.py \
+  --train-examples experiments/stage8g_dsg_data_corrected_llm_cards/train_examples.jsonl \
+  --dev-examples experiments/stage8g_dsg_data_corrected_llm_cards/dev_examples.jsonl \
+  --splits train,dev \
+  --output-dir experiments/stage8g_embedding_cache_corrected_qwen3_06b \
+  --model-path /data/1_pretrained_models/Qwen3-Embedding-0.6B \
+  --batch-size 32 \
+  --max-length 512 \
+  --pooling last \
+  --normalize \
+  --device cuda \
+  --dtype bfloat16 \
+  --trust-remote-code \
+  --deduplicate-node-texts
+```
+
+Train matched full-data RGCN and RGTA runs. The only architectural difference between the two
+commands is `--encoder-type`:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python src/training/stage8g_train_dense_relation_grounder.py \
+  --train-relation-file experiments/stage5j_relation_labels_corrected_llm_cards/train_relation_labels.jsonl \
+  --dev-relation-file experiments/stage5j_relation_labels_corrected_llm_cards/dev_relation_labels.jsonl \
+  --train-graph-file experiments/stage8g_dsg_data_corrected_llm_cards/train_examples.jsonl \
+  --dev-graph-file experiments/stage8g_dsg_data_corrected_llm_cards/dev_examples.jsonl \
+  --embedding-cache-dir experiments/stage8g_embedding_cache_corrected_qwen3_06b \
+  --output-dir experiments/stage8g_corrected_llm_cards_rgcn_seed42 \
+  --train-limit 9428 \
+  --dev-limit 1534 \
+  --feature-mode dense \
+  --encoder-type rgcn \
+  --use-relation-conditioned-prior \
+  --epochs 8 \
+  --hidden-dim 96 \
+  --num-layers 2 \
+  --lr 1e-4 \
+  --patience 3 \
+  --seed 42 \
+  --device cuda \
+  --output-top-k 30
+
+CUDA_VISIBLE_DEVICES=1 python src/training/stage8g_train_dense_relation_grounder.py \
+  --train-relation-file experiments/stage5j_relation_labels_corrected_llm_cards/train_relation_labels.jsonl \
+  --dev-relation-file experiments/stage5j_relation_labels_corrected_llm_cards/dev_relation_labels.jsonl \
+  --train-graph-file experiments/stage8g_dsg_data_corrected_llm_cards/train_examples.jsonl \
+  --dev-graph-file experiments/stage8g_dsg_data_corrected_llm_cards/dev_examples.jsonl \
+  --embedding-cache-dir experiments/stage8g_embedding_cache_corrected_qwen3_06b \
+  --output-dir experiments/stage8g_corrected_llm_cards_rgta_seed42 \
+  --train-limit 9428 \
+  --dev-limit 1534 \
+  --feature-mode dense \
+  --encoder-type rgta \
+  --use-relation-conditioned-prior \
+  --epochs 8 \
+  --hidden-dim 96 \
+  --num-layers 2 \
+  --lr 1e-4 \
+  --patience 3 \
+  --seed 42 \
+  --device cuda \
+  --output-top-k 30
+```
+
 ## Experimental control
 
 Keep both pipelines:

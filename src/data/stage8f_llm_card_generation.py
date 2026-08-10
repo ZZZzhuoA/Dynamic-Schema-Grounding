@@ -437,7 +437,26 @@ def generate_schema_cards_for_db(table_record, split, client, args):
         for card in cards:
             if card.get("source") == "llm_fallback":
                 card["chunk_errors"] = chunk_errors[:3]
-    return sorted(cards, key=lambda x: x["schema_item_id"])
+    cards = sorted(cards, key=lambda x: x["schema_item_id"])
+    diagnostics = {
+        "chunk_count": len(schema_item_chunks(table_record, args.schema_card_mode)),
+        "chunk_error_count": len(chunk_errors),
+        "chunk_errors": chunk_errors,
+        "fallback_card_count": sum(1 for card in cards if card.get("source") == "llm_fallback"),
+    }
+    diagnostics["fallback_rate"] = (
+        diagnostics["fallback_card_count"] / len(cards) if cards else 1.0
+    )
+    return cards, diagnostics
+
+
+def schema_card_quality(cards):
+    fallback_count = sum(1 for card in cards if card.get("source") == "llm_fallback")
+    return {
+        "card_count": len(cards),
+        "fallback_card_count": fallback_count,
+        "fallback_rate": fallback_count / len(cards) if cards else 1.0,
+    }
 
 
 def question_prompt(record):
@@ -540,16 +559,26 @@ def generate_schema_task(index, table_record, split, client, args):
     db_id = table_record["db_id"]
     error = None
     try:
-        cards = generate_schema_cards_for_db(table_record, split, client, args)
+        cards, diagnostics = generate_schema_cards_for_db(table_record, split, client, args)
     except Exception as exc:  # noqa: BLE001 - preserve long-running batch progress.
         cards = []
+        diagnostics = {
+            "chunk_count": 0,
+            "chunk_error_count": 0,
+            "chunk_errors": [],
+            "fallback_card_count": 0,
+            "fallback_rate": 1.0,
+        }
         error = exception_message(exc)
+    if error is None and diagnostics["chunk_error_count"]:
+        error = f"{diagnostics['chunk_error_count']} schema-card chunk(s) used fallback"
     status = {
         "split": split,
         "kind": "schema",
         "index": index,
         "db_id": db_id,
         "card_count": len(cards),
+        **diagnostics,
         "error": error,
     }
     return index, cards, status
@@ -668,11 +697,24 @@ def main():
         action="store_true",
         help="With --resume, regenerate records whose latest status contains an error.",
     )
+    parser.add_argument(
+        "--max-schema-fallback-rate",
+        type=float,
+        default=0.25,
+        help="Fail quality validation when a split exceeds this schema-card fallback fraction.",
+    )
+    parser.add_argument(
+        "--allow-excessive-schema-fallback",
+        action="store_true",
+        help="Write outputs and continue even when schema fallback exceeds the configured threshold.",
+    )
     args = parser.parse_args()
     if args.retry_errors and not args.resume:
         parser.error("--retry-errors requires --resume")
     if args.workers < 1:
         parser.error("--workers must be at least 1")
+    if not 0.0 <= args.max_schema_fallback_rate <= 1.0:
+        parser.error("--max-schema-fallback-rate must be in [0, 1]")
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -726,9 +768,17 @@ def main():
                 cached_item_ids = {
                     item_id for cached_db_id, item_id in schema_by_key if cached_db_id == db_id
                 }
+                cached_cards = [
+                    card for (cached_db_id, _), card in schema_by_key.items() if cached_db_id == db_id
+                ]
+                cached_quality = schema_card_quality(cached_cards)
                 cache_complete = expected_item_ids.issubset(cached_item_ids)
                 reuse = previous_status is not None and cache_complete and not (
-                    args.retry_errors and previous_status.get("error")
+                    args.retry_errors
+                    and (
+                        previous_status.get("error")
+                        or cached_quality["fallback_rate"] > args.max_schema_fallback_rate
+                    )
                 )
                 if reuse:
                     reused_count += 1
@@ -765,7 +815,16 @@ def main():
             split_summary["schema_db_generated_this_run"] = generated_count
             split_summary["schema_db_reused_count"] = reused_count
             split_summary["schema_card_count"] = len(schema_cards)
-            split_summary["schema_error_count"] = sum(1 for row in status_rows if row["error"])
+            split_summary["schema_error_count"] = sum(1 for row in status_rows if row.get("error"))
+            schema_quality = schema_card_quality(schema_cards)
+            split_summary["schema_fallback_card_count"] = schema_quality["fallback_card_count"]
+            split_summary["schema_fallback_rate"] = schema_quality["fallback_rate"]
+            split_summary["schema_chunk_error_count"] = sum(
+                int(row.get("chunk_error_count", 0)) for row in status_rows
+            )
+            split_summary["schema_quality_passed"] = (
+                schema_quality["fallback_rate"] <= args.max_schema_fallback_rate
+            )
         if args.card_types in {"question", "both"}:
             records = read_jsonl(label_path_for_split(args, split), args.question_limit)
             card_path = output_dir / f"{split}_question_cards.jsonl"
@@ -843,6 +902,22 @@ def main():
     write_json(output_dir / "summary.json", summary)
     print(json.dumps(summary, ensure_ascii=False, indent=2))
     print(f"Outputs written to: {output_dir}")
+    failed_schema_splits = [
+        split
+        for split, split_summary in summary["splits"].items()
+        if split_summary.get("schema_quality_passed") is False
+    ]
+    if failed_schema_splits and not args.allow_excessive_schema_fallback:
+        rates = {
+            split: summary["splits"][split]["schema_fallback_rate"]
+            for split in failed_schema_splits
+        }
+        raise RuntimeError(
+            "Schema-card fallback quality gate failed: "
+            f"rates={rates}, max={args.max_schema_fallback_rate}. "
+            "Use --retry-errors to regenerate fallback caches; override only with "
+            "--allow-excessive-schema-fallback."
+        )
 
 
 if __name__ == "__main__":

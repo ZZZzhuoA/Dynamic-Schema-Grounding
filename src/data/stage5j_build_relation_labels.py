@@ -273,6 +273,22 @@ def build_split(input_file, output_file, schema_cards, split, limit=None):
     return summarize(outputs)
 
 
+def parse_relation_list(value):
+    relations = [item.strip() for item in str(value or "").split(",") if item.strip()]
+    unknown = sorted(set(relations) - set(RELATION_TYPES))
+    if unknown:
+        raise ValueError(f"Unknown required relation types: {unknown}")
+    return relations
+
+
+def empty_required_relations(split_summary, required_relations):
+    return [
+        relation
+        for relation in required_relations
+        if split_summary.get("relation_stats", {}).get(relation, {}).get("non_empty_samples", 0) == 0
+    ]
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--train-clause-labels", default="experiments/stage5g_clause_labels/train_clause_labels.jsonl")
@@ -281,7 +297,18 @@ def main():
     parser.add_argument("--dev-schema-semantic-cards", default="experiments/stage5i_schema_semantic_cards_heuristic_v2/dev_schema_semantic_cards.jsonl")
     parser.add_argument("--output-dir", default="experiments/stage5j_relation_labels")
     parser.add_argument("--limit", type=int, default=None)
+    parser.add_argument(
+        "--required-dev-relations",
+        default="METRIC_TARGET,TEMPORAL_FILTER,FORMULA_COMPONENT",
+        help="Comma-separated relation types that must be non-empty in the generated dev labels.",
+    )
+    parser.add_argument(
+        "--allow-empty-required-relations",
+        action="store_true",
+        help="Write outputs without failing when a required dev relation type is empty.",
+    )
     args = parser.parse_args()
+    required_dev_relations = parse_relation_list(args.required_dev_relations)
 
     output_dir = Path(args.output_dir)
     train_cards = load_schema_cards(Path(args.train_schema_semantic_cards))
@@ -305,6 +332,10 @@ def main():
         "relation_types": RELATION_TYPES,
         "train": train_summary,
         "dev": dev_summary,
+        "quality_gate": {
+            "required_dev_relations": required_dev_relations,
+            "empty_dev_relations": empty_required_relations(dev_summary, required_dev_relations),
+        },
         "generalization_boundary": (
             "Relation labels are derived from gold SQL/clause labels only for training/evaluation. "
             "Test-time inputs will use question, evidence, schema semantic graph, and relation tokens."
@@ -313,6 +344,12 @@ def main():
     write_json(output_dir / "summary.json", summary)
     print(json.dumps(summary, ensure_ascii=False, indent=2))
     print(f"Outputs written to: {output_dir}")
+    if summary["quality_gate"]["empty_dev_relations"] and not args.allow_empty_required_relations:
+        raise RuntimeError(
+            "Relation-label quality gate failed; empty required dev relations: "
+            f"{summary['quality_gate']['empty_dev_relations']}. "
+            "Check schema-card fallback/typing before training."
+        )
 
 
 if __name__ == "__main__":
