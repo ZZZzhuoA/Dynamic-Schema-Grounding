@@ -30,6 +30,24 @@ class FakeClient:
 
 
 class Stage8FParallelGenerationTest(unittest.TestCase):
+    def test_extract_json_accepts_literal_control_characters(self):
+        parsed = MODULE.extract_json('{"description": "line one\nline two"}')
+        self.assertEqual(parsed["description"], "line one\nline two")
+
+    def test_large_table_is_split_with_table_context(self):
+        table_record = {
+            "table_names_original": ["large_table"],
+            "table_names": ["large table"],
+            "column_names_original": [[-1, "*"]] + [[0, f"column_{i}"] for i in range(50)],
+            "column_names": [[-1, "*"]] + [[0, f"column {i}"] for i in range(50)],
+            "column_types": ["text"] * 51,
+            "primary_keys": [],
+            "foreign_keys": [],
+        }
+        chunks = MODULE.schema_item_chunks(table_record, "table", max_items=24)
+        self.assertEqual([len(chunk) for chunk in chunks], [24, 24, 5])
+        self.assertTrue(all(chunk[0]["node_type"] == "table" for chunk in chunks))
+
     def test_schema_card_quality_counts_fallbacks(self):
         quality = MODULE.schema_card_quality(
             [{"source": "llm"}, {"source": "llm_fallback"}, {"source": "llm_fallback"}]

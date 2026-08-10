@@ -140,6 +140,7 @@ python src/data/stage8f_llm_card_generation.py \
   --model qwen2.5-coder-32b \
   --workers 16 \
   --schema-card-mode table \
+  --schema-chunk-max-items 24 \
   --max-tokens 8192 \
   --question-max-tokens 1024 \
   --disable-thinking \

@@ -188,7 +188,10 @@ def extract_json(text):
     start_candidates = [pos for pos in [text.find("{"), text.find("[")] if pos >= 0]
     if start_candidates:
         text = text[min(start_candidates) :]
-    return json.loads(text)
+    # Some OpenAI-compatible servers return literal newlines/control characters
+    # inside otherwise valid JSON strings. strict=False accepts those without
+    # attempting unsafe structural repair of malformed or truncated JSON.
+    return json.loads(text, strict=False)
 
 
 def table_record_to_schema_items(table_record):
@@ -398,20 +401,28 @@ def generate_schema_cards_for_items(table_record, split, client, args, schema_it
     return sorted(cards, key=lambda x: x["schema_item_id"])
 
 
-def schema_item_chunks(table_record, mode):
+def schema_item_chunks(table_record, mode, max_items=None):
     raw_items = table_record_to_schema_items(table_record)
     if mode == "db":
-        return [raw_items]
+        if not max_items or len(raw_items) <= max_items:
+            return [raw_items]
+        return [raw_items[index : index + max_items] for index in range(0, len(raw_items), max_items)]
     table_items = [item for item in raw_items if item["node_type"] == "table"]
     chunks = []
     for table_item in table_items:
         table_id = table_item.get("table_id")
-        chunk = [table_item] + [
+        columns = [
             item
             for item in raw_items
             if item["node_type"] == "column" and item.get("table_id") == table_id
         ]
-        chunks.append(chunk)
+        if not max_items or len(columns) + 1 <= max_items:
+            chunks.append([table_item] + columns)
+            continue
+        column_budget = max(max_items - 1, 1)
+        for index in range(0, len(columns), column_budget):
+            # Repeat the table item so every column shard retains table context.
+            chunks.append([table_item] + columns[index : index + column_budget])
     return chunks
 
 
@@ -419,7 +430,12 @@ def generate_schema_cards_for_db(table_record, split, client, args):
     cards = []
     seen = set()
     chunk_errors = []
-    for chunk_index, chunk in enumerate(schema_item_chunks(table_record, args.schema_card_mode), start=1):
+    chunks = schema_item_chunks(
+        table_record,
+        args.schema_card_mode,
+        getattr(args, "schema_chunk_max_items", None),
+    )
+    for chunk_index, chunk in enumerate(chunks, start=1):
         try:
             chunk_cards = generate_schema_cards_for_items(table_record, split, client, args, chunk)
         except Exception as exc:  # noqa: BLE001 - fallback only for the failed chunk.
@@ -439,7 +455,7 @@ def generate_schema_cards_for_db(table_record, split, client, args):
                 card["chunk_errors"] = chunk_errors[:3]
     cards = sorted(cards, key=lambda x: x["schema_item_id"])
     diagnostics = {
-        "chunk_count": len(schema_item_chunks(table_record, args.schema_card_mode)),
+        "chunk_count": len(chunks),
         "chunk_error_count": len(chunk_errors),
         "chunk_errors": chunk_errors,
         "fallback_card_count": sum(1 for card in cards if card.get("source") == "llm_fallback"),
@@ -656,6 +672,15 @@ def main():
     parser.add_argument("--max-tokens", type=int, default=8192)
     parser.add_argument("--question-max-tokens", type=int, default=2048)
     parser.add_argument("--schema-card-mode", choices=["table", "db"], default="table")
+    parser.add_argument(
+        "--schema-chunk-max-items",
+        type=int,
+        default=24,
+        help=(
+            "Maximum schema items per LLM request. Large tables are split into column shards "
+            "with the table item repeated as context."
+        ),
+    )
     parser.add_argument("--timeout", type=int, default=300)
     parser.add_argument("--sleep", type=float, default=0.0)
     parser.add_argument(
@@ -715,6 +740,8 @@ def main():
         parser.error("--workers must be at least 1")
     if not 0.0 <= args.max_schema_fallback_rate <= 1.0:
         parser.error("--max-schema-fallback-rate must be in [0, 1]")
+    if args.schema_chunk_max_items < 2:
+        parser.error("--schema-chunk-max-items must be at least 2")
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
