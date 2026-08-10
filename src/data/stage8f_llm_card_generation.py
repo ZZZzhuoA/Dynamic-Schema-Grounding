@@ -5,6 +5,7 @@ import re
 import time
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 
@@ -98,6 +99,19 @@ def latest_by(records, key_fn):
     return result
 
 
+def normalized_cache_text(value):
+    return re.sub(r"\s+", " ", str(value or "").strip().lower())
+
+
+def resumed_question_content_matches(card, record):
+    return (
+        normalized_cache_text(card.get("question"))
+        == normalized_cache_text(record.get("question"))
+        and normalized_cache_text(card.get("evidence"))
+        == normalized_cache_text(record.get("evidence"))
+    )
+
+
 def validate_resumed_question(card, record, index):
     if int(card.get("record_index", -1)) != index:
         raise ValueError(f"Resume question record_index mismatch at {index}")
@@ -113,6 +127,25 @@ def validate_resumed_question(card, record, index):
             f"Resume question_id mismatch at {index}: "
             f"cached={cached_question_id} source={source_question_id}"
         )
+
+
+def cached_jsonl_records(output_path, reuse_card_dirs, filename):
+    records = []
+    for reuse_card_dir in reuse_card_dirs:
+        records.extend(read_jsonl_if_exists(reuse_card_dir / filename))
+    records.extend(read_jsonl_if_exists(output_path))
+    return records
+
+
+def completed_results(tasks, worker_fn, workers):
+    if workers <= 1:
+        for task in tasks:
+            yield worker_fn(*task)
+        return
+    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="stage8f-card") as executor:
+        futures = [executor.submit(worker_fn, *task) for task in tasks]
+        for future in as_completed(futures):
+            yield future.result()
 
 
 class OpenAICompatibleClient:
@@ -493,6 +526,75 @@ def generate_question_card(record, split, record_index, client, args):
     return sanitize_question_card(parsed, record, split, record_index)
 
 
+def exception_message(exc):
+    error = repr(exc)
+    if isinstance(exc, urllib.error.HTTPError):
+        try:
+            error = f"{error} body={exc.read().decode('utf-8', errors='replace')}"
+        except Exception:
+            pass
+    return error
+
+
+def generate_schema_task(index, table_record, split, client, args):
+    db_id = table_record["db_id"]
+    error = None
+    try:
+        cards = generate_schema_cards_for_db(table_record, split, client, args)
+    except Exception as exc:  # noqa: BLE001 - preserve long-running batch progress.
+        cards = []
+        error = exception_message(exc)
+    status = {
+        "split": split,
+        "kind": "schema",
+        "index": index,
+        "db_id": db_id,
+        "card_count": len(cards),
+        "error": error,
+    }
+    return index, cards, status
+
+
+def fallback_question_card(record, split, index, error):
+    return {
+        "split": split,
+        "db_id": record.get("db_id"),
+        "question_id": record.get("question_id"),
+        "record_index": index,
+        "question": record.get("question"),
+        "evidence": record.get("evidence"),
+        "normalized_question": record.get("question"),
+        "intent": "",
+        "mentions": [],
+        "operation_hints": [],
+        "value_hints": [],
+        "formula_hints": [],
+        "ordering_hints": [],
+        "source": "llm_fallback",
+        "llm_error": error,
+    }
+
+
+def generate_question_task(index, record, split, client, args):
+    error = None
+    try:
+        card = generate_question_card(record, split, index, client, args)
+    except Exception as exc:  # noqa: BLE001 - preserve long-running batch progress.
+        error = exception_message(exc)
+        card = fallback_question_card(record, split, index, error)
+    if getattr(args, "sleep", 0) > 0:
+        time.sleep(args.sleep)
+    status = {
+        "split": split,
+        "kind": "question",
+        "index": index,
+        "db_id": record.get("db_id"),
+        "question_id": record.get("question_id"),
+        "error": error,
+    }
+    return index, card, status
+
+
 def table_path_for_split(args, split):
     return Path(args.train_tables if split == "train" else args.dev_tables)
 
@@ -527,6 +629,34 @@ def main():
     parser.add_argument("--schema-card-mode", choices=["table", "db"], default="table")
     parser.add_argument("--timeout", type=int, default=300)
     parser.add_argument("--sleep", type=float, default=0.0)
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        help="Number of concurrent OpenAI-compatible requests. vLLM can batch these continuously.",
+    )
+    parser.add_argument(
+        "--reuse-card-dir",
+        action="append",
+        default=[],
+        help=(
+            "Existing Stage 8F output directory used as a read-only cache seed. "
+            "Repeat the option to combine train/dev caches from multiple directories."
+        ),
+    )
+    parser.add_argument(
+        "--refresh-mismatched-question-cards",
+        dest="refresh_mismatched_question_cards",
+        action="store_true",
+        help="Regenerate cached cards when normalized question/evidence changed (default).",
+    )
+    parser.add_argument(
+        "--no-refresh-mismatched-question-cards",
+        dest="refresh_mismatched_question_cards",
+        action="store_false",
+        help="Reuse cached cards without checking question/evidence content.",
+    )
+    parser.set_defaults(refresh_mismatched_question_cards=True)
     parser.add_argument("--disable-thinking", action="store_true")
     parser.add_argument(
         "--resume",
@@ -541,9 +671,12 @@ def main():
     args = parser.parse_args()
     if args.retry_errors and not args.resume:
         parser.error("--retry-errors requires --resume")
+    if args.workers < 1:
+        parser.error("--workers must be at least 1")
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    reuse_card_dirs = [Path(path) for path in args.reuse_card_dir]
     client = build_client(args)
     summary = {
         "config": vars(args),
@@ -565,14 +698,24 @@ def main():
                 write_jsonl(card_path, [])
                 write_jsonl(status_path, [])
             schema_by_key = latest_by(
-                read_jsonl_if_exists(card_path),
+                cached_jsonl_records(
+                    card_path,
+                    reuse_card_dirs,
+                    f"{split}_schema_semantic_cards.jsonl",
+                ),
                 lambda row: (row.get("db_id"), int(row.get("schema_item_id", -1))),
             )
             status_by_db = latest_by(
-                read_jsonl_if_exists(status_path), lambda row: row.get("db_id")
+                cached_jsonl_records(
+                    status_path,
+                    reuse_card_dirs,
+                    f"{split}_schema_status.jsonl",
+                ),
+                lambda row: row.get("db_id"),
             )
             generated_count = 0
             reused_count = 0
+            pending_schema_tasks = []
             for index, table_record in enumerate(table_records, start=1):
                 db_id = table_record["db_id"]
                 previous_status = status_by_db.get(db_id)
@@ -596,27 +739,19 @@ def main():
                         )
                     )
                     continue
-                error = None
-                try:
-                    cards = generate_schema_cards_for_db(table_record, split, client, args)
-                except Exception as exc:  # noqa: BLE001 - record and continue for long jobs.
-                    cards = []
-                    error = repr(exc)
-                    if isinstance(exc, urllib.error.HTTPError):
-                        try:
-                            error = f"{error} body={exc.read().decode('utf-8', errors='replace')}"
-                        except Exception:
-                            pass
-                status = {"split": split, "kind": "schema", "index": index, "db_id": db_id, "card_count": len(cards), "error": error}
+                pending_schema_tasks.append((index, table_record, split, client, args))
+            for _, cards, status in completed_results(
+                pending_schema_tasks,
+                generate_schema_task,
+                args.workers,
+            ):
                 append_jsonl(card_path, cards)
                 append_jsonl(status_path, [status])
                 for card in cards:
-                    schema_by_key[(db_id, int(card["schema_item_id"]))] = card
-                status_by_db[db_id] = status
+                    schema_by_key[(status["db_id"], int(card["schema_item_id"]))] = card
+                status_by_db[status["db_id"]] = status
                 generated_count += 1
                 print(json.dumps(status, ensure_ascii=False))
-                if args.sleep > 0:
-                    time.sleep(args.sleep)
             db_order = {record["db_id"]: index for index, record in enumerate(table_records)}
             schema_cards = sorted(
                 [card for (db_id, _), card in schema_by_key.items() if db_id in db_order],
@@ -639,13 +774,25 @@ def main():
                 write_jsonl(card_path, [])
                 write_jsonl(status_path, [])
             question_by_index = latest_by(
-                read_jsonl_if_exists(card_path), lambda row: int(row.get("record_index", -1))
+                cached_jsonl_records(
+                    card_path,
+                    reuse_card_dirs,
+                    f"{split}_question_cards.jsonl",
+                ),
+                lambda row: int(row.get("record_index", -1)),
             )
             status_by_index = latest_by(
-                read_jsonl_if_exists(status_path), lambda row: int(row.get("index", -1))
+                cached_jsonl_records(
+                    status_path,
+                    reuse_card_dirs,
+                    f"{split}_question_status.jsonl",
+                ),
+                lambda row: int(row.get("index", -1)),
             )
             generated_count = 0
             reused_count = 0
+            mismatched_count = 0
+            pending_question_tasks = []
             for index, record in enumerate(records):
                 previous_card = question_by_index.get(index)
                 previous_status = status_by_index.get(index)
@@ -654,6 +801,13 @@ def main():
                 )
                 if reuse:
                     validate_resumed_question(previous_card, record, index)
+                    if (
+                        args.refresh_mismatched_question_cards
+                        and not resumed_question_content_matches(previous_card, record)
+                    ):
+                        reuse = False
+                        mismatched_count += 1
+                if reuse:
                     reused_count += 1
                     print(
                         json.dumps(
@@ -662,37 +816,18 @@ def main():
                         )
                     )
                     continue
-                error = None
-                try:
-                    card = generate_question_card(record, split, index, client, args)
-                except Exception as exc:  # noqa: BLE001
-                    card = {
-                        "split": split,
-                        "db_id": record.get("db_id"),
-                        "question_id": record.get("question_id"),
-                        "record_index": index,
-                        "question": record.get("question"),
-                        "evidence": record.get("evidence"),
-                        "normalized_question": record.get("question"),
-                        "intent": "",
-                        "mentions": [],
-                        "operation_hints": [],
-                        "value_hints": [],
-                        "formula_hints": [],
-                        "ordering_hints": [],
-                        "source": "llm_fallback",
-                        "llm_error": repr(exc),
-                    }
-                    error = repr(exc)
-                status = {"split": split, "kind": "question", "index": index, "db_id": record.get("db_id"), "question_id": record.get("question_id"), "error": error}
+                pending_question_tasks.append((index, record, split, client, args))
+            for index, card, status in completed_results(
+                pending_question_tasks,
+                generate_question_task,
+                args.workers,
+            ):
                 append_jsonl(card_path, [card])
                 append_jsonl(status_path, [status])
                 question_by_index[index] = card
                 status_by_index[index] = status
                 generated_count += 1
                 print(json.dumps(status, ensure_ascii=False))
-                if args.sleep > 0:
-                    time.sleep(args.sleep)
             question_cards = [question_by_index[index] for index in range(len(records)) if index in question_by_index]
             status_rows = [status_by_index[index] for index in range(len(records)) if index in status_by_index]
             write_jsonl(card_path, question_cards)
@@ -701,6 +836,7 @@ def main():
             split_summary["question_completed_count"] = len(question_cards)
             split_summary["question_generated_this_run"] = generated_count
             split_summary["question_reused_count"] = reused_count
+            split_summary["question_cache_mismatch_count"] = mismatched_count
             split_summary["question_card_count"] = len(question_cards)
             split_summary["question_error_count"] = sum(1 for row in status_rows if row["error"])
         summary["splits"][split] = split_summary

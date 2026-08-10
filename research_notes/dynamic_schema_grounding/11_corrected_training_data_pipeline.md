@@ -84,6 +84,32 @@ Schema cards can be reused because the database schemas are unchanged. After car
 rebuild graph examples and dense embedding caches before retraining the relation-conditioned
 grounder.
 
+## Parallel and incremental Stage 8F generation
+
+Stage 8F supports concurrent requests for vLLM continuous batching. It can also seed a new output
+directory from one or more old Stage 8F directories. Cached question cards are reused only when the
+normalized question and evidence still match; changed records are regenerated.
+
+```bash
+python src/data/stage8f_llm_card_generation.py \
+  --train-labels experiments/stage1_label_extraction_corrected/bird_train_grounding_labels.jsonl \
+  --dev-labels experiments/stage1_label_extraction_corrected/bird_dev_grounding_labels.jsonl \
+  --output-dir experiments/stage8f_llm_cards_corrected_incremental \
+  --reuse-card-dir experiments/OLD_TRAIN_CARD_DIR \
+  --reuse-card-dir experiments/OLD_DEV_CARD_DIR \
+  --splits train,dev \
+  --card-types both \
+  --workers 8 \
+  --question-max-tokens 512 \
+  --disable-thinking \
+  --resume \
+  --retry-errors
+```
+
+Every completed result is appended by the main thread, so workers never write the same file
+concurrently. Final files are canonicalized into source order. Start with 8 workers and increase to
+16 only if vLLM has spare GPU capacity and stable latency.
+
 ## Experimental control
 
 Keep both pipelines:
