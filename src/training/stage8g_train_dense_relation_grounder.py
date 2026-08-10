@@ -195,10 +195,24 @@ def split_gold_ids(example):
     return gold_ids, column_ids
 
 
-def train_one_epoch(model, examples, cache, runtime, args, optimizer, criterion, device, graph_relations):
+def train_one_epoch(
+    model,
+    examples,
+    cache,
+    runtime,
+    args,
+    optimizer,
+    criterion,
+    device,
+    graph_relations,
+    epoch_index=0,
+):
     model.train()
     total_loss = 0.0
-    for example in examples:
+    epoch_examples = list(examples)
+    if args.shuffle_train_examples:
+        random.Random(args.seed + int(epoch_index)).shuffle(epoch_examples)
+    for example in epoch_examples:
         tensors = build_feature_tensors(example, cache, runtime, args, graph_relations, device)
         output = forward_model(model, example, tensors, args)
         loss = criterion(output["logits"], tensors["labels"])
@@ -365,6 +379,17 @@ def main():
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
+        "--shuffle-train-examples",
+        action="store_true",
+        default=True,
+        help="Deterministically reshuffle relation examples at each epoch (enabled by default).",
+    )
+    parser.add_argument(
+        "--no-shuffle-train-examples",
+        dest="shuffle_train_examples",
+        action="store_false",
+    )
+    parser.add_argument(
         "--deterministic",
         action="store_true",
         help="Request deterministic PyTorch kernels when available (may reduce throughput).",
@@ -486,7 +511,16 @@ def main():
     with (output_dir / "train_log.jsonl").open("w", encoding="utf-8") as log_file:
         for epoch in range(1, args.epochs + 1):
             train_loss = train_one_epoch(
-                model, train_examples, train_cache, runtime, args, optimizer, criterion, device, graph_relations
+                model,
+                train_examples,
+                train_cache,
+                runtime,
+                args,
+                optimizer,
+                criterion,
+                device,
+                graph_relations,
+                epoch_index=epoch,
             )
             dev_relation_metrics, dev_relation_predictions = evaluate_relation_examples(
                 model, dev_examples, dev_cache, runtime, args, device, graph_relations
