@@ -415,6 +415,14 @@ def process_records(records, schemas, split):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--bird-dir", default="Data/BIRD")
+    parser.add_argument(
+        "--train-question-answer",
+        default=None,
+        help=(
+            "Optional train_question_answer JSON override. Use the Stage 0 correction merge output "
+            "without overwriting the original BIRD file."
+        ),
+    )
     parser.add_argument("--output-dir", default="experiments/stage1_label_extraction")
     parser.add_argument("--splits", default="train,dev")
     parser.add_argument("--limit", type=int, default=None)
@@ -427,6 +435,13 @@ def main():
     train_schemas = load_table_schemas(bird_dir / "train_databases" / "train_databases" / "train_tables.json")
     dev_schemas = load_table_schemas(bird_dir / "dev_tables.json")
     all_stats = {
+        "config": {
+            "bird_dir": str(bird_dir),
+            "train_question_answer": args.train_question_answer,
+            "output_dir": str(output_dir),
+            "splits": args.splits,
+            "limit": args.limit,
+        },
         "schema_db_count": {
             "train": len(train_schemas),
             "dev": len(dev_schemas),
@@ -436,9 +451,15 @@ def main():
     splits = [item.strip() for item in args.splits.split(",") if item.strip()]
     for split in splits:
         if split == "train":
-            raw_records = read_json(bird_dir / "bird-schema" / "train_question_answer.json")
+            train_question_answer_path = (
+                Path(args.train_question_answer)
+                if args.train_question_answer
+                else bird_dir / "bird-schema" / "train_question_answer.json"
+            )
+            raw_records = read_json(train_question_answer_path)
             records = [normalize_train_record(item) for item in raw_records]
             schemas = train_schemas
+            all_stats["config"]["resolved_train_question_answer"] = str(train_question_answer_path)
         elif split == "dev":
             raw_records = read_json(bird_dir / "dev.json")
             records = [normalize_dev_record(item) for item in raw_records]

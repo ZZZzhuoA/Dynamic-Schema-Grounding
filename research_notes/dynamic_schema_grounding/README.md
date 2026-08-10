@@ -35,6 +35,7 @@ Next SQL Token / Clause
 - [08_model_architecture_diagrams.md](./08_model_architecture_diagrams.md)：可直接放进论文草稿的模型架构图与流程图。
 - [09_experiment_design_tables.md](./09_experiment_design_tables.md)：实验设计总表、消融矩阵、干预实验表与预期分析表。
 - [10_staged_experiment_roadmap.md](./10_staged_experiment_roadmap.md)：按阶段推进实验的执行路线图，每阶段包含准备材料、流程、验收标准和进入下一阶段条件。
+- [11_corrected_training_data_pipeline.md](./11_corrected_training_data_pipeline.md)：局部修正训练集的安全合并、审计与监督重建流程。
 
 ## 一句话版本
 

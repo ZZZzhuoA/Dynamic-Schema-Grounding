@@ -1,0 +1,38 @@
+[
+  {
+    "correction_index": 162,
+    "original_index": 1577,
+    "audit_status": "approved",
+    "reason": "Question paraphrase, evidence exact, and corrected SQL directly matches the intended UK Sales Rep query."
+  },
+  {
+    "correction_index": 378,
+    "original_index": 8884,
+    "audit_status": "approved",
+    "reason": "The phrase 'at the minimum' and min_qty correction clearly identify the original cookbook record."
+  },
+  {
+    "correction_index": 891,
+    "original_index": 8281,
+    "audit_status": "approved",
+    "reason": "Exact duplicate-question occurrence with a valid area-ratio SQL correction."
+  },
+  {
+    "correction_index": 1303,
+    "original_index": 4067,
+    "audit_status": "approved",
+    "reason": "Question, Arizona/active-business evidence, and cross-noon business-hours SQL identify the source record."
+  },
+  {
+    "correction_index": 1532,
+    "original_index": 4186,
+    "audit_status": "approved",
+    "reason": "Question clarification, evidence, and AVG(height_meters) SQL are fully consistent."
+  },
+  {
+    "correction_index": 2299,
+    "original_index": 7884,
+    "audit_status": "approved",
+    "reason": "The correction fixes the joint most-populous-city and smallest-surface-area query."
+  }
+]

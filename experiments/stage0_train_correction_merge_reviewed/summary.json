@@ -1,0 +1,42 @@
+{
+  "config": {
+    "train_question_answer": "Data\\BIRD\\bird-schema\\train_question_answer.json",
+    "corrections": "Data\\BIRD\\processed_final_data.json",
+    "output_dir": "experiments\\stage0_train_correction_merge_reviewed",
+    "review_map": "experiments/stage0_train_correction_merge/review_map_approved.json",
+    "fuzzy_question_threshold": 0.9,
+    "fuzzy_score_margin": 0.05,
+    "clear_changed_hit_info": true
+  },
+  "original_record_count": 9428,
+  "correction_record_count": 2375,
+  "applied_correction_count": 2366,
+  "unresolved_correction_count": 9,
+  "merged_record_count": 9428,
+  "match_method_counts": {
+    "exact_unique": 2329,
+    "fuzzy_question": 25,
+    "manual_review": 6,
+    "exact_occurrence": 4,
+    "exact_disambiguated": 2
+  },
+  "unresolved_reason_counts": {
+    "ambiguous_exact_question": 1,
+    "question_similarity_below_threshold": 8
+  },
+  "change_counts": {
+    "applied": 2366,
+    "question_changed": 30,
+    "evidence_changed": 172,
+    "sql_changed": 1890,
+    "sql_unchanged": 476,
+    "hit_info_cleared": 1890
+  },
+  "outputs": {
+    "merged_train_question_answer": "experiments\\stage0_train_correction_merge_reviewed\\merged_train_question_answer.json",
+    "correction_manifest": "experiments\\stage0_train_correction_merge_reviewed\\correction_manifest.jsonl",
+    "unresolved_corrections": "experiments\\stage0_train_correction_merge_reviewed\\unresolved_corrections.jsonl",
+    "review_map_template": "experiments\\stage0_train_correction_merge_reviewed\\review_map_template.json"
+  },
+  "safety_note": "Changed SQL invalidates the original hit_info. It is cleared by default so Stage 1 derives schema supervision from corrected SQL rather than stale annotations."
+}
