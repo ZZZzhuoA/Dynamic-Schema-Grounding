@@ -26,6 +26,7 @@ from src.training.stage8g_train_dense_relation_grounder import (  # noqa: E402
     import_runtime,
     infer_input_dim,
     load_cache,
+    select_aligned_records,
 )
 
 
@@ -91,6 +92,16 @@ def main():
     parser.add_argument("--embedding-cache-dir", required=True)
     parser.add_argument("--split", default="dev")
     parser.add_argument(
+        "--cache-split",
+        default=None,
+        help="Embedding-cache split; defaults to --split.",
+    )
+    parser.add_argument(
+        "--record-index-file",
+        default=None,
+        help="Optional JSON record-index manifest applied before offset/limit.",
+    )
+    parser.add_argument(
         "--offset",
         type=int,
         default=0,
@@ -140,7 +151,12 @@ def main():
 
     if cli.offset < 0:
         raise ValueError("--offset must be non-negative")
-    all_aligned = load_aligned_records(Path(cli.relation_file), Path(cli.graph_file), None)
+    source_aligned = load_aligned_records(
+        Path(cli.relation_file), Path(cli.graph_file), None
+    )
+    all_aligned = select_aligned_records(
+        source_aligned, cli.record_index_file, None
+    )
     stop = cli.offset + cli.limit if cli.limit is not None else None
     aligned = all_aligned[cli.offset:stop]
     if not aligned:
@@ -152,7 +168,8 @@ def main():
         args.relation_types,
         include_empty_relation_examples=args.include_empty_relation_examples,
     )
-    cache = load_cache(Path(cli.embedding_cache_dir), cli.split, runtime)
+    cache_split = cli.cache_split or cli.split
+    cache = load_cache(Path(cli.embedding_cache_dir), cache_split, runtime)
     input_dim = infer_input_dim(args, cache)
     trained_input_dim = train_config.get("input_dim")
     if trained_input_dim is not None and int(trained_input_dim) != input_dim:
@@ -207,8 +224,11 @@ def main():
         "graph_file": cli.graph_file,
         "embedding_cache_dir": cli.embedding_cache_dir,
         "split": cli.split,
+        "cache_split": cache_split,
+        "record_index_file": cli.record_index_file,
         "base_sample_count": len(aligned),
-        "source_base_sample_count": len(all_aligned),
+        "source_base_sample_count": len(source_aligned),
+        "filtered_base_sample_count": len(all_aligned),
         "relation_example_count": len(examples),
         "offset": cli.offset,
         "limit": cli.limit,

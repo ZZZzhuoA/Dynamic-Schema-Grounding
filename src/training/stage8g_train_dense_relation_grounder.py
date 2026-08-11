@@ -82,6 +82,34 @@ def load_cache(prefix: Path, split: str, runtime):
     }
 
 
+def load_record_index_filter(path):
+    if not path:
+        return None
+    payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    indices = payload.get("record_indices") if isinstance(payload, dict) else payload
+    if not isinstance(indices, list):
+        raise ValueError(f"Record-index file must contain a list: {path}")
+    result = [int(index) for index in indices]
+    if len(result) != len(set(result)):
+        raise ValueError(f"Duplicate record indices in {path}")
+    return result
+
+
+def select_aligned_records(aligned, index_file=None, limit=None):
+    requested = load_record_index_filter(index_file)
+    if requested is None:
+        selected = list(aligned)
+    else:
+        by_index = {int(item["record_index"]): item for item in aligned}
+        missing = [index for index in requested if index not in by_index]
+        if missing:
+            raise ValueError(
+                f"Record-index filter references missing records: {missing[:10]}"
+            )
+        selected = [by_index[index] for index in requested]
+    return selected[:limit] if limit is not None else selected
+
+
 def dense_features_for_example(example, cache, runtime, device):
     torch = runtime["torch"]
     record_index = int(example["record_index"])
@@ -360,6 +388,26 @@ def main():
     parser.add_argument("--train-graph-file", default="experiments/stage8f_dsg_data_llm_cards_qwen25_train1000_dev100/train_examples.jsonl")
     parser.add_argument("--dev-graph-file", default="experiments/stage8f_dsg_data_llm_cards_qwen25_train1000_dev100/dev_examples.jsonl")
     parser.add_argument("--embedding-cache-dir", default="experiments/stage8g_embedding_cache_qwen3_06b_train1000_dev100")
+    parser.add_argument(
+        "--train-cache-split",
+        default="train",
+        help="Embedding-cache split used by training records.",
+    )
+    parser.add_argument(
+        "--dev-cache-split",
+        default="dev",
+        help="Embedding-cache split used by validation/evaluation records.",
+    )
+    parser.add_argument(
+        "--train-record-index-file",
+        default=None,
+        help="Optional JSON record-index manifest applied after full-file alignment.",
+    )
+    parser.add_argument(
+        "--dev-record-index-file",
+        default=None,
+        help="Optional JSON record-index manifest applied after full-file alignment.",
+    )
     parser.add_argument("--output-dir", default="experiments/stage8g_dense_relation_grounder_smoke")
     parser.add_argument("--train-limit", type=int, default=1000)
     parser.add_argument("--dev-limit", type=int, default=100)
@@ -426,6 +474,16 @@ def main():
     parser.add_argument("--similarity-prior-clip", type=float, default=4.0)
     parser.add_argument("--selection-metric", default="assembled_schema_recall@30")
     parser.add_argument("--selection-mode", choices=["max", "min"], default="max")
+    parser.add_argument(
+        "--checkpoint-policy",
+        choices=["best_dev", "last"],
+        default="best_dev",
+        help=(
+            "Use best_dev for ordinary training. Use last for strict OOF training: "
+            "the held-out fold is not evaluated or used for checkpoint selection until "
+            "all fixed epochs have completed."
+        ),
+    )
     parser.add_argument("--patience", type=int, default=3)
     parser.add_argument("--min-delta", type=float, default=0.0)
     parser.add_argument(
@@ -448,8 +506,18 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
     runtime = import_runtime()
     configure_reproducibility(args.seed, runtime, deterministic=args.deterministic)
-    train_aligned = load_aligned_records(Path(args.train_relation_file), Path(args.train_graph_file), args.train_limit)
-    dev_aligned = load_aligned_records(Path(args.dev_relation_file), Path(args.dev_graph_file), args.dev_limit)
+    train_aligned_all = load_aligned_records(
+        Path(args.train_relation_file), Path(args.train_graph_file), None
+    )
+    dev_aligned_all = load_aligned_records(
+        Path(args.dev_relation_file), Path(args.dev_graph_file), None
+    )
+    train_aligned = select_aligned_records(
+        train_aligned_all, args.train_record_index_file, args.train_limit
+    )
+    dev_aligned = select_aligned_records(
+        dev_aligned_all, args.dev_record_index_file, args.dev_limit
+    )
     train_examples = make_relation_examples(
         train_aligned,
         args.relation_types,
@@ -461,8 +529,8 @@ def main():
         include_empty_relation_examples=args.include_empty_relation_examples,
     )
     cache_dir = Path(args.embedding_cache_dir)
-    train_cache = load_cache(cache_dir, "train", runtime)
-    dev_cache = load_cache(cache_dir, "dev", runtime)
+    train_cache = load_cache(cache_dir, args.train_cache_split, runtime)
+    dev_cache = load_cache(cache_dir, args.dev_cache_split, runtime)
     input_dim = infer_input_dim(args, train_cache)
     data_report = {
         "train_base_count": len(train_aligned),
@@ -473,6 +541,11 @@ def main():
         "feature_mode": args.feature_mode,
         "input_dim": input_dim,
         "embedding_cache_dir": str(cache_dir),
+        "train_cache_split": args.train_cache_split,
+        "dev_cache_split": args.dev_cache_split,
+        "train_record_index_file": args.train_record_index_file,
+        "dev_record_index_file": args.dev_record_index_file,
+        "checkpoint_policy": args.checkpoint_policy,
         "train_query_dim": train_cache["query_dim"],
         "train_node_dim": train_cache["node_dim"],
         "dev_query_dim": dev_cache["query_dim"],
@@ -522,60 +595,81 @@ def main():
                 graph_relations,
                 epoch_index=epoch,
             )
-            dev_relation_metrics, dev_relation_predictions = evaluate_relation_examples(
-                model, dev_examples, dev_cache, runtime, args, device, graph_relations
-            )
-            assembled_rows = assemble_predictions(
-                dev_relation_predictions,
-                dev_aligned,
-                output_top_k=args.output_top_k,
-                budgets=args.assembly_budgets,
-            )
-            assembled_metrics = evaluate_assembled(assembled_rows)
-            dev_metrics = {**dev_relation_metrics, **assembled_metrics}
-            if args.use_similarity_prior:
-                dev_metrics["learned_similarity_prior_scales"] = {
-                    relation: float(scale)
-                    for relation, scale in zip(
-                        args.relation_types,
-                        model.prior_scales().detach().cpu().tolist(),
-                    )
-                }
-            selected_value = get_metric(dev_metrics, args.selection_metric)
-            improved = is_better_metric(selected_value, best_value, args.selection_mode, args.min_delta)
-            if improved:
-                best_epoch = epoch
-                best_value = selected_value
-                best_state = clone_state_dict_to_cpu(model)
-                epochs_without_improvement = 0
-                best_metrics = dev_metrics.copy()
-                best_metrics.update(
-                    {
-                        "best_epoch": best_epoch,
-                        "selection_metric": args.selection_metric,
-                        "selection_value": best_value,
-                        "selection_mode": args.selection_mode,
-                    }
-                )
-                write_json(output_dir / "best_metrics.json", best_metrics)
-                if not args.no_save_model:
-                    torch.save(best_state, output_dir / "dense_relation_grounder_model.pt")
-            else:
-                epochs_without_improvement += 1
             row = {
                 "epoch": epoch,
                 "train_loss": train_loss,
-                "selection_metric": args.selection_metric,
-                "selection_value": selected_value,
-                "best_epoch": best_epoch,
-                "best_selection_value": best_value,
-                "is_best": improved,
-                "epochs_without_improvement": epochs_without_improvement,
+                "checkpoint_policy": args.checkpoint_policy,
             }
-            row.update({f"dev_{key}": value for key, value in dev_metrics.items() if key != "split"})
+            if args.checkpoint_policy == "best_dev":
+                dev_relation_metrics, dev_relation_predictions = evaluate_relation_examples(
+                    model, dev_examples, dev_cache, runtime, args, device, graph_relations
+                )
+                assembled_rows = assemble_predictions(
+                    dev_relation_predictions,
+                    dev_aligned,
+                    output_top_k=args.output_top_k,
+                    budgets=args.assembly_budgets,
+                )
+                assembled_metrics = evaluate_assembled(assembled_rows)
+                dev_metrics = {**dev_relation_metrics, **assembled_metrics}
+                if args.use_similarity_prior:
+                    dev_metrics["learned_similarity_prior_scales"] = {
+                        relation: float(scale)
+                        for relation, scale in zip(
+                            args.relation_types,
+                            model.prior_scales().detach().cpu().tolist(),
+                        )
+                    }
+                selected_value = get_metric(dev_metrics, args.selection_metric)
+                improved = is_better_metric(
+                    selected_value,
+                    best_value,
+                    args.selection_mode,
+                    args.min_delta,
+                )
+                if improved:
+                    best_epoch = epoch
+                    best_value = selected_value
+                    best_state = clone_state_dict_to_cpu(model)
+                    epochs_without_improvement = 0
+                    best_metrics = dev_metrics.copy()
+                    best_metrics.update(
+                        {
+                            "best_epoch": best_epoch,
+                            "selection_metric": args.selection_metric,
+                            "selection_value": best_value,
+                            "selection_mode": args.selection_mode,
+                        }
+                    )
+                    write_json(output_dir / "best_metrics.json", best_metrics)
+                    if not args.no_save_model:
+                        torch.save(best_state, output_dir / "dense_relation_grounder_model.pt")
+                else:
+                    epochs_without_improvement += 1
+                row.update(
+                    {
+                        "selection_metric": args.selection_metric,
+                        "selection_value": selected_value,
+                        "best_epoch": best_epoch,
+                        "best_selection_value": best_value,
+                        "is_best": improved,
+                        "epochs_without_improvement": epochs_without_improvement,
+                    }
+                )
+                row.update(
+                    {
+                        f"dev_{key}": value
+                        for key, value in dev_metrics.items()
+                        if key != "split"
+                    }
+                )
             log_file.write(json.dumps(row, ensure_ascii=False) + "\n")
             print(json.dumps(row, ensure_ascii=False))
-            if args.patience > 0 and epochs_without_improvement >= args.patience:
+            if (
+                args.checkpoint_policy == "best_dev"
+                and args.patience > 0
+                and epochs_without_improvement >= args.patience
+            ):
                 stopped_early = True
                 break
 
@@ -593,7 +687,47 @@ def main():
     if not args.no_save_model:
         torch.save(model.state_dict(), output_dir / "dense_relation_grounder_last_model.pt")
 
-    if best_state is not None:
+    if args.checkpoint_policy == "last":
+        best_epoch = epoch if "epoch" in locals() else 0
+        best_state = clone_state_dict_to_cpu(model)
+        final_relation_metrics, final_relation_predictions = evaluate_relation_examples(
+            model,
+            dev_examples,
+            dev_cache,
+            runtime,
+            args,
+            device,
+            graph_relations,
+            output_dir=output_dir,
+            split="dev",
+        )
+        final_assembled = assemble_predictions(
+            final_relation_predictions,
+            dev_aligned,
+            output_top_k=args.output_top_k,
+            budgets=args.assembly_budgets,
+        )
+        final_assembled_metrics = evaluate_assembled(final_assembled)
+        write_jsonl(output_dir / "dev_assembled_predictions.jsonl", final_assembled)
+        final_metrics_for_selection = {
+            **final_relation_metrics,
+            **final_assembled_metrics,
+        }
+        best_value = get_metric(final_metrics_for_selection, args.selection_metric)
+        if not args.no_save_model:
+            torch.save(best_state, output_dir / "dense_relation_grounder_model.pt")
+        write_json(
+            output_dir / "best_metrics.json",
+            {
+                **final_metrics_for_selection,
+                "best_epoch": best_epoch,
+                "selection_metric": args.selection_metric,
+                "selection_value": best_value,
+                "selection_mode": "fixed_last_epoch",
+                "heldout_used_for_checkpoint_selection": False,
+            },
+        )
+    elif best_state is not None:
         model.load_state_dict({key: value.to(device) for key, value in best_state.items()})
         final_relation_metrics, final_relation_predictions = evaluate_relation_examples(
             model, dev_examples, dev_cache, runtime, args, device, graph_relations, output_dir=output_dir, split="dev"
@@ -624,10 +758,20 @@ def main():
         "best_epoch": best_epoch,
         "selection_metric": args.selection_metric,
         "selection_value": best_value,
-        "selection_mode": args.selection_mode,
+        "selection_mode": (
+            "fixed_last_epoch"
+            if args.checkpoint_policy == "last"
+            else args.selection_mode
+        ),
+        "checkpoint_policy": args.checkpoint_policy,
+        "heldout_used_for_checkpoint_selection": args.checkpoint_policy != "last",
         "stopped_early": stopped_early,
         "last_epoch": epoch if "epoch" in locals() else 0,
-        "dev_metrics_are_from": "best_checkpoint" if best_state is not None else "last_checkpoint",
+        "dev_metrics_are_from": (
+            "fixed_last_checkpoint"
+            if args.checkpoint_policy == "last"
+            else "best_checkpoint" if best_state is not None else "last_checkpoint"
+        ),
         "dev_metrics": final_metrics,
         "dev_last_metrics": {**last_relation_metrics, **last_assembled_metrics},
     }
