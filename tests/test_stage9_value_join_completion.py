@@ -90,8 +90,16 @@ class Stage9JoinCompletionTest(unittest.TestCase):
             },
         }
         matches = [
-            {"schema_item_id": 3, "score": 1.0, "matches": []},
-            {"schema_item_id": 2, "score": 1.0, "matches": []},
+            {
+                "schema_item_id": 3,
+                "score": 1.0,
+                "matches": [{"normalized_value": "alameda", "score": 1.0}],
+            },
+            {
+                "schema_item_id": 2,
+                "score": 1.0,
+                "matches": [{"normalized_value": "alameda", "score": 1.0}],
+            },
         ]
         args = SimpleNamespace(
             terminal_top_per_relation=3,
@@ -102,6 +110,104 @@ class Stage9JoinCompletionTest(unittest.TestCase):
             matches, relation_rows, by_id, args
         )
         self.assertEqual(ranked[0]["schema_item_id"], 2)
+        self.assertEqual(ranked[0]["value_gate"], "inject")
+        self.assertTrue(ranked[0]["eligible_for_terminal"])
+        self.assertFalse(ranked[1]["eligible_for_terminal"])
+
+    def test_unique_value_can_inject_but_cannot_create_join_terminal_without_support(self):
+        by_id = {
+            0: {"id": 0, "type": "table", "name": "schools"},
+            1: {"id": 1, "type": "column", "name": "schools.county", "table": "schools"},
+        }
+        matches = [
+            {
+                "schema_item_id": 1,
+                "score": 1.0,
+                "matches": [{"normalized_value": "alameda", "score": 1.0}],
+            }
+        ]
+        args = SimpleNamespace(
+            terminal_top_per_relation=3,
+            value_table_context_weight=0.35,
+            value_relation_context_weight=0.25,
+        )
+        ranked = COMPLETION.contextualize_value_matches(matches, {}, by_id, args)
+        self.assertEqual(ranked[0]["value_gate"], "inject")
+        self.assertAlmostEqual(ranked[0]["value_confidence"], 0.70)
+        self.assertFalse(ranked[0]["eligible_for_terminal"])
+
+    def test_rerank_value_cannot_introduce_a_new_schema_item(self):
+        by_id = {
+            1: {"id": 1, "type": "column", "name": "t.first", "table": "t"},
+            2: {"id": 2, "type": "column", "name": "t.existing", "table": "t"},
+            3: {"id": 3, "type": "column", "name": "t.new", "table": "t"},
+        }
+        row = {
+            "top_3": [
+                {"id": 1, "score": 3.0},
+                {"id": 2, "score": 2.0},
+            ]
+        }
+        candidates = [
+            {"schema_item_id": 3, "score": 0.45, "value_gate": "rerank"},
+            {"schema_item_id": 2, "score": 0.42, "value_gate": "rerank"},
+        ]
+        fused = COMPLETION.fuse_gated_value_candidates(
+            row, candidates, by_id, budget=2, protected_prefix=1
+        )
+        self.assertEqual([item["id"] for item in fused["top_3"]], [1, 2])
+
+    def test_coverage_diagnostics_respect_requested_top_k(self):
+        baseline = [
+            {"record_index": 0, "top_5": [{"id": 1}, {"id": 2}]}
+        ]
+        enhanced = [
+            {"record_index": 0, "top_5": [{"id": 1}, {"id": 3}]}
+        ]
+        aligned = [
+            {
+                "record_index": 0,
+                "clause_record": {"whole_sql_labels": [1, 2]},
+                "graph_example": {
+                    "inference_inputs": {"db_id": "demo", "question": "q"}
+                },
+            }
+        ]
+        transitions = COMPLETION.build_coverage_transition_diagnostics(
+            baseline, enhanced, aligned, top_k=5
+        )
+        self.assertEqual(transitions[0]["transition"], "lost")
+        self.assertEqual(transitions[0]["evicted_gold_ids"], [2])
+
+    def test_typed_assembled_recall_uses_node_types_and_skips_empty_types(self):
+        assembled = [
+            {"record_index": 0, "top_5": [{"id": 0}, {"id": 1}]},
+            {"record_index": 1, "top_5": [{"id": 1}]},
+        ]
+        graph_inputs = {
+            "schema_nodes": [
+                {"id": 0, "type": "table", "name": "t"},
+                {"id": 1, "type": "column", "name": "t.a", "table": "t"},
+                {"id": 2, "type": "column", "name": "t.b", "table": "t"},
+            ]
+        }
+        aligned = [
+            {
+                "record_index": 0,
+                "clause_record": {"whole_sql_labels": [0, 1, 2]},
+                "graph_example": {"inference_inputs": graph_inputs},
+            },
+            {
+                "record_index": 1,
+                "clause_record": {"whole_sql_labels": [1]},
+                "graph_example": {"inference_inputs": graph_inputs},
+            },
+        ]
+        metrics = COMPLETION.evaluate_typed_assembled(assembled, aligned, top_k=5)
+        self.assertEqual(metrics["assembled_table_recall@5"], 1.0)
+        self.assertEqual(metrics["assembled_column_recall@5"], 0.75)
+        self.assertEqual(metrics["assembled_table_recall_sample_count"], 1)
+        self.assertEqual(metrics["assembled_column_recall_sample_count"], 2)
 
     def test_metric_closure_completes_intermediate_join_table(self):
         graph_example = {
