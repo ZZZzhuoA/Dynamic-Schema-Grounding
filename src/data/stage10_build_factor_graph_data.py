@@ -493,6 +493,7 @@ def main():
     candidate_counts = [len(row["candidate_nodes"]) for row in examples]
     factor_counts = [len(row["factors"]) for row in examples]
     oracle_recalls = [row["candidate_oracle_recall"] for row in examples]
+    empty_candidate_rows = [row for row in examples if not row["candidate_nodes"]]
     summary = {
         "config": vars(args),
         "sample_count": len(examples),
@@ -510,6 +511,10 @@ def main():
         "factor_kinds": FACTOR_KINDS,
         "relation_types": args.relation_types,
         "gold_injection": False,
+        "empty_candidate_count": len(empty_candidate_rows),
+        "empty_candidate_with_gold_count": sum(
+            bool(row.get("gold_ids")) for row in empty_candidate_rows
+        ),
     }
     write_json(summary_file, summary)
     print(json.dumps(summary, ensure_ascii=False, indent=2))

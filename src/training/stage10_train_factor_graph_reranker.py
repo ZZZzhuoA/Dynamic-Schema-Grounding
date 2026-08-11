@@ -74,6 +74,72 @@ def collect_schema_relations(examples):
     )
 
 
+def validate_and_filter_examples(examples, split):
+    """Remove only label-empty/candidate-empty records and reject real failures."""
+    usable = []
+    skipped = []
+    numeric_dim = None
+    role_dim = None
+    for example in examples:
+        candidates = example.get("candidate_nodes", [])
+        gold_ids = example.get("gold_ids", [])
+        if not candidates:
+            diagnostic = {
+                "split": split,
+                "record_index": example.get("record_index"),
+                "db_id": example.get("db_id"),
+                "question_id": example.get("question_id"),
+                "gold_count": len(gold_ids),
+                "reason": "empty_candidate_graph",
+            }
+            if gold_ids:
+                raise ValueError(
+                    "Candidate generation lost every node for a gold-bearing sample: "
+                    + json.dumps(diagnostic, ensure_ascii=False)
+                )
+            skipped.append(diagnostic)
+            continue
+        current_numeric_dim = len(candidates[0].get("numeric_features", []))
+        if current_numeric_dim <= 0:
+            raise ValueError(
+                f"Empty numeric features at {split} record_index={example.get('record_index')}"
+            )
+        if any(
+            len(node.get("numeric_features", [])) != current_numeric_dim
+            for node in candidates
+        ):
+            raise ValueError(
+                f"Inconsistent node feature dimensions at {split} "
+                f"record_index={example.get('record_index')}"
+            )
+        if numeric_dim is None:
+            numeric_dim = current_numeric_dim
+        elif current_numeric_dim != numeric_dim:
+            raise ValueError(
+                f"Numeric feature dimension changed in {split}: "
+                f"expected={numeric_dim} actual={current_numeric_dim} "
+                f"record_index={example.get('record_index')}"
+            )
+        current_role_dim = len(example.get("role_labels", [[]])[0])
+        if role_dim is None:
+            role_dim = current_role_dim
+        elif current_role_dim != role_dim:
+            raise ValueError(
+                f"Role label dimension changed in {split}: "
+                f"expected={role_dim} actual={current_role_dim}"
+            )
+        usable.append(example)
+    return usable, {
+        "split": split,
+        "input_count": len(examples),
+        "usable_count": len(usable),
+        "skipped_empty_unlabeled_count": len(skipped),
+        "skipped_examples": skipped,
+        "numeric_dim": numeric_dim,
+        "role_dim": role_dim,
+    }
+
+
 def example_to_tensors(example, cache, maps, runtime, device):
     torch = runtime["torch"]
     full_nodes = full_node_embeddings(cache, example["record_index"])
@@ -346,8 +412,14 @@ def main():
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(args.seed)
     device = torch.device(args.device)
-    train_examples = read_jsonl(Path(args.train_file), args.train_limit)
-    dev_examples = read_jsonl(Path(args.dev_file), args.dev_limit)
+    raw_train_examples = read_jsonl(Path(args.train_file), args.train_limit)
+    raw_dev_examples = read_jsonl(Path(args.dev_file), args.dev_limit)
+    train_examples, train_validation = validate_and_filter_examples(
+        raw_train_examples, "train"
+    )
+    dev_examples, dev_validation = validate_and_filter_examples(
+        raw_dev_examples, "dev"
+    )
     if not train_examples or not dev_examples:
         raise ValueError("Train/dev factor graph files must be non-empty")
     train_cache = load_cache(args.embedding_cache_dir, "train", runtime)
@@ -373,6 +445,10 @@ def main():
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    write_json(
+        output_dir / "data_validation.json",
+        {"train": train_validation, "dev": dev_validation},
+    )
     config = vars(args).copy()
     config.update(
         {

@@ -121,6 +121,34 @@ class Stage10FactorGraphDataTest(unittest.TestCase):
         self.assertEqual(result["missing_gold_ids"], [4])
         self.assertLess(result["candidate_oracle_recall"], 1.0)
 
+    def test_validation_skips_only_empty_unlabeled_candidate_graphs(self):
+        empty = {
+            "record_index": 7,
+            "db_id": "demo",
+            "candidate_nodes": [],
+            "gold_ids": [],
+        }
+        valid = {
+            "record_index": 8,
+            "candidate_nodes": [
+                {"numeric_features": [1.0, 0.0]}
+            ],
+            "gold_ids": [1],
+            "role_labels": [[1.0]],
+        }
+        usable, report = TRAINING.validate_and_filter_examples(
+            [empty, valid], "train"
+        )
+        self.assertEqual([row["record_index"] for row in usable], [8])
+        self.assertEqual(report["skipped_empty_unlabeled_count"], 1)
+
+    def test_validation_rejects_empty_gold_bearing_candidate_graph(self):
+        with self.assertRaises(ValueError):
+            TRAINING.validate_and_filter_examples(
+                [{"record_index": 9, "candidate_nodes": [], "gold_ids": [2]}],
+                "train",
+            )
+
     def test_constrained_selector_never_returns_orphan_column(self):
         example = {
             "candidate_nodes": [
