@@ -275,6 +275,8 @@ class Stage10ModelSmokeTest(unittest.TestCase):
             min_tables=-1,
             connectivity_weight=0.1,
             baseline_retention_weight=0.05,
+            gradient_accumulation_steps=2,
+            eval_every_examples=2,
         )
         model = HeterogeneousFactorGraphReranker(
             dense_dim=8,
@@ -287,13 +289,26 @@ class Stage10ModelSmokeTest(unittest.TestCase):
             dropout=0.0,
         )
         optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+        progress = []
         train_metrics = TRAINING.train_epoch(
-            model, [example], cache, maps, args, runtime, torch.device("cpu"), optimizer, 1
+            model,
+            [example] * 5,
+            cache,
+            maps,
+            args,
+            runtime,
+            torch.device("cpu"),
+            optimizer,
+            1,
+            progress_callback=lambda metrics: progress.append(dict(metrics)),
         )
         metrics, predictions = TRAINING.evaluate(
             model, [example], cache, maps, args, runtime, torch.device("cpu"), "dev"
         )
         self.assertGreater(train_metrics["loss"], 0.0)
+        self.assertEqual(train_metrics["optimizer_steps"], 3)
+        self.assertEqual(train_metrics["effective_batch_size"], 2)
+        self.assertEqual([row["example_count"] for row in progress], [2, 4])
         self.assertIn("constrained_complete_coverage@2", metrics)
         selected = predictions[0]["top_2"]
         selected_ids = {item["schema_item_id"] for item in selected}

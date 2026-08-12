@@ -348,25 +348,78 @@ def evaluate(model, examples, cache, maps, args, runtime, device, split):
     return metrics, predictions
 
 
-def train_epoch(model, examples, cache, maps, args, runtime, device, optimizer, epoch):
+def train_epoch(
+    model,
+    examples,
+    cache,
+    maps,
+    args,
+    runtime,
+    device,
+    optimizer,
+    epoch,
+    progress_callback=None,
+):
     model.train()
     shuffled = list(examples)
     random.Random(args.seed + epoch).shuffle(shuffled)
     total = 0.0
     components = {"node_loss": 0.0, "role_loss": 0.0, "pairwise_loss": 0.0}
-    for example in shuffled:
-        tensors = example_to_tensors(example, cache, maps, runtime, device)
-        output = forward_model(model, tensors)
-        loss, detail = reranker_loss(output, tensors, args, runtime)
+    accumulation_steps = int(getattr(args, "gradient_accumulation_steps", 1))
+    eval_every_examples = int(getattr(args, "eval_every_examples", 0))
+    if accumulation_steps < 1:
+        raise ValueError("gradient_accumulation_steps must be at least 1")
+    if eval_every_examples < 0:
+        raise ValueError("eval_every_examples must be non-negative")
+    processed = 0
+    optimizer_steps = 0
+    next_evaluation = eval_every_examples if eval_every_examples else None
+    for batch_start in range(0, len(shuffled), accumulation_steps):
+        micro_batch = shuffled[batch_start : batch_start + accumulation_steps]
         optimizer.zero_grad()
-        loss.backward()
+        for example in micro_batch:
+            tensors = example_to_tensors(example, cache, maps, runtime, device)
+            output = forward_model(model, tensors)
+            loss, detail = reranker_loss(output, tensors, args, runtime)
+            # Graphs have different node counts and are currently materialized one at
+            # a time. Averaging gradients over micro-batches gives an exact effective
+            # batch without padding heterogeneous graphs.
+            (loss / len(micro_batch)).backward()
+            total += float(loss.detach().cpu())
+            for key in components:
+                components[key] += detail[key]
         runtime["torch"].nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
         optimizer.step()
-        total += float(loss.detach().cpu())
-        for key in components:
-            components[key] += detail[key]
+        optimizer_steps += 1
+        processed += len(micro_batch)
+        if (
+            progress_callback is not None
+            and next_evaluation is not None
+            and processed >= next_evaluation
+            and processed < len(shuffled)
+        ):
+            progress_callback(
+                {
+                    "example_count": processed,
+                    "optimizer_steps": optimizer_steps,
+                    "loss": total / processed,
+                    **{
+                        key: value / processed
+                        for key, value in components.items()
+                    },
+                }
+            )
+            model.train()
+            while next_evaluation <= processed:
+                next_evaluation += eval_every_examples
     count = max(len(shuffled), 1)
-    return {"loss": total / count, **{key: value / count for key, value in components.items()}}
+    return {
+        "loss": total / count,
+        **{key: value / count for key, value in components.items()},
+        "example_count": len(shuffled),
+        "optimizer_steps": optimizer_steps,
+        "effective_batch_size": accumulation_steps,
+    }
 
 
 def main():
@@ -390,6 +443,21 @@ def main():
     parser.add_argument("--pairwise-margin", type=float, default=0.5)
     parser.add_argument("--hard-negative-k", type=int, default=8)
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
+    parser.add_argument(
+        "--gradient-accumulation-steps",
+        type=int,
+        default=1,
+        help="Number of heterogeneous query graphs averaged per optimizer update.",
+    )
+    parser.add_argument(
+        "--eval-every-examples",
+        type=int,
+        default=0,
+        help=(
+            "Evaluate after approximately this many training examples within each "
+            "epoch; 0 preserves epoch-only evaluation."
+        ),
+    )
     parser.add_argument("--output-top-k", type=int, default=30)
     parser.add_argument("--max-tables", type=int, default=8)
     parser.add_argument("--min-tables", type=int, default=-1)
@@ -457,9 +525,22 @@ def main():
             "factor_numeric_dim": maps["factor_numeric_dim"],
             "relation_count": relation_count,
             "schema_relations": schema_relations,
+            "architecture": {
+                "model_type": args.model_type,
+                "schema_graph_enabled": args.model_type in {"schema_rgta", "factor_rgta"},
+                "factor_graph_enabled": args.model_type == "factor_rgta",
+            },
+            "training_protocol": {
+                "gradient_accumulation_steps": args.gradient_accumulation_steps,
+                "eval_every_examples": args.eval_every_examples,
+                "checkpoint_selection": args.selection_metric,
+                "early_stopping_unit": "epoch",
+            },
             "innovation": (
-                "A query-conditioned heterogeneous factor graph jointly calibrates relation, "
-                "database-value, and join-path evidence before typed owner-closed subset decoding."
+                "A query-conditioned candidate schema subgraph is globally reranked before "
+                "typed owner-closed subset decoding. Stage 10-B-fix1 separates graph-structure "
+                "gain from optimization artifacts through OOF inputs, effective multi-graph "
+                "batches, and within-epoch checkpoint observation."
             ),
         }
     )
@@ -469,12 +550,20 @@ def main():
     best_value = None
     best_state = None
     best_metrics = None
+    best_checkpoint = None
     epochs_without_improvement = 0
     log_rows = []
-    for epoch in range(1, args.epochs + 1):
-        train_metrics = train_epoch(
-            model, train_examples, train_cache, maps, args, runtime, device, optimizer, epoch
-        )
+    global_examples_seen = 0
+    global_optimizer_steps = 0
+
+    def evaluate_checkpoint(
+        epoch,
+        examples_seen_in_epoch,
+        optimizer_steps_in_epoch,
+        train_metrics,
+        checkpoint_type,
+    ):
+        nonlocal best_epoch, best_value, best_state, best_metrics, best_checkpoint
         dev_metrics, _ = evaluate(
             model, dev_examples, dev_cache, maps, args, runtime, device, "dev"
         )
@@ -482,27 +571,81 @@ def main():
         improved = is_better_metric(
             selected_value, best_value, args.selection_mode, args.min_delta
         )
+        checkpoint = {
+            "epoch": epoch,
+            "examples_seen_in_epoch": examples_seen_in_epoch,
+            "epoch_progress": examples_seen_in_epoch / max(len(train_examples), 1),
+            "global_examples_seen": global_examples_seen + examples_seen_in_epoch,
+            "optimizer_steps_in_epoch": optimizer_steps_in_epoch,
+            "global_optimizer_steps": global_optimizer_steps + optimizer_steps_in_epoch,
+            "checkpoint_type": checkpoint_type,
+        }
         if improved:
             best_epoch = epoch
             best_value = selected_value
             best_state = clone_state_dict_to_cpu(model)
             best_metrics = dev_metrics
-            epochs_without_improvement = 0
+            best_checkpoint = checkpoint
             if not args.no_save_model:
                 torch.save(best_state, output_dir / "factor_graph_reranker_model.pt")
-        else:
-            epochs_without_improvement += 1
         row = {
-            "epoch": epoch,
+            **checkpoint,
             **{f"train_{key}": value for key, value in train_metrics.items()},
-            **{f"dev_{key}": value for key, value in dev_metrics.items() if key != "split"},
+            **{
+                f"dev_{key}": value
+                for key, value in dev_metrics.items()
+                if key != "split"
+            },
             "selection_value": selected_value,
             "best_epoch": best_epoch,
             "best_selection_value": best_value,
+            "best_checkpoint": best_checkpoint,
             "is_best": improved,
         }
         log_rows.append(row)
         print(json.dumps(row, ensure_ascii=False))
+        return improved
+
+    for epoch in range(1, args.epochs + 1):
+        epoch_improved = False
+
+        def progress_callback(partial_train_metrics):
+            nonlocal epoch_improved
+            improved = evaluate_checkpoint(
+                epoch,
+                int(partial_train_metrics["example_count"]),
+                int(partial_train_metrics["optimizer_steps"]),
+                partial_train_metrics,
+                "periodic",
+            )
+            epoch_improved = epoch_improved or improved
+
+        train_metrics = train_epoch(
+            model,
+            train_examples,
+            train_cache,
+            maps,
+            args,
+            runtime,
+            device,
+            optimizer,
+            epoch,
+            progress_callback=progress_callback if args.eval_every_examples else None,
+        )
+        improved = evaluate_checkpoint(
+            epoch,
+            int(train_metrics["example_count"]),
+            int(train_metrics["optimizer_steps"]),
+            train_metrics,
+            "epoch_end",
+        )
+        epoch_improved = epoch_improved or improved
+        global_examples_seen += int(train_metrics["example_count"])
+        global_optimizer_steps += int(train_metrics["optimizer_steps"])
+        if epoch_improved:
+            epochs_without_improvement = 0
+        else:
+            epochs_without_improvement += 1
         if args.patience > 0 and epochs_without_improvement >= args.patience:
             break
     write_jsonl(output_dir / "train_log.jsonl", log_rows)
@@ -515,11 +658,15 @@ def main():
     write_jsonl(output_dir / "dev_predictions.jsonl", predictions)
     summary = {
         "best_epoch": best_epoch,
+        "best_checkpoint": best_checkpoint,
         "selection_metric": args.selection_metric,
         "selection_value": best_value,
         "dev_metrics": final_metrics,
         "best_metrics_during_training": best_metrics,
         "last_epoch": log_rows[-1]["epoch"] if log_rows else 0,
+        "evaluation_count": len(log_rows),
+        "global_examples_seen": global_examples_seen,
+        "global_optimizer_steps": global_optimizer_steps,
     }
     write_json(output_dir / "training_summary.json", summary)
     print(json.dumps(summary, ensure_ascii=False, indent=2))
