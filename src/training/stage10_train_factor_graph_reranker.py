@@ -2,6 +2,7 @@ import argparse
 import json
 import random
 import sys
+from collections import defaultdict
 from pathlib import Path
 
 
@@ -206,6 +207,9 @@ def example_to_tensors(example, cache, maps, runtime, device):
         "factor_edge_weight": torch.tensor(factor_weights, dtype=torch.float32, device=device),
         "whole_labels": torch.tensor(example["whole_labels"], dtype=torch.float32, device=device),
         "role_labels": torch.tensor(example["role_labels"], dtype=torch.float32, device=device),
+        "coverage_eligible": bool(
+            float(example.get("candidate_oracle_recall", 0.0)) >= 1.0 - 1e-9
+        ),
     }
 
 
@@ -223,6 +227,63 @@ def forward_model(model, tensors):
         tensors["factor_edge_type"],
         tensors["factor_edge_weight"],
     )
+
+
+def topk_coverage_loss(
+    logits,
+    labels,
+    top_k,
+    margin,
+    temperature,
+    eligible=True,
+):
+    """Surrogate for keeping every positive node inside a fixed Top-K budget.
+
+    If P positives must fit in K positions, at most K-P negatives may outrank the
+    weakest positive. The (K-P+1)-th highest negative is therefore the first
+    boundary violation. A smooth minimum focuses the loss on the weakest positive.
+    """
+    import torch
+
+    if temperature <= 0:
+        raise ValueError("coverage_temperature must be positive")
+    zero = logits.sum() * 0.0
+    positive = logits[labels > 0.5]
+    negative = logits[labels <= 0.5]
+    positive_count = int(positive.numel())
+    negative_count = int(negative.numel())
+    boundary_rank = int(top_k) - positive_count + 1
+    active = bool(
+        eligible
+        and positive_count > 0
+        and positive_count <= int(top_k)
+        and boundary_rank > 0
+        and negative_count >= boundary_rank
+    )
+    if not active:
+        return zero, {
+            "coverage_active": 0.0,
+            "coverage_positive_count": float(positive_count),
+            "coverage_boundary_rank": float(max(boundary_rank, 0)),
+            "coverage_violation": 0.0,
+        }
+
+    # This lower-bound soft minimum becomes the exact minimum as temperature -> 0
+    # and sends gradients to every positive, with the weakest positives dominating.
+    weakest_positive = -temperature * torch.logsumexp(
+        -positive / temperature, dim=0
+    )
+    boundary_negative = negative.topk(boundary_rank).values[-1]
+    violation = margin + boundary_negative - weakest_positive
+    loss = temperature * torch.nn.functional.softplus(violation / temperature)
+    return loss, {
+        "coverage_active": 1.0,
+        "coverage_positive_count": float(positive_count),
+        "coverage_boundary_rank": float(boundary_rank),
+        "coverage_violation": float(violation.detach().cpu()),
+        "coverage_weakest_positive": float(weakest_positive.detach().cpu()),
+        "coverage_boundary_negative": float(boundary_negative.detach().cpu()),
+    }
 
 
 def reranker_loss(output, tensors, args, runtime):
@@ -245,11 +306,27 @@ def reranker_loss(output, tensors, args, runtime):
         ).mean()
     else:
         pair_loss = logits.new_zeros(())
-    total = node_loss + args.role_loss_weight * role_loss + args.pairwise_loss_weight * pair_loss
+    coverage_loss, coverage_detail = topk_coverage_loss(
+        logits,
+        labels,
+        top_k=args.output_top_k,
+        margin=float(getattr(args, "coverage_margin", 0.1)),
+        temperature=float(getattr(args, "coverage_temperature", 0.2)),
+        eligible=bool(tensors.get("coverage_eligible", True)),
+    )
+    coverage_weight = float(getattr(args, "coverage_loss_weight", 0.0))
+    total = (
+        node_loss
+        + args.role_loss_weight * role_loss
+        + args.pairwise_loss_weight * pair_loss
+        + coverage_weight * coverage_loss
+    )
     return total, {
         "node_loss": float(node_loss.detach().cpu()),
         "role_loss": float(role_loss.detach().cpu()),
         "pairwise_loss": float(pair_loss.detach().cpu()),
+        "coverage_loss": float(coverage_loss.detach().cpu()),
+        **coverage_detail,
     }
 
 
@@ -286,6 +363,7 @@ def evaluate(model, examples, cache, maps, args, runtime, device, split):
     torch = runtime["torch"]
     model.eval()
     losses = []
+    loss_components = defaultdict(float)
     selected_raw = {}
     selected_constrained = {}
     selected_baseline = {}
@@ -294,8 +372,10 @@ def evaluate(model, examples, cache, maps, args, runtime, device, split):
         for example in examples:
             tensors = example_to_tensors(example, cache, maps, runtime, device)
             output = forward_model(model, tensors)
-            loss, _ = reranker_loss(output, tensors, args, runtime)
+            loss, detail = reranker_loss(output, tensors, args, runtime)
             losses.append(float(loss.detach().cpu()))
+            for key, value in detail.items():
+                loss_components[key] += float(value)
             scores = output["logits"].detach().cpu().tolist()
             raw_local = sorted(range(len(scores)), key=lambda index: scores[index], reverse=True)[: args.output_top_k]
             constrained_local, selector_debug = constrained_topk(
@@ -336,6 +416,24 @@ def evaluate(model, examples, cache, maps, args, runtime, device, split):
                 }
             )
     metrics = {"split": split, "sample_count": len(examples), "loss": sum(losses) / len(losses) if losses else 0.0}
+    metrics.update(
+        {
+            f"loss_{key}": value / len(examples) if examples else 0.0
+            for key, value in sorted(loss_components.items())
+        }
+    )
+    active_count = loss_components.get("coverage_active", 0.0)
+    metrics["loss_coverage_active_count"] = active_count
+    metrics["loss_coverage_loss_per_active"] = (
+        loss_components.get("coverage_loss", 0.0) / active_count
+        if active_count
+        else 0.0
+    )
+    metrics["loss_coverage_violation_per_active"] = (
+        loss_components.get("coverage_violation", 0.0) / active_count
+        if active_count
+        else 0.0
+    )
     metrics.update(selection_metrics(examples, selected_baseline, args.output_top_k, "baseline"))
     metrics.update(selection_metrics(examples, selected_raw, args.output_top_k, "reranker_raw"))
     metrics.update(selection_metrics(examples, selected_constrained, args.output_top_k, "constrained"))
@@ -364,7 +462,14 @@ def train_epoch(
     shuffled = list(examples)
     random.Random(args.seed + epoch).shuffle(shuffled)
     total = 0.0
-    components = {"node_loss": 0.0, "role_loss": 0.0, "pairwise_loss": 0.0}
+    components = {
+        "node_loss": 0.0,
+        "role_loss": 0.0,
+        "pairwise_loss": 0.0,
+        "coverage_loss": 0.0,
+        "coverage_active": 0.0,
+        "coverage_violation": 0.0,
+    }
     accumulation_steps = int(getattr(args, "gradient_accumulation_steps", 1))
     eval_every_examples = int(getattr(args, "eval_every_examples", 0))
     if accumulation_steps < 1:
@@ -398,28 +503,46 @@ def train_epoch(
             and processed >= next_evaluation
             and processed < len(shuffled)
         ):
-            progress_callback(
-                {
-                    "example_count": processed,
-                    "optimizer_steps": optimizer_steps,
-                    "loss": total / processed,
-                    **{
-                        key: value / processed
-                        for key, value in components.items()
-                    },
-                }
+            partial = {
+                "example_count": processed,
+                "optimizer_steps": optimizer_steps,
+                "loss": total / processed,
+                **{
+                    key: value / processed
+                    for key, value in components.items()
+                },
+            }
+            active_count = components["coverage_active"]
+            partial["coverage_active_count"] = active_count
+            partial["coverage_loss_per_active"] = (
+                components["coverage_loss"] / active_count if active_count else 0.0
             )
+            partial["coverage_violation_per_active"] = (
+                components["coverage_violation"] / active_count
+                if active_count
+                else 0.0
+            )
+            progress_callback(partial)
             model.train()
             while next_evaluation <= processed:
                 next_evaluation += eval_every_examples
     count = max(len(shuffled), 1)
-    return {
+    result = {
         "loss": total / count,
         **{key: value / count for key, value in components.items()},
         "example_count": len(shuffled),
         "optimizer_steps": optimizer_steps,
         "effective_batch_size": accumulation_steps,
     }
+    active_count = components["coverage_active"]
+    result["coverage_active_count"] = active_count
+    result["coverage_loss_per_active"] = (
+        components["coverage_loss"] / active_count if active_count else 0.0
+    )
+    result["coverage_violation_per_active"] = (
+        components["coverage_violation"] / active_count if active_count else 0.0
+    )
+    return result
 
 
 def main():
@@ -442,6 +565,24 @@ def main():
     parser.add_argument("--role-loss-weight", type=float, default=0.3)
     parser.add_argument("--pairwise-margin", type=float, default=0.5)
     parser.add_argument("--hard-negative-k", type=int, default=8)
+    parser.add_argument(
+        "--coverage-loss-weight",
+        type=float,
+        default=0.0,
+        help="Weight of the query-level budget-aware Top-K coverage surrogate.",
+    )
+    parser.add_argument(
+        "--coverage-margin",
+        type=float,
+        default=0.1,
+        help="Required score gap between the weakest positive and Top-K negative boundary.",
+    )
+    parser.add_argument(
+        "--coverage-temperature",
+        type=float,
+        default=0.2,
+        help="Temperature for smooth weakest-positive and softplus boundary loss.",
+    )
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
     parser.add_argument(
         "--gradient-accumulation-steps",
@@ -471,6 +612,10 @@ def main():
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--no-save-model", action="store_true")
     args = parser.parse_args()
+    if args.coverage_loss_weight < 0:
+        raise ValueError("coverage_loss_weight must be non-negative")
+    if args.coverage_temperature <= 0:
+        raise ValueError("coverage_temperature must be positive")
 
     runtime = import_runtime()
     torch = runtime["torch"]
@@ -535,6 +680,14 @@ def main():
                 "eval_every_examples": args.eval_every_examples,
                 "checkpoint_selection": args.selection_metric,
                 "early_stopping_unit": "epoch",
+                "coverage_loss": {
+                    "weight": args.coverage_loss_weight,
+                    "top_k": args.output_top_k,
+                    "margin": args.coverage_margin,
+                    "temperature": args.coverage_temperature,
+                    "eligibility": "candidate_oracle_recall == 1",
+                    "negative_boundary_rank": "K - positive_count + 1",
+                },
             },
             "innovation": (
                 "A query-conditioned candidate schema subgraph is globally reranked before "

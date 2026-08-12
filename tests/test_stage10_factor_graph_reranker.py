@@ -178,6 +178,49 @@ class Stage10FactorGraphDataTest(unittest.TestCase):
 
 
 class Stage10ModelSmokeTest(unittest.TestCase):
+    def test_budget_aware_coverage_loss_targets_weakest_positive_and_boundary(self):
+        try:
+            import torch
+        except ImportError:
+            self.skipTest("PyTorch is unavailable in the current interpreter")
+        logits = torch.tensor([2.0, 0.0, 3.0, 1.0, -1.0], requires_grad=True)
+        labels = torch.tensor([1.0, 1.0, 0.0, 0.0, 0.0])
+        loss, detail = TRAINING.topk_coverage_loss(
+            logits,
+            labels,
+            top_k=3,
+            margin=0.1,
+            temperature=0.2,
+            eligible=True,
+        )
+        loss.backward()
+
+        # P=2 and K=3 means one negative may outrank the weakest positive; the
+        # second-highest negative (score 1.0) is the first violating boundary.
+        self.assertEqual(detail["coverage_boundary_rank"], 2.0)
+        self.assertEqual(detail["coverage_active"], 1.0)
+        self.assertAlmostEqual(detail["coverage_boundary_negative"], 1.0, places=5)
+        self.assertLess(float(logits.grad[1]), 0.0)
+        self.assertGreater(float(logits.grad[3]), 0.0)
+
+    def test_coverage_loss_is_inactive_for_incomplete_or_trivial_candidates(self):
+        try:
+            import torch
+        except ImportError:
+            self.skipTest("PyTorch is unavailable in the current interpreter")
+        logits = torch.tensor([1.0, 0.0, -1.0], requires_grad=True)
+        labels = torch.tensor([1.0, 0.0, 0.0])
+        incomplete, incomplete_detail = TRAINING.topk_coverage_loss(
+            logits, labels, top_k=2, margin=0.1, temperature=0.2, eligible=False
+        )
+        trivial, trivial_detail = TRAINING.topk_coverage_loss(
+            logits, labels, top_k=3, margin=0.1, temperature=0.2, eligible=True
+        )
+        self.assertEqual(float(incomplete.detach()), 0.0)
+        self.assertEqual(float(trivial.detach()), 0.0)
+        self.assertEqual(incomplete_detail["coverage_active"], 0.0)
+        self.assertEqual(trivial_detail["coverage_active"], 0.0)
+
     def test_factor_graph_forward_and_backward(self):
         try:
             import torch
@@ -269,6 +312,9 @@ class Stage10ModelSmokeTest(unittest.TestCase):
             pairwise_loss_weight=0.5,
             pairwise_margin=0.5,
             hard_negative_k=2,
+            coverage_loss_weight=0.3,
+            coverage_margin=0.1,
+            coverage_temperature=0.2,
             max_grad_norm=1.0,
             output_top_k=2,
             max_tables=1,
