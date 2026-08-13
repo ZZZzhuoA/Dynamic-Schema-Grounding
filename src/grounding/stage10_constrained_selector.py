@@ -9,6 +9,7 @@ def constrained_topk(
     min_tables=None,
     connectivity_weight=0.10,
     baseline_retention_weight=0.05,
+    required_local_ids=None,
 ):
     """Select a typed, owner-closed schema subset from reranker utilities.
 
@@ -55,9 +56,55 @@ def constrained_topk(
         )
         return float(scores[local_id]) + retention
 
-    selected = set(
-        sorted(table_locals, key=unary, reverse=True)[:min_tables]
+    required = {int(local_id) for local_id in (required_local_ids or [])}
+    if any(local_id < 0 or local_id >= len(nodes) for local_id in required):
+        raise ValueError("required_local_ids contains an out-of-range local id")
+
+    # A forced feasible completion is used only during structured training. Gold
+    # columns bring their owner tables with them, exactly as ordinary decoding does.
+    forced_owner_additions = 0
+    for local_id in list(required):
+        node = nodes[local_id]
+        if node.get("type") != "column":
+            continue
+        owner_schema_id = node.get("owner_table_id")
+        owner_local = (
+            local_by_schema_id.get(int(owner_schema_id))
+            if owner_schema_id is not None
+            else None
+        )
+        if owner_local is not None and owner_local not in required:
+            required.add(owner_local)
+            forced_owner_additions += 1
+
+    required_table_count = sum(
+        1 for local_id in required if nodes[local_id].get("type") == "table"
     )
+    if len(required) > top_k or required_table_count > max_tables:
+        return [], {
+            "selected_table_count": 0,
+            "selected_column_count": 0,
+            "owner_closure_additions": 0,
+            "forced_owner_additions": forced_owner_additions,
+            "required_count": len(required),
+            "required_feasible": False,
+            "minimum_table_count": min_tables,
+            "max_tables": max_tables,
+            "selected_count": 0,
+        }
+
+    selected = set(required)
+    if sum(1 for index in selected if nodes[index].get("type") == "table") < min_tables:
+        for local_id in sorted(table_locals, key=unary, reverse=True):
+            if local_id in selected:
+                continue
+            if len(selected) >= top_k:
+                break
+            selected.add(local_id)
+            if sum(
+                1 for index in selected if nodes[index].get("type") == "table"
+            ) >= min_tables:
+                break
     owner_closure_additions = 0
 
     def table_count_after(package):
@@ -125,6 +172,9 @@ def constrained_topk(
             1 for index in ranked_selected if nodes[index].get("type") == "column"
         ),
         "owner_closure_additions": owner_closure_additions,
+        "forced_owner_additions": forced_owner_additions,
+        "required_count": len(required),
+        "required_feasible": required.issubset(set(ranked_selected)),
         "minimum_table_count": min_tables,
         "max_tables": max_tables,
         "selected_count": len(ranked_selected),

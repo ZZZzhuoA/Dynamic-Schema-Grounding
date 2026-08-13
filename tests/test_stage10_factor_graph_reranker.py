@@ -178,6 +178,87 @@ class Stage10FactorGraphDataTest(unittest.TestCase):
 
 
 class Stage10ModelSmokeTest(unittest.TestCase):
+    @staticmethod
+    def structured_example():
+        return {
+            "candidate_nodes": [
+                {"local_id": 0, "schema_item_id": 0, "type": "table", "owner_table_id": 0, "owner_local_id": 0},
+                {"local_id": 1, "schema_item_id": 1, "type": "column", "owner_table_id": 0, "owner_local_id": 0},
+                {"local_id": 2, "schema_item_id": 2, "type": "table", "owner_table_id": 2, "owner_local_id": 2},
+                {"local_id": 3, "schema_item_id": 3, "type": "column", "owner_table_id": 2, "owner_local_id": 2},
+            ],
+            "schema_edges": [
+                {"src": 0, "dst": 1, "type": "table_to_column"},
+                {"src": 2, "dst": 3, "type": "table_to_column"},
+            ],
+            "baseline_selected_ids": [2, 3],
+            "candidate_oracle_recall": 1.0,
+        }
+
+    def test_required_selector_builds_owner_closed_gold_feasible_set(self):
+        example = self.structured_example()
+        selected, detail = SELECTOR.constrained_topk(
+            example,
+            scores=[0.0, 0.0, 2.0, 2.0],
+            top_k=2,
+            max_tables=1,
+            min_tables=1,
+            required_local_ids={1},
+        )
+        self.assertEqual(set(selected), {0, 1})
+        self.assertTrue(detail["required_feasible"])
+        self.assertEqual(detail["forced_owner_additions"], 1)
+
+    def test_structured_coverage_loss_swaps_intruder_package_for_gold_package(self):
+        try:
+            import torch
+        except ImportError:
+            self.skipTest("PyTorch is unavailable in the current interpreter")
+        logits = torch.tensor([0.0, 0.0, 2.0, 2.0], requires_grad=True)
+        labels = torch.tensor([1.0, 1.0, 0.0, 0.0])
+        args = SimpleNamespace(
+            output_top_k=2,
+            max_tables=1,
+            min_tables=1,
+            connectivity_weight=0.0,
+            baseline_retention_weight=0.0,
+            structured_coverage_margin=0.1,
+        )
+        loss, detail = TRAINING.constrained_structured_coverage_loss(
+            logits, labels, self.structured_example(), args
+        )
+        loss.backward()
+        self.assertEqual(detail["structured_active"], 1.0)
+        self.assertEqual(detail["structured_missing_gold"], 2.0)
+        self.assertGreater(float(loss.detach()), 0.0)
+        self.assertLess(float(logits.grad[0]), 0.0)
+        self.assertLess(float(logits.grad[1]), 0.0)
+        self.assertGreater(float(logits.grad[2]), 0.0)
+        self.assertGreater(float(logits.grad[3]), 0.0)
+
+    def test_structured_coverage_loss_skips_infeasible_gold_table_budget(self):
+        try:
+            import torch
+        except ImportError:
+            self.skipTest("PyTorch is unavailable in the current interpreter")
+        example = self.structured_example()
+        logits = torch.tensor([0.0, 0.0, 2.0, 2.0], requires_grad=True)
+        labels = torch.tensor([1.0, 0.0, 1.0, 0.0])
+        args = SimpleNamespace(
+            output_top_k=2,
+            max_tables=1,
+            min_tables=1,
+            connectivity_weight=0.0,
+            baseline_retention_weight=0.0,
+            structured_coverage_margin=0.1,
+        )
+        loss, detail = TRAINING.constrained_structured_coverage_loss(
+            logits, labels, example, args
+        )
+        self.assertEqual(float(loss.detach()), 0.0)
+        self.assertEqual(detail["structured_active"], 0.0)
+        self.assertEqual(detail["structured_feasible"], 0.0)
+
     def test_budget_aware_coverage_loss_targets_weakest_positive_and_boundary(self):
         try:
             import torch
@@ -315,6 +396,8 @@ class Stage10ModelSmokeTest(unittest.TestCase):
             coverage_loss_weight=0.3,
             coverage_margin=0.1,
             coverage_temperature=0.2,
+            structured_coverage_loss_weight=0.2,
+            structured_coverage_margin=0.1,
             max_grad_norm=1.0,
             output_top_k=2,
             max_tables=1,

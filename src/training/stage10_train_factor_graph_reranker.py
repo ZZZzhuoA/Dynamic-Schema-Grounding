@@ -210,6 +210,7 @@ def example_to_tensors(example, cache, maps, runtime, device):
         "coverage_eligible": bool(
             float(example.get("candidate_oracle_recall", 0.0)) >= 1.0 - 1e-9
         ),
+        "selector_example": example,
     }
 
 
@@ -286,6 +287,77 @@ def topk_coverage_loss(
     }
 
 
+def constrained_structured_coverage_loss(logits, labels, example, args):
+    """Structured hinge between decoded and gold-complete feasible schema sets.
+
+    Discrete set construction is intentionally detached. Gradients flow through the
+    scores of the two selected sets, as in a structured perceptron/hinge objective.
+    """
+    zero = logits.sum() * 0.0
+    eligible = bool(float(example.get("candidate_oracle_recall", 0.0)) >= 1.0 - 1e-9)
+    positive_locals = {
+        index for index, value in enumerate(labels.detach().cpu().tolist()) if value > 0.5
+    }
+    base_detail = {
+        "structured_active": 0.0,
+        "structured_feasible": 0.0,
+        "structured_missing_gold": 0.0,
+        "structured_swap_count": 0.0,
+        "structured_violation": 0.0,
+    }
+    if not eligible or not positive_locals:
+        return zero, base_detail
+
+    scores = logits.detach().cpu().tolist()
+    selector_kwargs = {
+        "top_k": args.output_top_k,
+        "max_tables": args.max_tables,
+        "min_tables": None if args.min_tables < 0 else args.min_tables,
+        "connectivity_weight": args.connectivity_weight,
+        "baseline_retention_weight": args.baseline_retention_weight,
+    }
+    predicted, _ = constrained_topk(example, scores, **selector_kwargs)
+    predicted_set = set(predicted)
+    missing_gold = positive_locals - predicted_set
+    if not missing_gold:
+        detail = dict(base_detail)
+        detail["structured_feasible"] = 1.0
+        return zero, detail
+
+    gold_feasible, gold_debug = constrained_topk(
+        example,
+        scores,
+        required_local_ids=positive_locals,
+        **selector_kwargs,
+    )
+    gold_set = set(gold_feasible)
+    if not gold_debug.get("required_feasible") or not positive_locals.issubset(gold_set):
+        return zero, base_detail
+
+    predicted_only = sorted(predicted_set - gold_set)
+    gold_only = sorted(gold_set - predicted_set)
+    if not predicted_only or not gold_only:
+        detail = dict(base_detail)
+        detail["structured_feasible"] = 1.0
+        return zero, detail
+
+    predicted_score = logits[predicted_only].sum()
+    gold_score = logits[gold_only].sum()
+    missing_count = len(missing_gold)
+    margin = float(getattr(args, "structured_coverage_margin", 0.1)) * missing_count
+    violation = margin + predicted_score - gold_score
+    # Normalize by the number of missing gold nodes so query complexity does not
+    # silently change the effective structured-loss weight.
+    loss = violation.clamp_min(0.0) / missing_count
+    return loss, {
+        "structured_active": 1.0,
+        "structured_feasible": 1.0,
+        "structured_missing_gold": float(missing_count),
+        "structured_swap_count": float(max(len(predicted_only), len(gold_only))),
+        "structured_violation": float(violation.detach().cpu()),
+    }
+
+
 def reranker_loss(output, tensors, args, runtime):
     torch = runtime["torch"]
     labels = tensors["whole_labels"]
@@ -315,18 +387,40 @@ def reranker_loss(output, tensors, args, runtime):
         eligible=bool(tensors.get("coverage_eligible", True)),
     )
     coverage_weight = float(getattr(args, "coverage_loss_weight", 0.0))
+    structured_weight = float(
+        getattr(args, "structured_coverage_loss_weight", 0.0)
+    )
+    if structured_weight > 0.0:
+        structured_loss, structured_detail = constrained_structured_coverage_loss(
+            logits,
+            labels,
+            tensors["selector_example"],
+            args,
+        )
+    else:
+        structured_loss = logits.sum() * 0.0
+        structured_detail = {
+            "structured_active": 0.0,
+            "structured_feasible": 0.0,
+            "structured_missing_gold": 0.0,
+            "structured_swap_count": 0.0,
+            "structured_violation": 0.0,
+        }
     total = (
         node_loss
         + args.role_loss_weight * role_loss
         + args.pairwise_loss_weight * pair_loss
         + coverage_weight * coverage_loss
+        + structured_weight * structured_loss
     )
     return total, {
         "node_loss": float(node_loss.detach().cpu()),
         "role_loss": float(role_loss.detach().cpu()),
         "pairwise_loss": float(pair_loss.detach().cpu()),
         "coverage_loss": float(coverage_loss.detach().cpu()),
+        "structured_coverage_loss": float(structured_loss.detach().cpu()),
         **coverage_detail,
+        **structured_detail,
     }
 
 
@@ -434,6 +528,18 @@ def evaluate(model, examples, cache, maps, args, runtime, device, split):
         if active_count
         else 0.0
     )
+    structured_active = loss_components.get("structured_active", 0.0)
+    metrics["loss_structured_active_count"] = structured_active
+    metrics["loss_structured_loss_per_active"] = (
+        loss_components.get("structured_coverage_loss", 0.0) / structured_active
+        if structured_active
+        else 0.0
+    )
+    metrics["loss_structured_missing_gold_per_active"] = (
+        loss_components.get("structured_missing_gold", 0.0) / structured_active
+        if structured_active
+        else 0.0
+    )
     metrics.update(selection_metrics(examples, selected_baseline, args.output_top_k, "baseline"))
     metrics.update(selection_metrics(examples, selected_raw, args.output_top_k, "reranker_raw"))
     metrics.update(selection_metrics(examples, selected_constrained, args.output_top_k, "constrained"))
@@ -469,6 +575,12 @@ def train_epoch(
         "coverage_loss": 0.0,
         "coverage_active": 0.0,
         "coverage_violation": 0.0,
+        "structured_coverage_loss": 0.0,
+        "structured_active": 0.0,
+        "structured_feasible": 0.0,
+        "structured_missing_gold": 0.0,
+        "structured_swap_count": 0.0,
+        "structured_violation": 0.0,
     }
     accumulation_steps = int(getattr(args, "gradient_accumulation_steps", 1))
     eval_every_examples = int(getattr(args, "eval_every_examples", 0))
@@ -522,6 +634,18 @@ def train_epoch(
                 if active_count
                 else 0.0
             )
+            structured_active = components["structured_active"]
+            partial["structured_active_count"] = structured_active
+            partial["structured_loss_per_active"] = (
+                components["structured_coverage_loss"] / structured_active
+                if structured_active
+                else 0.0
+            )
+            partial["structured_missing_gold_per_active"] = (
+                components["structured_missing_gold"] / structured_active
+                if structured_active
+                else 0.0
+            )
             progress_callback(partial)
             model.train()
             while next_evaluation <= processed:
@@ -541,6 +665,18 @@ def train_epoch(
     )
     result["coverage_violation_per_active"] = (
         components["coverage_violation"] / active_count if active_count else 0.0
+    )
+    structured_active = components["structured_active"]
+    result["structured_active_count"] = structured_active
+    result["structured_loss_per_active"] = (
+        components["structured_coverage_loss"] / structured_active
+        if structured_active
+        else 0.0
+    )
+    result["structured_missing_gold_per_active"] = (
+        components["structured_missing_gold"] / structured_active
+        if structured_active
+        else 0.0
     )
     return result
 
@@ -583,6 +719,20 @@ def main():
         default=0.2,
         help="Temperature for smooth weakest-positive and softplus boundary loss.",
     )
+    parser.add_argument(
+        "--structured-coverage-loss-weight",
+        type=float,
+        default=0.0,
+        help=(
+            "Weight of the constrained selection-aware structured coverage hinge."
+        ),
+    )
+    parser.add_argument(
+        "--structured-coverage-margin",
+        type=float,
+        default=0.1,
+        help="Per-missing-gold margin for the constrained structured hinge.",
+    )
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
     parser.add_argument(
         "--gradient-accumulation-steps",
@@ -616,6 +766,10 @@ def main():
         raise ValueError("coverage_loss_weight must be non-negative")
     if args.coverage_temperature <= 0:
         raise ValueError("coverage_temperature must be positive")
+    if args.structured_coverage_loss_weight < 0:
+        raise ValueError("structured_coverage_loss_weight must be non-negative")
+    if args.structured_coverage_margin < 0:
+        raise ValueError("structured_coverage_margin must be non-negative")
 
     runtime = import_runtime()
     torch = runtime["torch"]
@@ -688,12 +842,22 @@ def main():
                     "eligibility": "candidate_oracle_recall == 1",
                     "negative_boundary_rank": "K - positive_count + 1",
                 },
+                "structured_coverage_loss": {
+                    "weight": args.structured_coverage_loss_weight,
+                    "margin_per_missing_gold": args.structured_coverage_margin,
+                    "eligibility": "candidate_oracle_recall == 1",
+                    "prediction": "constrained_topk(model_scores)",
+                    "target": "constrained_topk(model_scores, required=gold)",
+                    "normalization": "missing_gold_count",
+                },
             },
             "innovation": (
                 "A query-conditioned candidate schema subgraph is globally reranked before "
                 "typed owner-closed subset decoding. Stage 10-B-fix1 separates graph-structure "
                 "gain from optimization artifacts through OOF inputs, effective multi-graph "
-                "batches, and within-epoch checkpoint observation."
+                "batches, and within-epoch checkpoint observation. Stage 10-D aligns "
+                "training with the typed owner-closed decoder through a structured "
+                "gold-feasible versus predicted-set margin."
             ),
         }
     )
