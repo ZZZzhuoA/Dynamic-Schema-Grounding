@@ -38,6 +38,77 @@ def import_runtime():
     return {"np": np, "torch": torch}
 
 
+def validate_and_filter_trajectories(examples, split, expected_numeric_dim=None):
+    """Filter only empty, target-free graphs and reject malformed supervision."""
+    usable = []
+    skipped = []
+    numeric_dim = expected_numeric_dim
+    for example in examples:
+        candidates = example.get("candidate_nodes", [])
+        steps = example.get("trajectory_steps", [])
+        target_ids = {
+            int(item_id)
+            for step in steps
+            for item_id in step.get("target_schema_ids", [])
+        }
+        diagnostic = {
+            "split": split,
+            "record_index": example.get("record_index"),
+            "db_id": example.get("db_id"),
+            "question_id": example.get("question_id"),
+        }
+        if not candidates:
+            if target_ids:
+                raise ValueError(
+                    "Empty candidate graph has trajectory supervision: "
+                    + json.dumps({**diagnostic, "target_schema_ids": sorted(target_ids)}, ensure_ascii=False)
+                )
+            skipped.append({**diagnostic, "reason": "empty_candidate_graph_without_targets"})
+            continue
+        current_dim = len(candidates[0].get("numeric_features", []))
+        if current_dim <= 0:
+            raise ValueError(
+                "Candidate graph has empty numeric features: "
+                + json.dumps(diagnostic, ensure_ascii=False)
+            )
+        if any(len(node.get("numeric_features", [])) != current_dim for node in candidates):
+            raise ValueError(
+                "Candidate graph has inconsistent numeric feature dimensions: "
+                + json.dumps(diagnostic, ensure_ascii=False)
+            )
+        if numeric_dim is None:
+            numeric_dim = current_dim
+        elif current_dim != numeric_dim:
+            raise ValueError(
+                f"Numeric feature dimension mismatch in {split}: expected={numeric_dim} "
+                f"actual={current_dim} record_index={example.get('record_index')}"
+            )
+        node_count = len(candidates)
+        for step in steps:
+            for field in ("target_local_ids", "observed_local_ids"):
+                invalid = [
+                    int(index)
+                    for index in step.get(field, [])
+                    if int(index) < 0 or int(index) >= node_count
+                ]
+                if invalid:
+                    raise ValueError(
+                        f"Out-of-range {field} in {split} record_index="
+                        f"{example.get('record_index')}: {invalid}"
+                    )
+        usable.append(example)
+    if not usable:
+        raise ValueError(f"No usable Stage 11 trajectories remain for split={split}")
+    return usable, {
+        "split": split,
+        "input_count": len(examples),
+        "usable_count": len(usable),
+        "skipped_count": len(skipped),
+        "skipped_examples": skipped,
+        "numeric_dim": numeric_dim,
+    }
+
+
 def trajectory_tensors(example, cache, relation_to_id, model, runtime, device):
     torch = runtime["torch"]
     positions = [int(node["schema_position"]) for node in example["candidate_nodes"]]
@@ -218,13 +289,17 @@ def main():
     runtime["np"].random.seed(args.seed)
     torch.manual_seed(args.seed)
     device = torch.device(args.device)
-    train = read_jsonl(Path(args.train_file), args.train_limit)
-    dev = read_jsonl(Path(args.dev_file), args.dev_limit)
+    raw_train = read_jsonl(Path(args.train_file), args.train_limit)
+    raw_dev = read_jsonl(Path(args.dev_file), args.dev_limit)
+    train, train_validation = validate_and_filter_trajectories(raw_train, "train")
+    dev, dev_validation = validate_and_filter_trajectories(
+        raw_dev, "dev", expected_numeric_dim=train_validation["numeric_dim"]
+    )
     train_cache = load_cache(args.embedding_cache_dir, "train", runtime)
     dev_cache = load_cache(args.embedding_cache_dir, "dev", runtime)
     relations = collect_schema_relations(train + dev)
     relation_to_id = {name: index for index, name in enumerate(relations)}
-    numeric_dim = len(train[0]["candidate_nodes"][0]["numeric_features"])
+    numeric_dim = int(train_validation["numeric_dim"])
     model = DynamicSchemaGroundingController(
         dense_dim=train_cache["dense_dim"], numeric_dim=numeric_dim,
         hidden_dim=args.hidden_dim, relation_count=max(len(relations), 1),
@@ -234,6 +309,10 @@ def main():
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    write_json(
+        output_dir / "data_validation.json",
+        {"train": train_validation, "dev": dev_validation},
+    )
     best_value, best_state, best_metrics = None, None, None
     log_rows = []
     for epoch in range(1, args.epochs + 1):
@@ -282,6 +361,7 @@ def main():
         "config": vars(args),
         "relations": relations,
         "operations": OPERATIONS,
+        "data_validation": {"train": train_validation, "dev": dev_validation},
     }
     write_json(output_dir / "training_summary.json", summary)
     print(json.dumps(summary, ensure_ascii=False, indent=2))

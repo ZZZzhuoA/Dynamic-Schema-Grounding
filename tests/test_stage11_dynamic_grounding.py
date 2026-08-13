@@ -17,6 +17,7 @@ DATA = load_module(
     "stage11_build_dynamic_grounding_trajectories",
     "src/data/stage11_build_dynamic_grounding_trajectories.py",
 )
+TRAINING = None
 
 
 class Stage11TrajectoryTest(unittest.TestCase):
@@ -63,6 +64,57 @@ class Stage11TrajectoryTest(unittest.TestCase):
 
 
 class Stage11ModelTest(unittest.TestCase):
+    def test_trajectory_validation_skips_only_empty_target_free_graphs(self):
+        try:
+            from src.training.stage11_train_dynamic_grounding_controller import (
+                validate_and_filter_trajectories,
+            )
+        except ImportError:
+            self.skipTest("PyTorch is unavailable")
+        empty = {
+            "record_index": 0,
+            "candidate_nodes": [],
+            "trajectory_steps": [{"target_schema_ids": []}],
+        }
+        valid = {
+            "record_index": 1,
+            "candidate_nodes": [
+                {"numeric_features": [1.0, 0.0]},
+            ],
+            "trajectory_steps": [
+                {
+                    "target_schema_ids": [3],
+                    "target_local_ids": [0],
+                    "observed_local_ids": [],
+                }
+            ],
+        }
+        usable, diagnostics = validate_and_filter_trajectories(
+            [empty, valid], "train"
+        )
+        self.assertEqual([row["record_index"] for row in usable], [1])
+        self.assertEqual(diagnostics["skipped_count"], 1)
+        self.assertEqual(diagnostics["numeric_dim"], 2)
+
+    def test_trajectory_validation_rejects_empty_graph_with_targets(self):
+        try:
+            from src.training.stage11_train_dynamic_grounding_controller import (
+                validate_and_filter_trajectories,
+            )
+        except ImportError:
+            self.skipTest("PyTorch is unavailable")
+        with self.assertRaisesRegex(ValueError, "trajectory supervision"):
+            validate_and_filter_trajectories(
+                [
+                    {
+                        "record_index": 7,
+                        "candidate_nodes": [],
+                        "trajectory_steps": [{"target_schema_ids": [4]}],
+                    }
+                ],
+                "train",
+            )
+
     def test_recurrent_controller_changes_belief_and_backpropagates(self):
         try:
             import torch
