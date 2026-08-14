@@ -6,6 +6,27 @@ import re
 from src.decoding.stage7_sql_state import detect_operation_state
 
 
+TOKEN_ROLE_BASE = 0
+TOKEN_ROLE_SCHEMA = 1
+TOKEN_ROLE_OPERATOR = 2
+TOKEN_ROLE_VALUE = 3
+TOKEN_ROLE_NAMES = {
+    TOKEN_ROLE_BASE: "base",
+    TOKEN_ROLE_SCHEMA: "schema",
+    TOKEN_ROLE_OPERATOR: "operator",
+    TOKEN_ROLE_VALUE: "value",
+}
+
+SEMANTIC_OPERATOR_PATTERN = re.compile(
+    r"(?i)(?:\b(?:distinct|count|sum|avg|min|max|cast|coalesce|case|when|then|else|end|"
+    r"group\s+by|order\s+by|having|limit|offset|union|intersect|except|join|on|like|in|"
+    r"between|is\s+not\s+null|is\s+null|asc|desc)\b|<>|!=|<=|>=|=|<|>|\+|-|\*|/)"
+)
+VALUE_PATTERN = re.compile(
+    r"(?:'(?:''|[^'])*'|\"(?:\"\"|[^\"])*\"|(?<![A-Za-z_])[-+]?\d+(?:\.\d+)?(?![A-Za-z_]))"
+)
+
+
 def full_schema_text(graph_example):
     inputs = graph_example.get("inference_inputs", graph_example)
     nodes = inputs.get("schema_nodes", [])
@@ -136,3 +157,79 @@ def observed_candidate_mask(partial_sql, candidate_nodes):
         matched = any(name and name in normalized for name in names)
         mask.append(float(matched))
     return mask
+
+
+def schema_identifier_names(graph_example):
+    inputs = graph_example.get("inference_inputs", graph_example)
+    names = set()
+    for node in inputs.get("schema_nodes", []):
+        node_type = node.get("type")
+        if node_type == "table":
+            value = str(node.get("name") or "").strip()
+            if value:
+                names.add(value)
+        elif node_type == "column":
+            table = str(node.get("table") or "").strip()
+            column = str(
+                node.get("column") or str(node.get("name") or "").split(".", 1)[-1]
+            ).strip()
+            if column:
+                names.add(column)
+            if table and column:
+                names.add(f"{table}.{column}")
+    return sorted(names, key=len, reverse=True)
+
+
+def _identifier_pattern(identifier):
+    escaped = re.escape(identifier)
+    # Bare identifiers need token boundaries; quoted/bracketed forms are handled
+    # explicitly so names containing spaces or punctuation remain matchable.
+    return re.compile(
+        rf"(?i)(?:`{escaped}`|\[{escaped}\]|\"{escaped}\"|(?<![A-Za-z0-9_]){escaped}(?![A-Za-z0-9_]))"
+    )
+
+
+def sql_semantic_spans(sql, graph_example):
+    """Return non-exclusive character spans with schema taking highest priority."""
+    text = str(sql or "")
+    spans = []
+    for match in VALUE_PATTERN.finditer(text):
+        spans.append((match.start(), match.end(), TOKEN_ROLE_VALUE))
+    for match in SEMANTIC_OPERATOR_PATTERN.finditer(text):
+        spans.append((match.start(), match.end(), TOKEN_ROLE_OPERATOR))
+    for identifier in schema_identifier_names(graph_example):
+        for match in _identifier_pattern(identifier).finditer(text):
+            spans.append((match.start(), match.end(), TOKEN_ROLE_SCHEMA))
+    return spans
+
+
+def sql_token_roles(tokenizer, sql, graph_example, append_eos=False):
+    """Align SQL semantic roles to tokenizer IDs using character offsets."""
+    text = str(sql or "").strip()
+    try:
+        encoded = tokenizer(
+            text, add_special_tokens=False, return_offsets_mapping=True
+        )
+    except (TypeError, NotImplementedError):
+        encoded = tokenizer(text, add_special_tokens=False)
+    token_ids = list(encoded["input_ids"])
+    offsets = encoded.get("offset_mapping")
+    roles = [TOKEN_ROLE_BASE] * len(token_ids)
+    if offsets is not None:
+        spans = sql_semantic_spans(text, graph_example)
+        priority = {
+            TOKEN_ROLE_BASE: 0,
+            TOKEN_ROLE_OPERATOR: 1,
+            TOKEN_ROLE_VALUE: 2,
+            TOKEN_ROLE_SCHEMA: 3,
+        }
+        for token_index, (start, end) in enumerate(offsets):
+            if end <= start:
+                continue
+            for span_start, span_end, role in spans:
+                if start < span_end and end > span_start and priority[role] > priority[roles[token_index]]:
+                    roles[token_index] = role
+    if append_eos and tokenizer.eos_token_id is not None:
+        token_ids.append(tokenizer.eos_token_id)
+        roles.append(TOKEN_ROLE_BASE)
+    return token_ids, roles

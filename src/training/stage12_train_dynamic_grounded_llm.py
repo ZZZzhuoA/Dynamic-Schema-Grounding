@@ -11,8 +11,11 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from src.data.stage12_llm_grounding_data import (  # noqa: E402
+    TOKEN_ROLE_BASE,
+    TOKEN_ROLE_NAMES,
     build_chat_prompt,
     build_full_schema_prompt,
+    sql_token_roles,
     teacher_forcing_token_steps,
 )
 from src.modeling.dynamic_grounded_llm import DynamicGroundedCausalLM  # noqa: E402
@@ -33,12 +36,12 @@ def graph_by_record_index(path, limit=None):
     return result
 
 
-def encode_teacher_forcing(tokenizer, prompt, sql, steps, max_length, device, torch):
+def encode_teacher_forcing(tokenizer, prompt, sql, steps, graph, max_length, device, torch):
     chat = build_chat_prompt(tokenizer, prompt)
     prompt_ids = tokenizer(chat, add_special_tokens=False)["input_ids"]
-    sql_ids = tokenizer(str(sql).strip(), add_special_tokens=False)["input_ids"]
-    if tokenizer.eos_token_id is not None:
-        sql_ids = sql_ids + [tokenizer.eos_token_id]
+    sql_ids, sql_roles = sql_token_roles(
+        tokenizer, sql, graph, append_eos=True
+    )
     if len(prompt_ids) + len(sql_ids) > max_length:
         return None
     input_ids = torch.tensor([prompt_ids + sql_ids], dtype=torch.long, device=device)
@@ -48,7 +51,70 @@ def encode_teacher_forcing(tokenizer, prompt, sql, steps, max_length, device, to
         teacher_forcing_token_steps(tokenizer, prompt_ids, sql_ids, steps),
         dtype=torch.long,
     )
-    return input_ids, labels, token_steps
+    token_roles = torch.tensor(
+        [[TOKEN_ROLE_BASE] * len(prompt_ids) + sql_roles],
+        dtype=torch.long,
+    )
+    return input_ids, labels, token_steps, token_roles
+
+
+def causal_token_nll(logits, labels, torch):
+    shift_logits = logits[:, :-1, :].contiguous()
+    shift_labels = labels[:, 1:].to(shift_logits.device).contiguous()
+    valid = shift_labels.ne(-100)
+    safe_labels = shift_labels.masked_fill(~valid, 0)
+    nll = torch.nn.functional.cross_entropy(
+        shift_logits.view(-1, shift_logits.shape[-1]),
+        safe_labels.view(-1),
+        reduction="none",
+    ).view_as(shift_labels)
+    return nll, valid
+
+
+def semantic_utility_objective(
+    normal_nll, zero_nll, valid, token_roles, role_weights,
+    counterfactual_weight, counterfactual_margin, preservation_weight, torch,
+):
+    roles = token_roles[:, 1:].to(normal_nll.device)
+    weights = torch.ones_like(normal_nll)
+    for role_id, weight in role_weights.items():
+        weights = torch.where(roles.eq(int(role_id)), float(weight), weights)
+    valid_float = valid.to(normal_nll.dtype)
+    weighted_denominator = (weights * valid_float).sum().clamp_min(1.0)
+    weighted_ce = (normal_nll * weights * valid_float).sum() / weighted_denominator
+    standard_ce = (normal_nll * valid_float).sum() / valid_float.sum().clamp_min(1.0)
+
+    key_mask = valid & roles.ne(TOKEN_ROLE_BASE)
+    base_mask = valid & roles.eq(TOKEN_ROLE_BASE)
+    zero_nll = zero_nll.to(normal_nll.device, normal_nll.dtype)
+    if key_mask.any():
+        key_gain = (zero_nll - normal_nll)[key_mask]
+        utility_loss = torch.relu(float(counterfactual_margin) - key_gain).mean()
+        mean_key_gain = key_gain.mean()
+        key_improvement_rate = key_gain.gt(0).to(normal_nll.dtype).mean()
+    else:
+        utility_loss = normal_nll.sum() * 0.0
+        mean_key_gain = normal_nll.sum() * 0.0
+        key_improvement_rate = normal_nll.sum() * 0.0
+    if base_mask.any():
+        preservation_loss = ((normal_nll - zero_nll)[base_mask] ** 2).mean()
+    else:
+        preservation_loss = normal_nll.sum() * 0.0
+    objective = (
+        weighted_ce
+        + float(counterfactual_weight) * utility_loss
+        + float(preservation_weight) * preservation_loss
+    )
+    return objective, {
+        "standard_ce": standard_ce,
+        "weighted_ce": weighted_ce,
+        "counterfactual_loss": utility_loss,
+        "preservation_loss": preservation_loss,
+        "mean_key_logprob_gain": mean_key_gain,
+        "key_improvement_rate": key_improvement_rate,
+        "key_token_count": key_mask.sum(),
+        "base_token_count": base_mask.sum(),
+    }
 
 
 def run_split(
@@ -59,7 +125,13 @@ def run_split(
     training = optimizer is not None
     wrapper.base_model.eval()
     wrapper.adapters.train(training)
-    losses, used, skipped_missing, skipped_length = [], 0, 0, 0
+    metric_values = {
+        "objective_loss": [], "standard_ce": [], "weighted_ce": [],
+        "counterfactual_loss": [], "preservation_loss": [],
+        "mean_key_logprob_gain": [], "key_improvement_rate": [],
+    }
+    role_counts = {name: 0 for name in TOKEN_ROLE_NAMES.values()}
+    used, skipped_missing, skipped_length = 0, 0, 0
     optimizer_steps = 0
     if training:
         optimizer.zero_grad(set_to_none=True)
@@ -72,24 +144,64 @@ def run_split(
         prompt = build_full_schema_prompt(trajectory, graph)
         encoded = encode_teacher_forcing(
             tokenizer, prompt, trajectory.get("gold_sql", ""),
-            trajectory["trajectory_steps"], args.max_length,
+            trajectory["trajectory_steps"], graph, args.max_length,
             wrapper.base_model.get_input_embeddings().weight.device, torch,
         )
         if encoded is None:
             skipped_length += 1
             continue
-        input_ids, labels, token_steps = encoded
+        input_ids, labels, token_steps, token_roles = encoded
         grounding, steering, _ = trajectory_grounding_context(
             controller, trajectory, cache, relation_to_id, runtime, controller_device
         )
+        zero_nll = None
+        if args.training_objective == "semantic_utility":
+            wrapper.clear_grounding_context()
+            with torch.no_grad():
+                zero_output = wrapper(input_ids=input_ids, use_cache=False)
+                zero_nll, _ = causal_token_nll(zero_output.logits, labels, torch)
+                zero_nll = zero_nll.detach()
+            del zero_output
         wrapper.set_grounding_context(grounding, steering, token_steps)
         context = torch.enable_grad() if training else torch.no_grad()
         with context:
-            output = wrapper(input_ids=input_ids, labels=labels, use_cache=False)
-            loss = output.loss
+            output = wrapper(input_ids=input_ids, use_cache=False)
+            normal_nll, valid = causal_token_nll(output.logits, labels, torch)
+            if args.training_objective == "semantic_utility":
+                role_weights = {
+                    0: args.base_token_weight,
+                    1: args.schema_token_weight,
+                    2: args.operator_token_weight,
+                    3: args.value_token_weight,
+                }
+                loss, metrics = semantic_utility_objective(
+                    normal_nll, zero_nll, valid, token_roles, role_weights,
+                    args.counterfactual_loss_weight,
+                    args.counterfactual_margin,
+                    args.preservation_loss_weight,
+                    torch,
+                )
+            else:
+                valid_float = valid.to(normal_nll.dtype)
+                loss = (normal_nll * valid_float).sum() / valid_float.sum().clamp_min(1.0)
+                zero = loss.detach() * 0.0
+                metrics = {
+                    "standard_ce": loss,
+                    "weighted_ce": loss,
+                    "counterfactual_loss": zero,
+                    "preservation_loss": zero,
+                    "mean_key_logprob_gain": zero,
+                    "key_improvement_rate": zero,
+                }
             if training:
                 (loss / args.gradient_accumulation_steps).backward()
-        losses.append(float(loss.detach().cpu()))
+        metric_values["objective_loss"].append(float(loss.detach().cpu()))
+        for name, value in metrics.items():
+            if name in metric_values:
+                metric_values[name].append(float(value.detach().cpu()))
+        valid_roles = token_roles[:, 1:].flatten()[valid.detach().cpu().flatten()]
+        for role_id, role_name in TOKEN_ROLE_NAMES.items():
+            role_counts[role_name] += int(valid_roles.eq(role_id).sum())
         used += 1
         if training and used % args.gradient_accumulation_steps == 0:
             torch.nn.utils.clip_grad_norm_(wrapper.adapters.parameters(), args.max_grad_norm)
@@ -97,7 +209,11 @@ def run_split(
             optimizer.zero_grad(set_to_none=True)
             optimizer_steps += 1
         if training and args.log_every and used % args.log_every == 0:
-            print(json.dumps({"used": used, "mean_loss": sum(losses) / len(losses)}))
+            print(json.dumps({
+                "used": used,
+                "mean_objective_loss": sum(metric_values["objective_loss"]) / used,
+                "mean_key_logprob_gain": sum(metric_values["mean_key_logprob_gain"]) / used,
+            }))
     if training and used % args.gradient_accumulation_steps:
         torch.nn.utils.clip_grad_norm_(wrapper.adapters.parameters(), args.max_grad_norm)
         optimizer.step()
@@ -106,7 +222,15 @@ def run_split(
     wrapper.clear_grounding_context()
     return {
         "example_count": used,
-        "mean_token_loss": sum(losses) / len(losses) if losses else 0.0,
+        **{
+            f"mean_{name}": sum(values) / len(values) if values else 0.0
+            for name, values in metric_values.items()
+        },
+        "mean_token_loss": (
+            sum(metric_values["standard_ce"]) / len(metric_values["standard_ce"])
+            if metric_values["standard_ce"] else 0.0
+        ),
+        "token_role_counts": role_counts,
         "skipped_missing": skipped_missing,
         "skipped_over_max_length": skipped_length,
         "optimizer_steps": optimizer_steps,
@@ -135,6 +259,16 @@ def main():
     parser.add_argument("--adapter-layer-fractions", default="0.25,0.5,0.75,1.0")
     parser.add_argument("--adapter-heads", type=int, default=8)
     parser.add_argument("--adapter-dropout", type=float, default=0.0)
+    parser.add_argument(
+        "--training-objective", choices=("ce", "semantic_utility"), default="ce"
+    )
+    parser.add_argument("--base-token-weight", type=float, default=0.5)
+    parser.add_argument("--schema-token-weight", type=float, default=4.0)
+    parser.add_argument("--operator-token-weight", type=float, default=2.5)
+    parser.add_argument("--value-token-weight", type=float, default=3.0)
+    parser.add_argument("--counterfactual-loss-weight", type=float, default=0.5)
+    parser.add_argument("--counterfactual-margin", type=float, default=0.05)
+    parser.add_argument("--preservation-loss-weight", type=float, default=0.1)
     parser.add_argument("--controller-device", default="cuda:0")
     parser.add_argument("--device-map", default="auto")
     parser.add_argument("--dtype", choices=("bfloat16", "float16", "float32"), default="bfloat16")
@@ -196,6 +330,11 @@ def main():
     # but never let it win selection for the trained adapter used at inference.
     torch.save(wrapper.adapter_state_dict(), output_dir / "identity_dynamic_llm_adapters.pt")
     best_loss, best_epoch, best_scales = None, None, None
+    selection_metric = (
+        "mean_objective_loss"
+        if args.training_objective == "semantic_utility"
+        else "mean_token_loss"
+    )
     history = [{
         "epoch": 0,
         "train": None,
@@ -225,8 +364,9 @@ def main():
         history.append(row)
         print(json.dumps(row, ensure_ascii=False))
         torch.save(wrapper.adapter_state_dict(), output_dir / "last_dynamic_llm_adapters.pt")
-        if best_loss is None or dev_metrics["mean_token_loss"] < best_loss:
-            best_loss, best_epoch = dev_metrics["mean_token_loss"], epoch
+        selection_value = dev_metrics[selection_metric]
+        if best_loss is None or selection_value < best_loss:
+            best_loss, best_epoch = selection_value, epoch
             best_scales = scales
             torch.save(wrapper.adapter_state_dict(), output_dir / "dynamic_llm_adapters.pt")
     config = {
@@ -241,10 +381,15 @@ def main():
         output_dir / "training_summary.json",
         {
             "best_epoch": best_epoch,
-            "best_dev_token_loss": best_loss,
+            "selection_metric": selection_metric,
+            "selection_value": best_loss,
+            "best_dev_token_loss": history[best_epoch]["dev"]["mean_token_loss"],
             "best_adapter_scales": best_scales,
             "identity_dev_token_loss": initial_dev["mean_token_loss"],
-            "selection_policy": "minimum dev token loss among trained epochs only; epoch 0 is excluded",
+            "identity_dev_objective_loss": initial_dev["mean_objective_loss"],
+            "selection_policy": (
+                f"minimum {selection_metric} among trained epochs only; epoch 0 is excluded"
+            ),
             "history": history,
             "config": config,
         },
