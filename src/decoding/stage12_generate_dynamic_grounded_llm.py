@@ -202,6 +202,7 @@ def main():
             "grounding_control": {
                 "intervention": args.intervention,
                 "refresh_interval": args.refresh_interval,
+                "adapter_scales": wrapper.adapter_scale_summary(),
                 "operation_trace": operation_trace,
                 "adapter_diagnostics": wrapper.last_diagnostics,
             },

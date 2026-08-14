@@ -104,6 +104,9 @@ class DynamicGroundingAdapter(nn.Module):
                     "token_count": int(positions.numel()),
                     "mean_route": float(route.detach().mean().cpu()),
                     "mean_attention_max": float(attention.detach().amax(-1).mean().cpu()),
+                    "mean_context_norm": float(context.detach().float().norm(dim=-1).mean().cpu()),
+                    "mean_steering_norm": float(steering.detach().float().norm(dim=-1).mean().cpu()),
+                    "mean_update_norm": float(update.detach().float().norm(dim=-1).mean().cpu()),
                 }
             )
         return result, diagnostics
@@ -174,6 +177,19 @@ class DynamicGroundedCausalLM(nn.Module):
 
     def adapter_state_dict(self):
         return {key: value.detach().cpu() for key, value in self.adapters.state_dict().items()}
+
+    def adapter_scale_summary(self):
+        result = {}
+        for index, adapter in self.adapters.items():
+            result[index] = {
+                "cross_scale_raw": float(adapter.cross_scale.detach().float().cpu()),
+                "cross_scale_effective": float(torch.tanh(adapter.cross_scale.detach()).float().cpu()),
+                "steering_scale_raw": float(adapter.steering_scale.detach().float().cpu()),
+                "steering_scale_effective": float(
+                    torch.tanh(adapter.steering_scale.detach()).float().cpu()
+                ),
+            }
+        return result
 
     def forward(self, *args, **kwargs):
         return self.base_model(*args, **kwargs)

@@ -143,6 +143,9 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
+    if args.epochs < 1:
+        parser.error("--epochs must be at least 1 because epoch 0 is diagnostic only")
+
     import numpy as np
     import torch
     from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -189,9 +192,17 @@ def main():
         wrapper, controller, dev_trajectories, dev_graphs, dev_cache,
         relation_to_id, tokenizer, args, runtime, controller_device,
     )
-    best_loss, best_epoch = initial_dev["mean_token_loss"], 0
-    torch.save(wrapper.adapter_state_dict(), output_dir / "dynamic_llm_adapters.pt")
-    history = [{"epoch": 0, "train": None, "dev": initial_dev}]
+    # Epoch 0 is an exact identity adapter. Keep it as a diagnostic baseline,
+    # but never let it win selection for the trained adapter used at inference.
+    torch.save(wrapper.adapter_state_dict(), output_dir / "identity_dynamic_llm_adapters.pt")
+    best_loss, best_epoch, best_scales = None, None, None
+    history = [{
+        "epoch": 0,
+        "train": None,
+        "dev": initial_dev,
+        "adapter_scales": wrapper.adapter_scale_summary(),
+        "checkpoint_role": "identity_baseline_only",
+    }]
     print(json.dumps(history[0], ensure_ascii=False))
     for epoch in range(1, args.epochs + 1):
         random.Random(args.seed + epoch).shuffle(train_trajectories)
@@ -203,11 +214,20 @@ def main():
             wrapper, controller, dev_trajectories, dev_graphs, dev_cache,
             relation_to_id, tokenizer, args, runtime, controller_device,
         )
-        row = {"epoch": epoch, "train": train_metrics, "dev": dev_metrics}
+        scales = wrapper.adapter_scale_summary()
+        row = {
+            "epoch": epoch,
+            "train": train_metrics,
+            "dev": dev_metrics,
+            "adapter_scales": scales,
+            "checkpoint_role": "trained_candidate",
+        }
         history.append(row)
         print(json.dumps(row, ensure_ascii=False))
+        torch.save(wrapper.adapter_state_dict(), output_dir / "last_dynamic_llm_adapters.pt")
         if best_loss is None or dev_metrics["mean_token_loss"] < best_loss:
             best_loss, best_epoch = dev_metrics["mean_token_loss"], epoch
+            best_scales = scales
             torch.save(wrapper.adapter_state_dict(), output_dir / "dynamic_llm_adapters.pt")
     config = {
         **vars(args),
@@ -219,7 +239,15 @@ def main():
     write_json(output_dir / "adapter_config.json", config)
     write_json(
         output_dir / "training_summary.json",
-        {"best_epoch": best_epoch, "best_dev_token_loss": best_loss, "history": history, "config": config},
+        {
+            "best_epoch": best_epoch,
+            "best_dev_token_loss": best_loss,
+            "best_adapter_scales": best_scales,
+            "identity_dev_token_loss": initial_dev["mean_token_loss"],
+            "selection_policy": "minimum dev token loss among trained epochs only; epoch 0 is excluded",
+            "history": history,
+            "config": config,
+        },
     )
     print(f"Outputs written to: {output_dir}")
 

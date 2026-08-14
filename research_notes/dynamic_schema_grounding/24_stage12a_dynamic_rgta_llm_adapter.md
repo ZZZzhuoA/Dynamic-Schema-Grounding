@@ -110,6 +110,16 @@ training_summary.json
 
 Epoch 0 is the exact identity-initialized adapter baseline. Confirm that epoch 1 has a finite loss and that at least one adapter checkpoint is written.
 
+Epoch 0 is excluded from trained-checkpoint selection. The files have distinct roles:
+
+```text
+identity_dynamic_llm_adapters.pt  # untrained exact-identity diagnostic
+dynamic_llm_adapters.pt           # best trained epoch (epoch >= 1)
+last_dynamic_llm_adapters.pt      # final trained epoch
+```
+
+`training_summary.json` records raw/effective cross-attention and steering scales for every epoch. Before generation, confirm that at least one scale in `best_adapter_scales` is non-zero.
+
 ### 2. Generate the normal neural-injection condition
 
 ```bash

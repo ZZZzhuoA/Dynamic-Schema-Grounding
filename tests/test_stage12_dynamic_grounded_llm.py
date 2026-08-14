@@ -55,6 +55,9 @@ class Stage12AdapterTest(unittest.TestCase):
         actual.sum().backward()
         adapter = wrapped.adapters["1"]
         self.assertIsNotNone(adapter.cross_scale.grad)
+        scales = wrapped.adapter_scale_summary()
+        self.assertEqual(scales["1"]["cross_scale_raw"], 0.0)
+        self.assertEqual(scales["1"]["steering_scale_raw"], 0.0)
         self.assertFalse(base.model.layers[0].linear.weight.requires_grad)
 
     def test_teacher_forcing_alignment_changes_at_clause_boundaries(self):
