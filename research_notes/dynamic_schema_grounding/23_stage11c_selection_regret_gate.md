@@ -39,6 +39,11 @@ The selected objective is `Recall@K + eta * MRR`, so training cannot replace the
 protected baseline unless a later checkpoint improves the same ranking quality used
 by the gate.
 
+When the base is frozen, trajectories whose only supervised event is the first
+history-free event have no trainable autograd path. The trainer skips these examples
+and reports `train_skipped_no_trainable_path`; they cannot teach the history expert
+and must not trigger a backward call on a constant frozen-base loss.
+
 ## Experiment
 
 ```bash

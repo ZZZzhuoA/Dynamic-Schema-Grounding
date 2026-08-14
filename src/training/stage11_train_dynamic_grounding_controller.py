@@ -607,7 +607,7 @@ def main():
         model.train()
         shuffled = list(train)
         random.Random(args.seed + epoch).shuffle(shuffled)
-        total, count = 0.0, 0
+        total, count, skipped_no_trainable_path = 0.0, 0, 0
         for example in shuffled:
             dense, numeric, query, edges, steps = trajectory_tensors(
                 example, train_cache, relation_to_id, model, runtime, device
@@ -627,6 +627,12 @@ def main():
             )
             if loss is None:
                 continue
+            # With a frozen independent controller, a trajectory containing only
+            # its first (history-free) supervised step has no trainable path.
+            # Skipping is correct: backpropagating cannot update the history expert.
+            if not loss.requires_grad:
+                skipped_no_trainable_path += 1
+                continue
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
             optimizer.step()
@@ -635,7 +641,13 @@ def main():
         metrics, _ = evaluate(
             model, dev, dev_cache, relation_to_id, args, runtime, device, "dev"
         )
-        row = {"epoch": epoch, "train_loss": total / max(count, 1), **metrics}
+        row = {
+            "epoch": epoch,
+            "train_loss": total / max(count, 1),
+            "train_update_count": count,
+            "train_skipped_no_trainable_path": skipped_no_trainable_path,
+            **metrics,
+        }
         log_rows.append(row)
         print(json.dumps(row, ensure_ascii=False))
         value = metrics[selection_metric]
