@@ -84,10 +84,18 @@ class DynamicSchemaGroundingController(nn.Module):
         state_feature_dim=16,
         dropout=0.1,
         recurrent=True,
+        history_mode=None,
+        detach_history=True,
     ):
         super().__init__()
         self.hidden_dim = hidden_dim
-        self.recurrent = recurrent
+        if history_mode is None:
+            history_mode = "legacy_recurrent" if recurrent else "independent"
+        if history_mode not in {"legacy_recurrent", "independent", "uncertainty_residual"}:
+            raise ValueError(f"Unsupported history_mode: {history_mode}")
+        self.history_mode = history_mode
+        self.recurrent = history_mode == "legacy_recurrent"
+        self.detach_history = detach_history
         self.operation_to_id = {name: index for index, name in enumerate(OPERATIONS)}
         self.node_input = nn.Linear(dense_dim, hidden_dim)
         self.numeric_input = nn.Linear(numeric_dim, hidden_dim)
@@ -98,6 +106,17 @@ class DynamicSchemaGroundingController(nn.Module):
         )
         self.initial_state = nn.Linear(hidden_dim, hidden_dim)
         self.transition = nn.GRUCell(hidden_dim * 5, hidden_dim)
+        self.history_delta = nn.Sequential(
+            nn.Linear(hidden_dim * 4, hidden_dim), nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim), nn.Tanh(),
+        )
+        self.history_relevance = nn.Sequential(
+            nn.Linear(hidden_dim * 3 + 3, hidden_dim), nn.GELU(),
+            nn.Linear(hidden_dim, 1),
+        )
+        # History starts as a small correction. Training must earn a larger gate.
+        nn.init.constant_(self.history_relevance[-1].bias, -2.0)
+        self.residual_norm = nn.LayerNorm(hidden_dim)
         self.layers = nn.ModuleList(
             [StateConditionedRGTALayer(hidden_dim, relation_count, dropout) for _ in range(num_layers)]
         )
@@ -115,9 +134,34 @@ class DynamicSchemaGroundingController(nn.Module):
         )
         return nodes, query, state, belief
 
+    def _graph_ground(self, base_nodes, query, state, edges):
+        nodes = base_nodes
+        for layer in self.layers:
+            nodes = layer(nodes, edges[0], edges[1], state)
+        state_matrix = state.unsqueeze(0).expand_as(nodes)
+        query_matrix = query.unsqueeze(0).expand_as(nodes)
+        logits = self.scorer(
+            torch.cat([nodes, state_matrix, nodes * state_matrix, query_matrix], dim=-1)
+        ).squeeze(-1)
+        return nodes, logits, torch.softmax(logits, dim=0)
+
+    @staticmethod
+    def _belief_uncertainty(belief):
+        count = belief.numel()
+        if count <= 1:
+            zero = belief.new_zeros(())
+            return zero, zero, zero
+        entropy = -(belief.clamp_min(1e-8) * belief.clamp_min(1e-8).log()).sum()
+        entropy = entropy / math.log(count)
+        top = torch.topk(belief, k=2).values
+        margin = top[0] - top[1]
+        ambiguity = 0.5 * entropy + 0.5 * (1.0 - margin)
+        return entropy, margin, ambiguity.clamp(0.0, 1.0)
+
     def step(
         self, base_nodes, query, previous_state, previous_belief, edges,
         operation_id, sql_features, observed_mask=None,
+        reference_state=None, reference_belief=None, history_available=True,
     ):
         summary = (previous_belief.unsqueeze(-1) * base_nodes).sum(0)
         if observed_mask is None:
@@ -134,21 +178,54 @@ class DynamicSchemaGroundingController(nn.Module):
             [query, operation, partial, summary, observed_summary], dim=-1
         )
         state = self.transition(state_input.unsqueeze(0), previous_state.unsqueeze(0)).squeeze(0)
-        nodes = base_nodes
-        for layer in self.layers:
-            nodes = layer(nodes, edges[0], edges[1], state)
+        provisional_nodes, provisional_logits, provisional_belief = self._graph_ground(
+            base_nodes, query, state, edges
+        )
+        entropy, margin, ambiguity = self._belief_uncertainty(provisional_belief)
+        history_gate = state.new_zeros(())
+        history_delta = torch.zeros_like(state)
+
+        if self.history_mode == "uncertainty_residual" and history_available:
+            history_state = reference_state
+            history_belief = reference_belief
+            if self.detach_history:
+                history_state = history_state.detach()
+                history_belief = history_belief.detach()
+            history_summary = (history_belief.unsqueeze(-1) * base_nodes).sum(0)
+            current_summary = (provisional_belief.unsqueeze(-1) * base_nodes).sum(0)
+            history_delta = self.history_delta(
+                torch.cat([history_state, history_summary, state, current_summary], dim=-1)
+            )
+            uncertainty_features = torch.stack([entropy, margin, ambiguity])
+            relevance = torch.sigmoid(
+                self.history_relevance(
+                    torch.cat([state, history_state, torch.abs(state - history_state),
+                               uncertainty_features], dim=-1)
+                ).squeeze(-1)
+            )
+            # Uncertainty is an explicit upper bound on historical influence.
+            history_gate = ambiguity.detach() * relevance
+            state = self.residual_norm(state + history_gate * history_delta)
+            nodes, logits, belief = self._graph_ground(base_nodes, query, state, edges)
+        else:
+            nodes, logits, belief = provisional_nodes, provisional_logits, provisional_belief
+
         state_matrix = state.unsqueeze(0).expand_as(nodes)
-        query_matrix = query.unsqueeze(0).expand_as(nodes)
-        logits = self.scorer(
-            torch.cat([nodes, state_matrix, nodes * state_matrix, query_matrix], dim=-1)
-        ).squeeze(-1)
-        belief = torch.softmax(logits, dim=0)
         gate = torch.sigmoid(self.bridge_gate(torch.cat([nodes, state_matrix], dim=-1)))
         grounding_tokens = gate * nodes + (1.0 - gate) * state_matrix
         steering_state = (belief.unsqueeze(-1) * grounding_tokens).sum(0)
         return {
             "logits": logits,
             "belief": belief,
+            "provisional_logits": provisional_logits,
+            "provisional_belief": provisional_belief,
+            "provisional_entropy": entropy,
+            "provisional_margin": margin,
+            "provisional_ambiguity": ambiguity,
+            "history_gate": history_gate,
+            "history_delta_norm": history_delta.norm(),
+            "history_available": history_available,
+            "residual_history_enabled": self.history_mode == "uncertainty_residual",
             "controller_state": state,
             "schema_states": nodes,
             "grounding_tokens": grounding_tokens,
@@ -162,11 +239,18 @@ class DynamicSchemaGroundingController(nn.Module):
         initial_state, initial_belief = state, belief
         outputs = []
         for step in steps:
-            previous_state = state if self.recurrent else initial_state
-            previous_belief = belief if self.recurrent else initial_belief
+            history_available = bool(outputs)
+            if self.history_mode == "legacy_recurrent":
+                previous_state, previous_belief = state, belief
+            else:
+                # Protected independent path: identical causal inputs at this
+                # step, but no latent state or predicted belief is inherited.
+                previous_state, previous_belief = initial_state, initial_belief
             output = self.step(
                 base_nodes, query, previous_state, previous_belief, edges,
                 step["operation_id"], step["sql_features"], step.get("observed_mask"),
+                reference_state=state, reference_belief=belief,
+                history_available=history_available,
             )
             outputs.append(output)
             state, belief = output["controller_state"], output["belief"]

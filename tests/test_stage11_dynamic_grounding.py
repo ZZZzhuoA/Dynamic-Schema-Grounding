@@ -175,6 +175,47 @@ class Stage11ModelTest(unittest.TestCase):
         )
         self.assertEqual(tuple(unbatched_steering["hidden_states"].shape), (5, 32))
 
+    def test_uncertainty_residual_history_is_gated_and_backpropagates(self):
+        try:
+            import torch
+            from src.modeling.dynamic_grounding_controller import (
+                DynamicSchemaGroundingController,
+                partial_sql_features,
+            )
+        except ImportError:
+            self.skipTest("PyTorch is unavailable")
+        torch.manual_seed(11)
+        model = DynamicSchemaGroundingController(
+            dense_dim=8, numeric_dim=4, hidden_dim=16, relation_count=2,
+            num_layers=1, dropout=0.0, history_mode="uncertainty_residual",
+        )
+        edge_index = torch.tensor([[0, 1, 2, 3], [1, 0, 3, 2]])
+        edge_type = torch.tensor([0, 0, 1, 1])
+        steps = [
+            {
+                "operation_id": torch.tensor([model.operation_to_id[operation]]),
+                "sql_features": torch.tensor(partial_sql_features(sql)),
+                "observed_mask": observed,
+            }
+            for operation, sql, observed in [
+                ("PROJECT", "select", torch.zeros(4)),
+                ("FILTER", "select x from t where", torch.tensor([1., 0., 0., 0.])),
+            ]
+        ]
+        outputs = model.forward_trajectory(
+            torch.randn(4, 8), torch.randn(4, 4), torch.randn(1, 8),
+            (edge_index, edge_type), steps,
+        )
+        self.assertEqual(float(outputs[0]["history_gate"]), 0.0)
+        history_gate = float(outputs[1]["history_gate"].detach())
+        self.assertGreaterEqual(history_gate, 0.0)
+        self.assertLessEqual(history_gate, 1.0)
+        self.assertTrue(torch.isfinite(outputs[1]["provisional_entropy"]))
+        outputs[1]["logits"].sum().backward()
+        grad = model.history_delta[0].weight.grad
+        self.assertIsNotNone(grad)
+        self.assertGreater(float(grad.abs().sum()), 0.0)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -168,18 +168,29 @@ def trajectory_tensors(example, cache, relation_to_id, model, runtime, device):
     return dense, numeric, query, (edge_index, edge_type), steps
 
 
-def trajectory_loss(outputs, steps, pos_weight, runtime):
+def trajectory_loss(
+    outputs, steps, pos_weight, runtime,
+    provisional_loss_weight=0.0, history_gate_penalty=0.0,
+):
     torch = runtime["torch"]
     losses = []
     for output, step in zip(outputs, steps):
         if not step["target"].sum():
             continue
         weight = torch.tensor(pos_weight, device=output["logits"].device)
-        losses.append(
-            torch.nn.functional.binary_cross_entropy_with_logits(
-                output["logits"], step["target"], pos_weight=weight
-            )
+        loss = torch.nn.functional.binary_cross_entropy_with_logits(
+            output["logits"], step["target"], pos_weight=weight
         )
+        residual_step = (
+            output.get("residual_history_enabled") and output.get("history_available")
+        )
+        if provisional_loss_weight and residual_step:
+            loss = loss + provisional_loss_weight * torch.nn.functional.binary_cross_entropy_with_logits(
+                output["provisional_logits"], step["target"], pos_weight=weight
+            )
+        if history_gate_penalty and residual_step:
+            loss = loss + history_gate_penalty * output["history_gate"]
+        losses.append(loss)
     if not losses:
         return outputs[0]["logits"].sum() * 0.0 if outputs else None
     return torch.stack(losses).mean()
@@ -189,7 +200,8 @@ def evaluate(model, examples, cache, relation_to_id, args, runtime, device, spli
     torch = runtime["torch"]
     model.eval()
     losses, recalls, reciprocal_ranks, belief_changes = [], [], [], []
-    by_operation = defaultdict(lambda: {"recall": [], "mrr": []})
+    gates, entropies, margins, residual_norms = [], [], [], []
+    by_operation = defaultdict(lambda: {"recall": [], "mrr": [], "gate": []})
     predictions = []
     with torch.no_grad():
         for example in examples:
@@ -199,7 +211,10 @@ def evaluate(model, examples, cache, relation_to_id, args, runtime, device, spli
             if not steps:
                 continue
             outputs = model.forward_trajectory(dense, numeric, query, edges, steps)
-            loss = trajectory_loss(outputs, steps, args.pos_weight, runtime)
+            loss = trajectory_loss(
+                outputs, steps, args.pos_weight, runtime,
+                args.provisional_loss_weight, args.history_gate_penalty,
+            )
             if loss is not None:
                 losses.append(float(loss.cpu()))
             previous_belief = None
@@ -221,6 +236,13 @@ def evaluate(model, examples, cache, relation_to_id, args, runtime, device, spli
                         float(torch.abs(output["belief"] - previous_belief).sum().cpu()) / 2.0
                     )
                 previous_belief = output["belief"]
+                entropies.append(float(output["provisional_entropy"].cpu()))
+                margins.append(float(output["provisional_margin"].cpu()))
+                if output["history_available"]:
+                    gate_value = float(output["history_gate"].cpu())
+                    gates.append(gate_value)
+                    residual_norms.append(float(output["history_delta_norm"].cpu()))
+                    by_operation[step["operation"]]["gate"].append(gate_value)
                 step_rows.append(
                     {
                         "step_index": step["step_index"],
@@ -230,6 +252,10 @@ def evaluate(model, examples, cache, relation_to_id, args, runtime, device, spli
                         "gold_local_ids": sorted(gold),
                         f"top_{args.output_top_k}_local_ids": top,
                         "steering_state_norm": float(output["steering_state"].norm().cpu()),
+                        "provisional_entropy": float(output["provisional_entropy"].cpu()),
+                        "provisional_margin": float(output["provisional_margin"].cpu()),
+                        "history_gate": float(output["history_gate"].cpu()),
+                        "history_delta_norm": float(output["history_delta_norm"].cpu()),
                     }
                 )
             predictions.append(
@@ -249,12 +275,18 @@ def evaluate(model, examples, cache, relation_to_id, args, runtime, device, spli
         f"step_schema_recall@{args.output_top_k}": mean(recalls),
         "step_schema_mrr": mean(reciprocal_ranks),
         "mean_belief_total_variation": mean(belief_changes),
+        "mean_provisional_entropy": mean(entropies),
+        "mean_provisional_margin": mean(margins),
+        "mean_history_gate": mean(gates),
+        "history_gate_activation_rate@0.1": mean([float(value > 0.1) for value in gates]),
+        "mean_history_delta_norm": mean(residual_norms),
     }
     for operation, values in sorted(by_operation.items()):
         prefix = operation.lower()
         metrics[f"{prefix}_target_step_count"] = len(values["recall"])
         metrics[f"{prefix}_schema_recall@{args.output_top_k}"] = mean(values["recall"])
         metrics[f"{prefix}_schema_mrr"] = mean(values["mrr"])
+        metrics[f"{prefix}_mean_history_gate"] = mean(values["gate"])
     return metrics, predictions
 
 
@@ -278,11 +310,27 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default="cpu")
     parser.add_argument(
+        "--history-mode",
+        choices=("legacy_recurrent", "independent", "uncertainty_residual"),
+        default="legacy_recurrent",
+        help="How latent history participates in each clause-level grounding step.",
+    )
+    parser.add_argument("--provisional-loss-weight", type=float, default=0.3)
+    parser.add_argument("--history-gate-penalty", type=float, default=0.01)
+    parser.add_argument(
+        "--allow-history-gradients", action="store_true",
+        help="Allow backpropagation through prior predicted states/beliefs; detached by default.",
+    )
+    parser.add_argument(
         "--disable-recurrence",
         action="store_true",
         help="Ablation: condition each event independently without belief/state recurrence.",
     )
     args = parser.parse_args()
+    if args.disable_recurrence:
+        if args.history_mode != "legacy_recurrent":
+            parser.error("--disable-recurrence cannot be combined with an explicit --history-mode")
+        args.history_mode = "independent"
     runtime = import_runtime()
     torch = runtime["torch"]
     random.seed(args.seed)
@@ -304,7 +352,9 @@ def main():
         dense_dim=train_cache["dense_dim"], numeric_dim=numeric_dim,
         hidden_dim=args.hidden_dim, relation_count=max(len(relations), 1),
         num_layers=args.num_layers, dropout=args.dropout,
-        recurrent=not args.disable_recurrence,
+        recurrent=args.history_mode == "legacy_recurrent",
+        history_mode=args.history_mode,
+        detach_history=not args.allow_history_gradients,
     ).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     output_dir = Path(args.output_dir)
@@ -328,7 +378,10 @@ def main():
                 continue
             optimizer.zero_grad()
             outputs = model.forward_trajectory(dense, numeric, query, edges, steps)
-            loss = trajectory_loss(outputs, steps, args.pos_weight, runtime)
+            loss = trajectory_loss(
+                outputs, steps, args.pos_weight, runtime,
+                args.provisional_loss_weight, args.history_gate_penalty,
+            )
             if loss is None:
                 continue
             loss.backward()
