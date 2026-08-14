@@ -86,6 +86,8 @@ class DynamicSchemaGroundingController(nn.Module):
         recurrent=True,
         history_mode=None,
         detach_history=True,
+        history_gate_policy="soft",
+        history_gate_threshold=0.5,
     ):
         super().__init__()
         self.hidden_dim = hidden_dim
@@ -96,6 +98,10 @@ class DynamicSchemaGroundingController(nn.Module):
         self.history_mode = history_mode
         self.recurrent = history_mode == "legacy_recurrent"
         self.detach_history = detach_history
+        if history_gate_policy not in {"soft", "straight_through"}:
+            raise ValueError(f"Unsupported history_gate_policy: {history_gate_policy}")
+        self.history_gate_policy = history_gate_policy
+        self.history_gate_threshold = float(history_gate_threshold)
         self.operation_to_id = {name: index for index, name in enumerate(OPERATIONS)}
         self.node_input = nn.Linear(dense_dim, hidden_dim)
         self.numeric_input = nn.Linear(numeric_dim, hidden_dim)
@@ -189,6 +195,7 @@ class DynamicSchemaGroundingController(nn.Module):
         entropy, margin, ambiguity = self._belief_uncertainty(provisional_belief)
         base_state = state
         history_gate = state.new_zeros(())
+        history_gate_probability = state.new_zeros(())
         history_delta = torch.zeros_like(state)
         candidate_state = base_state
         candidate_nodes = provisional_nodes
@@ -215,7 +222,15 @@ class DynamicSchemaGroundingController(nn.Module):
             )
             # Uncertainty conditions the learned relevance network. Counterfactual
             # utility supervision (in the trainer) decides whether it should open.
-            history_gate = relevance
+            history_gate_probability = relevance
+            if self.history_gate_policy == "straight_through":
+                hard_gate = (relevance >= self.history_gate_threshold).to(relevance.dtype)
+                history_gate = (
+                    hard_gate + relevance - relevance.detach()
+                    if self.training else hard_gate
+                )
+            else:
+                history_gate = relevance
             candidate_state = self.residual_norm(base_state + history_delta)
             candidate_nodes, candidate_logits, candidate_belief = self._graph_ground(
                 base_nodes, query, candidate_state, edges
@@ -243,6 +258,7 @@ class DynamicSchemaGroundingController(nn.Module):
             "provisional_margin": margin,
             "provisional_ambiguity": ambiguity,
             "history_gate": history_gate,
+            "history_gate_probability": history_gate_probability,
             "history_delta_norm": history_delta.norm(),
             "history_available": history_available,
             "residual_history_enabled": self.history_mode == "uncertainty_residual",

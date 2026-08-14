@@ -250,6 +250,82 @@ class Stage11ModelTest(unittest.TestCase):
         self.assertEqual(float(harmful), 0.0)
         self.assertEqual(float(tied), 0.0)
 
+    def test_selection_regret_utility_tracks_topk_and_mrr_improvement(self):
+        try:
+            import torch
+            from src.training.stage11_train_dynamic_grounding_controller import (
+                selection_regret_utility,
+            )
+        except ImportError:
+            self.skipTest("PyTorch is unavailable")
+        labels = torch.tensor([1.0, 0.0, 0.0, 0.0])
+        base = torch.tensor([0.0, 2.0, 1.0, -1.0])
+        candidate = torch.tensor([3.0, 2.0, 1.0, -1.0])
+        useful, base_quality, candidate_quality = selection_regret_utility(
+            base, candidate, labels, top_k=2, mrr_weight=0.1, temperature=0.05
+        )
+        harmful, _, _ = selection_regret_utility(
+            candidate, base, labels, top_k=2, mrr_weight=0.1, temperature=0.05
+        )
+        self.assertGreater(float(candidate_quality), float(base_quality))
+        self.assertGreater(float(useful), 0.0)
+        self.assertEqual(float(harmful), 0.0)
+
+    def test_straight_through_rejection_recovers_base_logits(self):
+        try:
+            import torch
+            from src.modeling.dynamic_grounding_controller import (
+                DynamicSchemaGroundingController,
+                partial_sql_features,
+            )
+        except ImportError:
+            self.skipTest("PyTorch is unavailable")
+        model = DynamicSchemaGroundingController(
+            dense_dim=8, numeric_dim=4, hidden_dim=16, relation_count=1,
+            num_layers=1, dropout=0.0, history_mode="uncertainty_residual",
+            history_gate_policy="straight_through", history_gate_threshold=1.1,
+        )
+        model.eval()
+        steps = [
+            {
+                "operation_id": torch.tensor([model.operation_to_id[operation]]),
+                "sql_features": torch.tensor(partial_sql_features(sql)),
+                "observed_mask": torch.zeros(3),
+            }
+            for operation, sql in [("PROJECT", "select"), ("FILTER", "select x where")]
+        ]
+        outputs = model.forward_trajectory(
+            torch.randn(3, 8), torch.randn(3, 4), torch.randn(1, 8),
+            (torch.empty((2, 0), dtype=torch.long), torch.empty(0, dtype=torch.long)),
+            steps,
+        )
+        self.assertEqual(float(outputs[1]["history_gate"]), 0.0)
+        self.assertTrue(torch.equal(outputs[1]["logits"], outputs[1]["provisional_logits"]))
+
+    def test_safe_history_tuning_freezes_independent_path(self):
+        try:
+            from src.modeling.dynamic_grounding_controller import DynamicSchemaGroundingController
+            from src.training.stage11_train_dynamic_grounding_controller import (
+                configure_safe_history_tuning,
+                initialize_rejecting_gate,
+            )
+        except ImportError:
+            self.skipTest("PyTorch is unavailable")
+        model = DynamicSchemaGroundingController(
+            dense_dim=8, numeric_dim=4, hidden_dim=16, relation_count=1,
+            history_mode="uncertainty_residual",
+        )
+        trainable = configure_safe_history_tuning(model, freeze_base_controller=True)
+        self.assertTrue(trainable)
+        self.assertTrue(all(name.startswith(("history_delta.", "history_relevance.", "residual_norm.")) for name in trainable))
+        self.assertFalse(model.node_input.weight.requires_grad)
+        self.assertTrue(model.history_delta[0].weight.requires_grad)
+        initialize_rejecting_gate(model)
+        self.assertEqual(
+            float(model.history_relevance[-1].weight.detach().abs().sum()), 0.0
+        )
+        self.assertEqual(float(model.history_relevance[-1].bias.detach()), -4.0)
+
 
 if __name__ == "__main__":
     unittest.main()
