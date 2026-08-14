@@ -158,6 +158,11 @@ class DynamicSchemaGroundingController(nn.Module):
         ambiguity = 0.5 * entropy + 0.5 * (1.0 - margin)
         return entropy, margin, ambiguity.clamp(0.0, 1.0)
 
+    @staticmethod
+    def mix_history(base, history_candidate, history_gate):
+        """Identity-preserving convex residual; gate=0 exactly returns base."""
+        return base + history_gate * (history_candidate - base)
+
     def step(
         self, base_nodes, query, previous_state, previous_belief, edges,
         operation_id, sql_features, observed_mask=None,
@@ -182,8 +187,13 @@ class DynamicSchemaGroundingController(nn.Module):
             base_nodes, query, state, edges
         )
         entropy, margin, ambiguity = self._belief_uncertainty(provisional_belief)
+        base_state = state
         history_gate = state.new_zeros(())
         history_delta = torch.zeros_like(state)
+        candidate_state = base_state
+        candidate_nodes = provisional_nodes
+        candidate_logits = provisional_logits
+        candidate_belief = provisional_belief
 
         if self.history_mode == "uncertainty_residual" and history_available:
             history_state = reference_state
@@ -203,10 +213,18 @@ class DynamicSchemaGroundingController(nn.Module):
                                uncertainty_features], dim=-1)
                 ).squeeze(-1)
             )
-            # Uncertainty is an explicit upper bound on historical influence.
-            history_gate = ambiguity.detach() * relevance
-            state = self.residual_norm(state + history_gate * history_delta)
-            nodes, logits, belief = self._graph_ground(base_nodes, query, state, edges)
+            # Uncertainty conditions the learned relevance network. Counterfactual
+            # utility supervision (in the trainer) decides whether it should open.
+            history_gate = relevance
+            candidate_state = self.residual_norm(base_state + history_delta)
+            candidate_nodes, candidate_logits, candidate_belief = self._graph_ground(
+                base_nodes, query, candidate_state, edges
+            )
+            # Fuse at logits so alpha=0 is exactly the independent prediction.
+            logits = self.mix_history(provisional_logits, candidate_logits, history_gate)
+            belief = torch.softmax(logits, dim=0)
+            state = self.mix_history(base_state, candidate_state, history_gate)
+            nodes = self.mix_history(provisional_nodes, candidate_nodes, history_gate)
         else:
             nodes, logits, belief = provisional_nodes, provisional_logits, provisional_belief
 
@@ -219,6 +237,8 @@ class DynamicSchemaGroundingController(nn.Module):
             "belief": belief,
             "provisional_logits": provisional_logits,
             "provisional_belief": provisional_belief,
+            "history_candidate_logits": candidate_logits,
+            "history_candidate_belief": candidate_belief,
             "provisional_entropy": entropy,
             "provisional_margin": margin,
             "provisional_ambiguity": ambiguity,

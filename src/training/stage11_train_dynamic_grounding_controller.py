@@ -168,9 +168,17 @@ def trajectory_tensors(example, cache, relation_to_id, model, runtime, device):
     return dense, numeric, query, (edge_index, edge_type), steps
 
 
+def counterfactual_utility(base_loss, candidate_loss, temperature=0.05, margin=0.0):
+    """Positive value only when the history candidate beats the base path."""
+    improvement = (base_loss - candidate_loss - margin).clamp_min(0.0)
+    return 1.0 - (-improvement / max(temperature, 1e-6)).exp()
+
+
 def trajectory_loss(
     outputs, steps, pos_weight, runtime,
     provisional_loss_weight=0.0, history_gate_penalty=0.0,
+    history_candidate_loss_weight=0.0, history_gate_loss_weight=0.0,
+    history_utility_temperature=0.05, history_utility_margin=0.0,
 ):
     torch = runtime["torch"]
     losses = []
@@ -184,12 +192,27 @@ def trajectory_loss(
         residual_step = (
             output.get("residual_history_enabled") and output.get("history_available")
         )
-        if provisional_loss_weight and residual_step:
-            loss = loss + provisional_loss_weight * torch.nn.functional.binary_cross_entropy_with_logits(
+        if residual_step:
+            base_loss = torch.nn.functional.binary_cross_entropy_with_logits(
                 output["provisional_logits"], step["target"], pos_weight=weight
             )
-        if history_gate_penalty and residual_step:
-            loss = loss + history_gate_penalty * output["history_gate"]
+            candidate_loss = torch.nn.functional.binary_cross_entropy_with_logits(
+                output["history_candidate_logits"], step["target"], pos_weight=weight
+            )
+            loss = loss + provisional_loss_weight * base_loss
+            loss = loss + history_candidate_loss_weight * candidate_loss
+            utility_target = counterfactual_utility(
+                base_loss.detach(), candidate_loss.detach(),
+                history_utility_temperature, history_utility_margin,
+            )
+            if history_gate_loss_weight:
+                loss = loss + history_gate_loss_weight * torch.nn.functional.binary_cross_entropy(
+                    output["history_gate"].clamp(1e-6, 1.0 - 1e-6), utility_target
+                )
+            # Retained only for backwards-compatible ablations. New Stage 11-B-fix1
+            # runs should leave this at zero and use utility supervision instead.
+            if history_gate_penalty:
+                loss = loss + history_gate_penalty * output["history_gate"]
         losses.append(loss)
     if not losses:
         return outputs[0]["logits"].sum() * 0.0 if outputs else None
@@ -201,7 +224,10 @@ def evaluate(model, examples, cache, relation_to_id, args, runtime, device, spli
     model.eval()
     losses, recalls, reciprocal_ranks, belief_changes = [], [], [], []
     gates, entropies, margins, residual_norms = [], [], [], []
-    by_operation = defaultdict(lambda: {"recall": [], "mrr": [], "gate": []})
+    utility_targets, gate_utility_errors, candidate_wins = [], [], []
+    by_operation = defaultdict(
+        lambda: {"recall": [], "mrr": [], "gate": [], "utility": [], "candidate_win": []}
+    )
     predictions = []
     with torch.no_grad():
         for example in examples:
@@ -214,6 +240,8 @@ def evaluate(model, examples, cache, relation_to_id, args, runtime, device, spli
             loss = trajectory_loss(
                 outputs, steps, args.pos_weight, runtime,
                 args.provisional_loss_weight, args.history_gate_penalty,
+                args.history_candidate_loss_weight, args.history_gate_loss_weight,
+                args.history_utility_temperature, args.history_utility_margin,
             )
             if loss is not None:
                 losses.append(float(loss.cpu()))
@@ -240,9 +268,28 @@ def evaluate(model, examples, cache, relation_to_id, args, runtime, device, spli
                 margins.append(float(output["provisional_margin"].cpu()))
                 if output["history_available"]:
                     gate_value = float(output["history_gate"].cpu())
+                    weight = torch.tensor(args.pos_weight, device=output["logits"].device)
+                    base_loss = torch.nn.functional.binary_cross_entropy_with_logits(
+                        output["provisional_logits"], step["target"], pos_weight=weight
+                    )
+                    candidate_loss = torch.nn.functional.binary_cross_entropy_with_logits(
+                        output["history_candidate_logits"], step["target"], pos_weight=weight
+                    )
+                    utility = float(
+                        counterfactual_utility(
+                            base_loss, candidate_loss,
+                            args.history_utility_temperature, args.history_utility_margin,
+                        ).cpu()
+                    )
+                    candidate_win = float(candidate_loss < base_loss)
                     gates.append(gate_value)
                     residual_norms.append(float(output["history_delta_norm"].cpu()))
+                    utility_targets.append(utility)
+                    gate_utility_errors.append(abs(gate_value - utility))
+                    candidate_wins.append(candidate_win)
                     by_operation[step["operation"]]["gate"].append(gate_value)
+                    by_operation[step["operation"]]["utility"].append(utility)
+                    by_operation[step["operation"]]["candidate_win"].append(candidate_win)
                 step_rows.append(
                     {
                         "step_index": step["step_index"],
@@ -256,6 +303,7 @@ def evaluate(model, examples, cache, relation_to_id, args, runtime, device, spli
                         "provisional_margin": float(output["provisional_margin"].cpu()),
                         "history_gate": float(output["history_gate"].cpu()),
                         "history_delta_norm": float(output["history_delta_norm"].cpu()),
+                        "counterfactual_utility_target": utility if output["history_available"] else 0.0,
                     }
                 )
             predictions.append(
@@ -280,6 +328,9 @@ def evaluate(model, examples, cache, relation_to_id, args, runtime, device, spli
         "mean_history_gate": mean(gates),
         "history_gate_activation_rate@0.1": mean([float(value > 0.1) for value in gates]),
         "mean_history_delta_norm": mean(residual_norms),
+        "mean_counterfactual_utility_target": mean(utility_targets),
+        "history_candidate_win_rate": mean(candidate_wins),
+        "mean_gate_utility_absolute_error": mean(gate_utility_errors),
     }
     for operation, values in sorted(by_operation.items()):
         prefix = operation.lower()
@@ -287,6 +338,8 @@ def evaluate(model, examples, cache, relation_to_id, args, runtime, device, spli
         metrics[f"{prefix}_schema_recall@{args.output_top_k}"] = mean(values["recall"])
         metrics[f"{prefix}_schema_mrr"] = mean(values["mrr"])
         metrics[f"{prefix}_mean_history_gate"] = mean(values["gate"])
+        metrics[f"{prefix}_mean_counterfactual_utility"] = mean(values["utility"])
+        metrics[f"{prefix}_history_candidate_win_rate"] = mean(values["candidate_win"])
     return metrics, predictions
 
 
@@ -316,7 +369,11 @@ def main():
         help="How latent history participates in each clause-level grounding step.",
     )
     parser.add_argument("--provisional-loss-weight", type=float, default=0.3)
-    parser.add_argument("--history-gate-penalty", type=float, default=0.01)
+    parser.add_argument("--history-gate-penalty", type=float, default=0.0)
+    parser.add_argument("--history-candidate-loss-weight", type=float, default=0.3)
+    parser.add_argument("--history-gate-loss-weight", type=float, default=0.1)
+    parser.add_argument("--history-utility-temperature", type=float, default=0.05)
+    parser.add_argument("--history-utility-margin", type=float, default=0.0)
     parser.add_argument(
         "--allow-history-gradients", action="store_true",
         help="Allow backpropagation through prior predicted states/beliefs; detached by default.",
@@ -381,6 +438,8 @@ def main():
             loss = trajectory_loss(
                 outputs, steps, args.pos_weight, runtime,
                 args.provisional_loss_weight, args.history_gate_penalty,
+                args.history_candidate_loss_weight, args.history_gate_loss_weight,
+                args.history_utility_temperature, args.history_utility_margin,
             )
             if loss is None:
                 continue

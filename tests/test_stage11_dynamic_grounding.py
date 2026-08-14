@@ -216,6 +216,40 @@ class Stage11ModelTest(unittest.TestCase):
         self.assertIsNotNone(grad)
         self.assertGreater(float(grad.abs().sum()), 0.0)
 
+    def test_history_fusion_has_exact_independent_identity_at_zero_gate(self):
+        try:
+            import torch
+            from src.modeling.dynamic_grounding_controller import (
+                DynamicSchemaGroundingController,
+            )
+        except ImportError:
+            self.skipTest("PyTorch is unavailable")
+        base = torch.randn(7)
+        candidate = torch.randn(7)
+        fused = DynamicSchemaGroundingController.mix_history(
+            base, candidate, torch.tensor(0.0)
+        )
+        self.assertTrue(torch.equal(fused, base))
+        full = DynamicSchemaGroundingController.mix_history(
+            base, candidate, torch.tensor(1.0)
+        )
+        self.assertTrue(torch.allclose(full, candidate))
+
+    def test_counterfactual_utility_is_positive_only_for_improvement(self):
+        try:
+            import torch
+            from src.training.stage11_train_dynamic_grounding_controller import (
+                counterfactual_utility,
+            )
+        except ImportError:
+            self.skipTest("PyTorch is unavailable")
+        useful = counterfactual_utility(torch.tensor(0.5), torch.tensor(0.4), 0.05)
+        harmful = counterfactual_utility(torch.tensor(0.4), torch.tensor(0.5), 0.05)
+        tied = counterfactual_utility(torch.tensor(0.4), torch.tensor(0.4), 0.05)
+        self.assertGreater(float(useful), 0.0)
+        self.assertEqual(float(harmful), 0.0)
+        self.assertEqual(float(tied), 0.0)
+
 
 if __name__ == "__main__":
     unittest.main()
