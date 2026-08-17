@@ -136,6 +136,12 @@ class GraphMemoryProjector(nn.Module):
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, graph_memory):
+        # Frozen graph encoders commonly emit FP32 while the code LLM runs in
+        # BF16.  Keep the projector's own precision policy explicit instead of
+        # relying on LayerNorm to accept mixed input/parameter dtypes.
+        graph_memory = graph_memory.to(
+            device=self.norm.weight.device, dtype=self.norm.weight.dtype
+        )
         projected = self.projection(self.norm(graph_memory))
         return self.output_norm(self.dropout(projected))
 

@@ -2,6 +2,18 @@ import unittest
 
 
 class Stage13CStaticGraphAdapterTest(unittest.TestCase):
+    def test_memory_projector_normalizes_input_dtype(self):
+        try:
+            import torch
+            from src.modeling.static_graph_adapter import GraphMemoryProjector
+        except ImportError:
+            self.skipTest("PyTorch is unavailable")
+        projector = GraphMemoryProjector(graph_dim=8, llm_dim=16)
+        memory = torch.randn(4, 8, dtype=torch.bfloat16)
+        projected = projector(memory)
+        self.assertEqual(projected.dtype, projector.norm.weight.dtype)
+        self.assertEqual(tuple(projected.shape), (4, 16))
+
     def test_runtime_accepts_legacy_index_cache(self):
         try:
             import numpy as np

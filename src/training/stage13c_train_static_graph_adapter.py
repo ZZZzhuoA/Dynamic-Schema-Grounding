@@ -271,8 +271,10 @@ def main():
     fractions = [float(value) for value in args.adapter_layer_fractions.split(",") if value.strip()]
     graph_dim = int(graph_summary.get("config", {}).get("hidden_dim", 256))
     llm_dim = int(base_model.config.hidden_size)
+    # Keep the small trainable graph-to-LLM projector in FP32. Decoder-layer
+    # adapters cast its output to each frozen LLM layer's dtype on consumption.
     projector = GraphMemoryProjector(graph_dim, llm_dim, args.adapter_dropout).to(
-        graph_device, dtype=dtype
+        graph_device
     )
     wrapper = StaticGraphConditionedCausalLM(
         base_model, graph_dim=llm_dim, layer_fractions=fractions,
