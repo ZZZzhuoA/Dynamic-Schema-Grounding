@@ -15,6 +15,10 @@ def ratio(hit, total):
     return hit / total if total else 1.0
 
 
+def optional_ratio(hit, total):
+    return hit / total if total else None
+
+
 def candidate_ids(rows, key="schema_id"):
     return {int(row[key]) for row in rows if key in row}
 
@@ -83,6 +87,12 @@ def evaluate(tool_rows, target_rows):
                 complete = complete and gold_set.issubset(predicted_set)
             counts["step_complete"] += int(complete)
             counts["step_total"] += 1
+            if action != "STOP":
+                counts["decision_step_complete"] += int(complete)
+                counts["decision_step_total"] += 1
+            if action not in {"SCAN", "STOP"}:
+                counts["semantic_step_complete"] += int(complete)
+                counts["semantic_step_total"] += 1
             bucket["step_complete"] += int(complete)
             bucket["step_total"] += 1
             sample_gold.update(table_gold)
@@ -117,6 +127,12 @@ def evaluate(tool_rows, target_rows):
             counts["value_route_hit"], counts["value_route_total"]
         ),
         "step_complete_rate": ratio(counts["step_complete"], counts["step_total"]),
+        "decision_step_complete_rate": ratio(
+            counts["decision_step_complete"], counts["decision_step_total"]
+        ),
+        "semantic_step_complete_rate": ratio(
+            counts["semantic_step_complete"], counts["semantic_step_total"]
+        ),
         "assembled_schema_recall": ratio(counts["assembly_hit"], counts["assembly_total"]),
         "assembled_complete_coverage": ratio(
             counts["assembly_complete"], counts["sample_total"]
@@ -127,11 +143,11 @@ def evaluate(tool_rows, target_rows):
     for action, bucket in sorted(action_counts.items()):
         metrics["action_metrics"][action] = {
             "step_count": bucket["step_total"],
-            "table_recall": ratio(bucket["table_hit"], bucket["table_total"]),
-            "column_recall": ratio(bucket["column_hit"], bucket["column_total"]),
-            "join_edge_recall": ratio(bucket["join_hit"], bucket["join_total"]),
-            "operator_recall": ratio(bucket["operator_hit"], bucket["operator_total"]),
-            "value_route_recall": ratio(
+            "table_recall": optional_ratio(bucket["table_hit"], bucket["table_total"]),
+            "column_recall": optional_ratio(bucket["column_hit"], bucket["column_total"]),
+            "join_edge_recall": optional_ratio(bucket["join_hit"], bucket["join_total"]),
+            "operator_recall": optional_ratio(bucket["operator_hit"], bucket["operator_total"]),
+            "value_route_recall": optional_ratio(
                 bucket["value_route_hit"], bucket["value_route_total"]
             ),
             "step_complete_rate": ratio(

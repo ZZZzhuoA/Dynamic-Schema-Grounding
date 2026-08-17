@@ -70,6 +70,14 @@ def normalize_requests(row):
             {
                 "request_id": f"step_{index}",
                 "action": step["action"],
+                # Arity belongs to the relational plan, not schema grounding.
+                # Keep only target counts; all schema IDs, edge IDs, operators,
+                # routes, and literal values remain hidden from the tool.
+                "table_cardinality": len(step.get("table_pointer_ids", [])),
+                "column_cardinality": len(step.get("column_pointer_ids", [])),
+                "join_edge_cardinality": len(step.get("join_edge_targets", [])),
+                "operator_cardinality": len(step.get("operator_targets", [])),
+                "value_route_cardinality": len(step.get("value_routes", [])),
             }
             for index, step in enumerate(row["teacher_steps"])
         ]
@@ -80,11 +88,37 @@ def normalize_requests(row):
         action = str(request.get("action") or "").upper()
         if action not in ACTIONS:
             raise ValueError(f"Unknown typed action at request {index}: {action}")
+        legacy_cardinality = max(1, int(request.get("cardinality", 1)))
+        default_table = legacy_cardinality if action == "SCAN" else 0
+        default_column = (
+            legacy_cardinality
+            if action in {"JOIN", "FILTER", "AGGREGATE", "HAVING_FILTER", "SORT", "PROJECT"}
+            else 0
+        )
         normalized.append(
             {
                 "request_id": str(request.get("request_id", f"step_{index}")),
                 "action": action,
-                "cardinality": max(1, int(request.get("cardinality", 1))),
+                "table_cardinality": max(
+                    0, int(request.get("table_cardinality", default_table))
+                ),
+                "column_cardinality": max(
+                    0, int(request.get("column_cardinality", default_column))
+                ),
+                "join_edge_cardinality": max(
+                    0, int(request.get("join_edge_cardinality", 1 if action == "JOIN" else 0))
+                ),
+                "operator_cardinality": max(
+                    0, int(request.get("operator_cardinality", 1 if action in {
+                        "JOIN", "FILTER", "AGGREGATE", "HAVING_FILTER",
+                        "SORT", "LIMIT", "PROJECT",
+                    } else 0))
+                ),
+                "value_route_cardinality": max(
+                    0, int(request.get("value_route_cardinality", 1 if action in {
+                        "FILTER", "HAVING_FILTER", "LIMIT"
+                    } else 0))
+                ),
                 "value_surface": request.get("value_surface"),
                 "requested_operator": request.get("requested_operator"),
                 "role": request.get("role"),
@@ -300,13 +334,12 @@ def assemble_tool_result(nodes, schema_edges, steps, max_schema_items=30):
 
     for step in steps:
         request = step["request"]
-        cardinality = int(request.get("cardinality", 1))
-        if request["action"] == "SCAN":
-            for candidate in step["table_candidates"][:cardinality]:
+        if request["table_cardinality"]:
+            for candidate in step["table_candidates"][: request["table_cardinality"]]:
                 keep(candidate, request["request_id"])
                 terminals.add(candidate.get("name"))
-        elif request["action"] not in {"STOP", "LIMIT"}:
-            for candidate in step["column_candidates"][:cardinality]:
+        if request["column_cardinality"]:
+            for candidate in step["column_candidates"][: request["column_cardinality"]]:
                 keep(candidate, request["request_id"])
                 terminals.add(candidate.get("table"))
         for edge in step.get("join_edge_candidates", []):
@@ -405,6 +438,10 @@ def infer_record(model, tensors, requests, args, torch):
             output = model.step(
                 base_nodes, query_state, state, node_types, edge_index, edge_type,
                 join_index, forced_action=request["action"],
+                inference_table_count=request["table_cardinality"],
+                inference_column_count=request["column_cardinality"],
+                inference_value_route_count=request["value_route_cardinality"],
+                inference_operator_count=request["operator_cardinality"],
             )
             action_probs = torch.softmax(output["action_logits"].float(), dim=-1)
             forced_id = ACTIONS.index(request["action"])

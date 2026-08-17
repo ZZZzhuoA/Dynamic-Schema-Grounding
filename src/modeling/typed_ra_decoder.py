@@ -91,6 +91,10 @@ class TypedRAPointerDecoder(nn.Module):
         join_edge_index,
         teacher_step=None,
         forced_action=None,
+        inference_table_count=None,
+        inference_column_count=None,
+        inference_value_route_count=None,
+        inference_operator_count=None,
         plan_hidden=None,
     ):
         if teacher_step is not None and forced_action is not None:
@@ -134,21 +138,47 @@ class TypedRAPointerDecoder(nn.Module):
 
         if teacher_step is None:
             selected_ids = []
-            if ACTIONS[action_id] == "SCAN" and (node_type_ids == 0).any():
-                selected_ids = [int(table_logits.argmax().item())]
-            elif ACTIONS[action_id] in {"JOIN", "FILTER", "AGGREGATE", "HAVING_FILTER", "SORT", "PROJECT"}:
-                if (node_type_ids == 1).any():
-                    selected_ids = [int(column_logits.argmax().item())]
+            action_name = ACTIONS[action_id]
+
+            def typed_topk(logits, mask, requested, default):
+                count = default if requested is None else max(int(requested), 0)
+                valid_ids = torch.nonzero(mask, as_tuple=False).flatten()
+                if count <= 0 or not len(valid_ids):
+                    return []
+                count = min(count, len(valid_ids))
+                return valid_ids[torch.topk(logits[valid_ids], count).indices].tolist()
+
+            selected_ids += typed_topk(
+                table_logits, node_type_ids == 0, inference_table_count,
+                1 if action_name == "SCAN" else 0,
+            )
+            selected_ids += typed_topk(
+                column_logits, node_type_ids == 1, inference_column_count,
+                1 if action_name in {
+                    "JOIN", "FILTER", "AGGREGATE", "HAVING_FILTER", "SORT", "PROJECT"
+                } else 0,
+            )
             route_ids = []
             operator_ids = []
-            action_name = ACTIONS[action_id]
-            if action_name in {"FILTER", "HAVING_FILTER", "LIMIT"}:
-                route_ids = [int(value_route_logits.argmax().item())]
-            if action_name in {
+            route_default = 1 if action_name in {"FILTER", "HAVING_FILTER", "LIMIT"} else 0
+            route_count = route_default if inference_value_route_count is None else max(
+                int(inference_value_route_count), 0
+            )
+            if route_count:
+                route_ids = torch.topk(
+                    value_route_logits, min(route_count, value_route_logits.numel())
+                ).indices.tolist()
+            operator_default = 1 if action_name in {
                 "JOIN", "FILTER", "AGGREGATE", "HAVING_FILTER",
                 "SORT", "LIMIT", "PROJECT",
-            }:
-                operator_ids = [int(operator_logits.argmax().item())]
+            } else 0
+            operator_count = operator_default if inference_operator_count is None else max(
+                int(inference_operator_count), 0
+            )
+            if operator_count:
+                operator_ids = torch.topk(
+                    operator_logits, min(operator_count, operator_logits.numel())
+                ).indices.tolist()
         else:
             selected_ids = list(teacher_step.get("table_pointer_ids", []))
             selected_ids += list(teacher_step.get("column_pointer_ids", []))

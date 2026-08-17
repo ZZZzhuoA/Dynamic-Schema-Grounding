@@ -20,6 +20,8 @@ class Stage14TypedSchemaToolTest(unittest.TestCase):
         self.assertEqual(source, "oracle_action_skeleton_diagnostic")
         self.assertEqual([row["action"] for row in requests], ["FILTER", "STOP"])
         self.assertNotIn("column_pointer_ids", requests[0])
+        self.assertEqual(requests[0]["column_cardinality"], 1)
+        self.assertEqual(requests[0]["operator_cardinality"], 1)
 
     def test_constraint_assembly_adds_owner_and_fk_path(self):
         from src.grounding.stage14_typed_schema_tool import assemble_tool_result
@@ -38,7 +40,8 @@ class Stage14TypedSchemaToolTest(unittest.TestCase):
         steps = [
             {
                 "request": {
-                    "request_id": "project", "action": "PROJECT", "cardinality": 1,
+                    "request_id": "project", "action": "PROJECT",
+                    "table_cardinality": 0, "column_cardinality": 1,
                     "value_surface": None,
                 },
                 "table_candidates": [],
@@ -50,7 +53,8 @@ class Stage14TypedSchemaToolTest(unittest.TestCase):
             },
             {
                 "request": {
-                    "request_id": "filter", "action": "FILTER", "cardinality": 1,
+                    "request_id": "filter", "action": "FILTER",
+                    "table_cardinality": 0, "column_cardinality": 1,
                     "value_surface": "Alice",
                 },
                 "table_candidates": [],
@@ -80,7 +84,8 @@ class Stage14TypedSchemaToolTest(unittest.TestCase):
             [],
             [{
                 "request": {
-                    "request_id": "filter", "action": "FILTER", "cardinality": 1,
+                    "request_id": "filter", "action": "FILTER",
+                    "table_cardinality": 0, "column_cardinality": 1,
                     "value_surface": value,
                 },
                 "table_candidates": [], "column_candidates": [],

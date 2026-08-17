@@ -58,6 +58,26 @@ The first experiment deliberately uses the gold action names but strips all gold
 operators, value routes, and values before RGTA inference. This isolates the schema tool from the
 future LLM planner.
 
+### Fix1 after the first 100-example diagnostic
+
+The first run produced high table/FK recall but zero assembled complete coverage. This exposed an
+interface error rather than a valid model conclusion: stripping gold pointer IDs also discarded the
+number of typed slots required by each action, so the assembler selected exactly one schema item for
+every action. Fix1 retains only plan arities:
+
+```text
+table_cardinality
+column_cardinality
+join_edge_cardinality
+operator_cardinality
+value_route_cardinality
+```
+
+It still removes every gold ID, edge, operator, route, and literal. Predicted recurrent transitions
+and constrained assembly now consume the same typed arities. The evaluator also reports missing
+per-action target types as `null` rather than a misleading recall of `1.0`, and adds decision-step
+and semantic-step complete rates that exclude STOP or both SCAN/STOP respectively.
+
 ```bash
 CUDA_VISIBLE_DEVICES=0 python src/grounding/stage14_typed_schema_tool.py \
   --graph-checkpoint experiments/stage13b_typed_ra_decoder_rgta_seed42/typed_ra_decoder.pt \
@@ -66,7 +86,7 @@ CUDA_VISIBLE_DEVICES=0 python src/grounding/stage14_typed_schema_tool.py \
   --plan-file experiments/stage13b_clean_typed_trajectories/dev_trajectories.jsonl \
   --embedding-cache-dir experiments/stage13b_embedding_cache_typefix1_qwen3_06b \
   --split dev \
-  --output-file experiments/stage14a_typed_schema_tool/oracle_action_limit100.jsonl \
+  --output-file experiments/stage14a_typed_schema_tool/oracle_action_arity_fix1_limit100.jsonl \
   --limit 100 \
   --table-top-k 3 \
   --column-top-k 5 \
@@ -81,9 +101,9 @@ Evaluate the tool without invoking an LLM:
 
 ```bash
 python src/evaluation/stage14_evaluate_typed_schema_tool.py \
-  --tool-output experiments/stage14a_typed_schema_tool/oracle_action_limit100.jsonl \
+  --tool-output experiments/stage14a_typed_schema_tool/oracle_action_arity_fix1_limit100.jsonl \
   --target-trajectories experiments/stage13b_clean_typed_trajectories/dev_trajectories.jsonl \
-  --output-dir experiments/stage14a_typed_schema_tool/evaluation_limit100
+  --output-dir experiments/stage14a_typed_schema_tool/evaluation_arity_fix1_limit100
 ```
 
 If the 100-example run is structurally valid, remove `--limit 100` and write to a new full-dev file.
@@ -99,11 +119,11 @@ A later LLM planner should produce JSONL without schema answers:
   "record_index": 0,
   "plan_source": "llm_typed_plan",
   "requests": [
-    {"request_id": "scan_0", "action": "SCAN"},
-    {"request_id": "filter_0", "action": "FILTER", "value_surface": "Alameda"},
-    {"request_id": "project_0", "action": "PROJECT", "cardinality": 2},
-    {"request_id": "sort_0", "action": "SORT"},
-    {"request_id": "limit_0", "action": "LIMIT", "value_surface": "1"},
+    {"request_id": "scan_0", "action": "SCAN", "table_cardinality": 1},
+    {"request_id": "filter_0", "action": "FILTER", "column_cardinality": 1, "operator_cardinality": 1, "value_route_cardinality": 1, "value_surface": "Alameda"},
+    {"request_id": "project_0", "action": "PROJECT", "column_cardinality": 2},
+    {"request_id": "sort_0", "action": "SORT", "column_cardinality": 1, "operator_cardinality": 1},
+    {"request_id": "limit_0", "action": "LIMIT", "value_route_cardinality": 1, "value_surface": "1"},
     {"request_id": "stop", "action": "STOP"}
   ]
 }
@@ -139,4 +159,3 @@ Proceed to an LLM planner only if the oracle-action diagnostic shows:
 
 If predicted-state rollout is much worse, the next fix belongs in the typed pointer transition
 (scheduled sampling or non-recurrent per-request inference), not in the LLM hidden states.
-
