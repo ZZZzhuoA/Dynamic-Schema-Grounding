@@ -8,11 +8,46 @@ class Stage13CStaticGraphAdapterTest(unittest.TestCase):
             from src.modeling.static_graph_adapter import GraphMemoryProjector
         except ImportError:
             self.skipTest("PyTorch is unavailable")
-        projector = GraphMemoryProjector(graph_dim=8, llm_dim=16)
+        projector = GraphMemoryProjector(
+            graph_dim=8, semantic_dim=12, query_dim=12, llm_dim=16
+        )
         memory = torch.randn(4, 8, dtype=torch.bfloat16)
-        projected = projector(memory)
-        self.assertEqual(projected.dtype, projector.norm.weight.dtype)
+        semantics = torch.randn(4, 12, dtype=torch.bfloat16)
+        query = torch.randn(1, 12, dtype=torch.bfloat16)
+        projected = projector(memory, semantics, query)
+        self.assertEqual(projected.dtype, projector.semantic_norm.weight.dtype)
         self.assertEqual(tuple(projected.shape), (4, 16))
+
+    def test_semantic_path_survives_graph_corruption(self):
+        try:
+            import torch
+            from src.modeling.static_graph_adapter import GraphMemoryProjector
+        except ImportError:
+            self.skipTest("PyTorch is unavailable")
+        torch.manual_seed(17)
+        projector = GraphMemoryProjector(
+            graph_dim=8, semantic_dim=12, query_dim=12, llm_dim=16
+        )
+        semantics = torch.randn(4, 12)
+        query = torch.randn(1, 12)
+        first = projector(torch.randn(4, 8), semantics, query, return_components=True)
+        second = projector(torch.randn(4, 8), semantics, query, return_components=True)
+        self.assertTrue(torch.allclose(first["semantic_memory"], second["semantic_memory"]))
+        self.assertFalse(torch.allclose(first["memory"], second["memory"]))
+
+    def test_cross_adapter_uses_fp32_parameters_and_bounded_context(self):
+        try:
+            import torch
+            from src.modeling.static_graph_adapter import StaticGraphCrossAdapter
+        except ImportError:
+            self.skipTest("PyTorch is unavailable")
+        adapter = StaticGraphCrossAdapter(llm_dim=16, graph_dim=8, num_heads=4)
+        hidden = torch.randn(1, 3, 16, dtype=torch.bfloat16)
+        memory = torch.randn(5, 8)
+        output = adapter(hidden, memory)
+        self.assertEqual(output.dtype, torch.bfloat16)
+        self.assertEqual(adapter.norm.weight.dtype, torch.float32)
+        self.assertLess(adapter.last_diagnostics["mean_update_ratio"], 0.1)
 
     def test_runtime_accepts_legacy_index_cache(self):
         try:

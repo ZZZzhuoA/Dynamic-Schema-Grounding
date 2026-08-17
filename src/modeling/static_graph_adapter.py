@@ -78,7 +78,8 @@ class StaticGraphCrossAdapter(nn.Module):
         graph_dim,
         num_heads=8,
         dropout=0.0,
-        residual_scale_init=0.1,
+        residual_scale_init=0.02,
+        gate_bias_init=-2.0,
     ):
         super().__init__()
         if llm_dim % num_heads:
@@ -91,7 +92,9 @@ class StaticGraphCrossAdapter(nn.Module):
         self.key = nn.Linear(graph_dim, llm_dim, bias=False)
         self.value = nn.Linear(graph_dim, llm_dim, bias=False)
         self.output = nn.Linear(llm_dim, llm_dim, bias=False)
+        self.context_norm = nn.LayerNorm(llm_dim)
         self.gate = nn.Linear(llm_dim * 2, 1)
+        nn.init.constant_(self.gate.bias, float(gate_bias_init))
         self.dropout = nn.Dropout(dropout)
         initial = max(min(float(residual_scale_init), 0.999), -0.999)
         self.residual_scale = nn.Parameter(torch.tensor(math.atanh(initial)))
@@ -100,7 +103,10 @@ class StaticGraphCrossAdapter(nn.Module):
     def forward(self, hidden, graph_memory):
         if hidden.shape[0] != 1:
             raise ValueError("Static graph adapters currently require batch_size=1")
-        memory = graph_memory.to(hidden.device, hidden.dtype)
+        output_dtype = hidden.dtype
+        working_dtype = self.norm.weight.dtype
+        hidden = hidden.to(dtype=working_dtype)
+        memory = graph_memory.to(hidden.device, working_dtype)
         batch, length, _ = hidden.shape
         normalized = self.norm(hidden)
         query = self.query(normalized).view(
@@ -112,38 +118,80 @@ class StaticGraphCrossAdapter(nn.Module):
         attention = torch.softmax(scores.float(), dim=-1).to(query.dtype)
         context = torch.einsum("bhtn,hnd->bhtd", attention, value)
         context = context.transpose(1, 2).contiguous().view(batch, length, self.llm_dim)
-        context = self.output(context)
+        context = self.context_norm(self.output(context))
         gate = torch.sigmoid(self.gate(torch.cat([normalized, context], dim=-1)))
         update = torch.tanh(self.residual_scale) * gate * context
-        result = hidden + self.dropout(update)
+        result = (hidden + self.dropout(update)).to(dtype=output_dtype)
+        hidden_norm = hidden.detach().float().norm(dim=-1).mean().clamp_min(1e-8)
         self.last_diagnostics = {
             "mean_gate": float(gate.detach().mean().cpu()),
             "mean_attention_max": float(attention.detach().amax(-1).mean().cpu()),
             "mean_update_norm": float(update.detach().float().norm(dim=-1).mean().cpu()),
+            "mean_update_ratio": float(
+                (update.detach().float().norm(dim=-1).mean() / hidden_norm).cpu()
+            ),
             "residual_scale": float(torch.tanh(self.residual_scale.detach()).cpu()),
         }
         return result
 
 
 class GraphMemoryProjector(nn.Module):
-    """Map frozen GNN node states into the frozen LLM embedding space."""
+    """Preserve node semantics while adding a gated graph-structure residual."""
 
-    def __init__(self, graph_dim, llm_dim, dropout=0.0):
+    def __init__(
+        self, graph_dim, llm_dim, semantic_dim=None, query_dim=None,
+        dropout=0.0, structure_scale_init=0.1,
+    ):
         super().__init__()
-        self.norm = nn.LayerNorm(graph_dim)
-        self.projection = nn.Linear(graph_dim, llm_dim, bias=False)
+        semantic_dim = int(semantic_dim or graph_dim)
+        query_dim = int(query_dim or semantic_dim)
+        self.semantic_norm = nn.LayerNorm(semantic_dim)
+        self.semantic_projection = nn.Linear(semantic_dim, llm_dim, bias=False)
+        self.graph_norm = nn.LayerNorm(graph_dim)
+        self.graph_projection = nn.Linear(graph_dim, llm_dim, bias=False)
+        self.query_projection = nn.Linear(query_dim, graph_dim, bias=False)
+        self.structure_gate = nn.Linear(graph_dim * 2, 1)
+        nn.init.constant_(self.structure_gate.bias, -2.0)
+        initial = max(min(float(structure_scale_init), 0.999), -0.999)
+        self.structure_scale = nn.Parameter(torch.tensor(math.atanh(initial)))
         self.output_norm = nn.LayerNorm(llm_dim)
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, graph_memory):
+    def forward(self, graph_memory, semantic_memory=None, query_embedding=None, return_components=False):
         # Frozen graph encoders commonly emit FP32 while the code LLM runs in
         # BF16.  Keep the projector's own precision policy explicit instead of
         # relying on LayerNorm to accept mixed input/parameter dtypes.
         graph_memory = graph_memory.to(
-            device=self.norm.weight.device, dtype=self.norm.weight.dtype
+            device=self.graph_norm.weight.device, dtype=self.graph_norm.weight.dtype
         )
-        projected = self.projection(self.norm(graph_memory))
-        return self.output_norm(self.dropout(projected))
+        if semantic_memory is None:
+            semantic_memory = graph_memory
+        semantic_memory = semantic_memory.to(
+            device=self.semantic_norm.weight.device, dtype=self.semantic_norm.weight.dtype
+        )
+        if query_embedding is None:
+            query_embedding = semantic_memory.new_zeros((1, self.query_projection.in_features))
+        query_embedding = query_embedding.to(
+            device=self.query_projection.weight.device, dtype=self.query_projection.weight.dtype
+        )
+        graph_state = self.graph_norm(graph_memory)
+        query_state = self.query_projection(query_embedding).mean(0)
+        query_matrix = query_state.unsqueeze(0).expand_as(graph_state)
+        structure_gate = torch.sigmoid(
+            self.structure_gate(torch.cat([graph_state, query_matrix], dim=-1))
+        )
+        semantic = self.semantic_projection(self.semantic_norm(semantic_memory))
+        structure = self.graph_projection(graph_state)
+        structure = torch.tanh(self.structure_scale) * structure_gate * structure
+        memory = self.output_norm(self.dropout(semantic + structure))
+        if return_components:
+            return {
+                "memory": memory,
+                "semantic_memory": self.output_norm(semantic),
+                "structure_memory": structure,
+                "structure_gate": structure_gate,
+            }
+        return memory
 
 
 class StaticGraphConditionedCausalLM(nn.Module):
@@ -157,7 +205,8 @@ class StaticGraphConditionedCausalLM(nn.Module):
         layer_fractions=(0.25, 0.5, 0.75, 1.0),
         num_heads=8,
         dropout=0.0,
-        residual_scale_init=0.1,
+        residual_scale_init=0.02,
+        gate_bias_init=-2.0,
     ):
         super().__init__()
         self.base_model = base_model
@@ -178,7 +227,8 @@ class StaticGraphConditionedCausalLM(nn.Module):
                 num_heads=num_heads,
                 dropout=dropout,
                 residual_scale_init=residual_scale_init,
-            ).to(device=parameter.device, dtype=parameter.dtype)
+                gate_bias_init=gate_bias_init,
+            ).to(device=parameter.device)
             self.adapters[str(index)] = adapter
             self._handles.append(layer.register_forward_hook(self._make_hook(index)))
 

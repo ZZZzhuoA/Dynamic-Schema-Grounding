@@ -77,20 +77,39 @@ def graph_tensors(example, cache, relation_to_id, device):
     return dense, query, node_types, edge_index, edge_type, nodes
 
 
-def corrupt_destinations(edge_index, node_count):
+def corrupt_destinations(edge_index, node_count, edge_type=None, relation_ids=None):
     if edge_index.numel() == 0:
         return edge_index
     corrupted = edge_index.clone()
-    corrupted[1] = torch.roll(corrupted[1], shifts=1)
-    if torch.equal(corrupted[1], edge_index[1]):
-        corrupted[1] = (corrupted[1] + 1) % max(node_count, 1)
+    if edge_type is not None and relation_ids:
+        mask = torch.zeros_like(edge_type, dtype=torch.bool)
+        for relation_id in relation_ids:
+            mask |= edge_type.eq(int(relation_id))
+    else:
+        mask = torch.ones(edge_index.shape[1], dtype=torch.bool, device=edge_index.device)
+    selected = corrupted[1, mask]
+    if not selected.numel():
+        return corrupted
+    replacement = torch.roll(selected, shifts=1)
+    if torch.equal(replacement, selected):
+        replacement = (replacement + 1) % max(node_count, 1)
+    corrupted[1, mask] = replacement
     return corrupted
 
 
-def frozen_graph_memory(model, tensors, corrupt=False):
+def frozen_graph_memory(model, tensors, corrupt=False, relation_to_id=None):
     dense, query, node_types, edge_index, edge_type, _ = tensors
     if corrupt:
-        edge_index = corrupt_destinations(edge_index, dense.shape[0])
+        structural_ids = []
+        if relation_to_id:
+            structural_ids = [
+                relation_to_id[name]
+                for name in ("foreign_key_forward", "foreign_key_backward")
+                if name in relation_to_id
+            ]
+        edge_index = corrupt_destinations(
+            edge_index, dense.shape[0], edge_type, structural_ids
+        )
     with torch.no_grad():
         memory, _ = model.encode_static_memory(
             dense, query, node_types, edge_index, edge_type
