@@ -1,0 +1,92 @@
+import unittest
+
+
+class Stage13CStaticGraphAdapterTest(unittest.TestCase):
+    def test_graph_encoder_changes_when_topology_changes(self):
+        try:
+            import torch
+            from src.modeling.static_graph_adapter import StaticSchemaGraphEncoder
+        except ImportError:
+            self.skipTest("PyTorch is unavailable")
+        torch.manual_seed(7)
+        encoder = StaticSchemaGraphEncoder(
+            dense_dim=8, hidden_dim=16, relation_count=2, num_layers=2, dropout=0.0
+        )
+        dense = torch.randn(4, 8)
+        query = torch.randn(1, 8)
+        node_types = torch.tensor([0, 1, 0, 1])
+        edge_type = torch.tensor([0, 1, 0, 1])
+        first_edges = torch.tensor([[0, 1, 2, 3], [1, 0, 3, 2]])
+        second_edges = torch.tensor([[0, 1, 2, 3], [2, 3, 0, 1]])
+        first, _ = encoder(dense, query, node_types, first_edges, edge_type)
+        second, _ = encoder(dense, query, node_types, second_edges, edge_type)
+        self.assertFalse(torch.allclose(first, second))
+        loss = encoder.structure_loss(first, first_edges, edge_type)
+        self.assertTrue(torch.isfinite(loss))
+        loss.backward()
+        self.assertIsNotNone(encoder.structure_src.weight.grad)
+
+    def test_static_adapter_changes_hidden_and_receives_gradients(self):
+        try:
+            import torch
+            from src.modeling.static_graph_adapter import StaticGraphCrossAdapter
+        except ImportError:
+            self.skipTest("PyTorch is unavailable")
+        torch.manual_seed(11)
+        adapter = StaticGraphCrossAdapter(
+            llm_dim=16, graph_dim=8, num_heads=4, residual_scale_init=0.1
+        )
+        hidden = torch.randn(1, 5, 16)
+        memory = torch.randn(6, 8, requires_grad=True)
+        output = adapter(hidden, memory)
+        self.assertFalse(torch.equal(hidden, output))
+        output.sum().backward()
+        self.assertIsNotNone(memory.grad)
+        self.assertIsNotNone(adapter.residual_scale.grad)
+        self.assertGreater(adapter.last_diagnostics["mean_update_norm"], 0.0)
+
+    def test_wrapper_has_one_fixed_memory_for_all_tokens(self):
+        try:
+            import torch
+            import torch.nn as nn
+            from src.modeling.static_graph_adapter import StaticGraphConditionedCausalLM
+        except ImportError:
+            self.skipTest("PyTorch is unavailable")
+
+        class Block(nn.Module):
+            def __init__(self):
+                super().__init__(); self.linear = nn.Linear(16, 16)
+            def forward(self, hidden):
+                return self.linear(hidden)
+
+        class Backbone(nn.Module):
+            def __init__(self):
+                super().__init__(); self.layers = nn.ModuleList([Block(), Block()])
+
+        class FakeLM(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.config = type("Config", (), {"hidden_size": 16})()
+                self.model = Backbone()
+            def forward(self, hidden):
+                for layer in self.model.layers:
+                    hidden = layer(hidden)
+                return hidden
+
+        torch.manual_seed(13)
+        base = FakeLM()
+        hidden = torch.randn(1, 4, 16)
+        baseline = base(hidden).detach()
+        wrapper = StaticGraphConditionedCausalLM(
+            base, graph_dim=8, layer_indices=[1], num_heads=4
+        )
+        wrapper.freeze_base_model()
+        wrapper.set_graph_memory(torch.randn(5, 8))
+        conditioned = wrapper(hidden)
+        self.assertFalse(torch.equal(baseline, conditioned))
+        self.assertFalse(base.model.layers[0].linear.weight.requires_grad)
+        self.assertTrue(wrapper.adapters["1"].query.weight.requires_grad)
+
+
+if __name__ == "__main__":
+    unittest.main()

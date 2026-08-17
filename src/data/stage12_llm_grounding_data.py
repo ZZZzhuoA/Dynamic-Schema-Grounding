@@ -27,7 +27,7 @@ VALUE_PATTERN = re.compile(
 )
 
 
-def full_schema_text(graph_example):
+def full_schema_text(graph_example, include_foreign_keys=True):
     inputs = graph_example.get("inference_inputs", graph_example)
     nodes = inputs.get("schema_nodes", [])
     by_local = {int(node.get("id", index)): node for index, node in enumerate(nodes)}
@@ -55,20 +55,20 @@ def full_schema_text(graph_example):
             continue
         left, right = str(src.get("name")), str(dst.get("name"))
         foreign_keys.add(tuple(sorted((left, right))))
-    if foreign_keys:
+    if include_foreign_keys and foreign_keys:
         lines.append("Foreign keys:")
         for left, right in sorted(foreign_keys):
             lines.append(f"- {left} = {right}")
     return "\n".join(lines).strip()
 
 
-def build_full_schema_prompt(trajectory, graph_example):
+def build_full_schema_prompt(trajectory, graph_example, include_foreign_keys=True):
     evidence = trajectory.get("evidence") or ""
     evidence_block = f"\nEvidence:\n{evidence}\n" if evidence else ""
     return (
         "Given the complete database schema and question, generate one valid SQLite SQL query.\n"
         "Use exact table and column names. Return SQL only.\n\n"
-        f"Database schema:\n{full_schema_text(graph_example)}\n\n"
+        f"Database schema:\n{full_schema_text(graph_example, include_foreign_keys=include_foreign_keys)}\n\n"
         f"Question:\n{trajectory.get('question', '')}\n"
         f"{evidence_block}\nReturn only the SQL query."
     )

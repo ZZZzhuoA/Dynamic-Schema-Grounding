@@ -67,6 +67,15 @@ class TypedRAPointerDecoder(nn.Module):
             nodes = layer(nodes, edge_index, edge_type, state)
         return nodes
 
+    def encode_static_memory(
+        self, dense_nodes, query_embedding, node_type_ids, edge_index, edge_type
+    ):
+        """Expose the pretrained query-conditioned graph memory without decoding actions."""
+        base_nodes, query, state = self.initialize(
+            dense_nodes, query_embedding, node_type_ids
+        )
+        return self._encode_graph(base_nodes, state, edge_index, edge_type), query
+
     @staticmethod
     def _masked(logits, mask):
         return logits.masked_fill(~mask, torch.finfo(logits.dtype).min)

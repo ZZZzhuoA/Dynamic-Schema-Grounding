@@ -36,6 +36,7 @@ Next SQL Token / Clause
 - [09_experiment_design_tables.md](./09_experiment_design_tables.md)：实验设计总表、消融矩阵、干预实验表与预期分析表。
 - [10_staged_experiment_roadmap.md](./10_staged_experiment_roadmap.md)：按阶段推进实验的执行路线图，每阶段包含准备材料、流程、验收标准和进入下一阶段条件。
 - [11_corrected_training_data_pipeline.md](./11_corrected_training_data_pipeline.md)：局部修正训练集的安全合并、审计与监督重建流程。
+- [28_stage13c_static_graph_adapter_alignment.md](./28_stage13c_static_graph_adapter_alignment.md)：冻结 RGTA 与冻结 Code LLM 之间的静态 Graph Adapter 对齐实验、训练命令和验收标准。
 
 ## 一句话版本
 
