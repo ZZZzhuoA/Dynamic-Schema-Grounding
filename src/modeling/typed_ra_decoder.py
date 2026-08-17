@@ -90,15 +90,23 @@ class TypedRAPointerDecoder(nn.Module):
         edge_type,
         join_edge_index,
         teacher_step=None,
+        forced_action=None,
         plan_hidden=None,
     ):
+        if teacher_step is not None and forced_action is not None:
+            raise ValueError("teacher_step and forced_action are mutually exclusive")
         if plan_hidden is not None:
             if self.plan_hidden is None:
                 raise ValueError("plan_hidden was provided but plan_hidden_dim=0")
             state = self.state_norm(state + self.plan_hidden(plan_hidden))
         nodes = self._encode_graph(base_nodes, state, edge_index, edge_type)
         action_logits = self.action_head(torch.cat([state, query], dim=-1))
-        if teacher_step is None:
+        if forced_action is not None:
+            if forced_action not in self.action_to_id:
+                raise ValueError(f"Unknown forced action: {forced_action}")
+            action_id = self.action_to_id[forced_action]
+            action_tensor = torch.tensor(action_id, dtype=torch.long, device=state.device)
+        elif teacher_step is None:
             action_id = int(action_logits.argmax().item())
             action_tensor = torch.tensor(action_id, dtype=torch.long, device=state.device)
         else:
@@ -133,6 +141,14 @@ class TypedRAPointerDecoder(nn.Module):
                     selected_ids = [int(column_logits.argmax().item())]
             route_ids = []
             operator_ids = []
+            action_name = ACTIONS[action_id]
+            if action_name in {"FILTER", "HAVING_FILTER", "LIMIT"}:
+                route_ids = [int(value_route_logits.argmax().item())]
+            if action_name in {
+                "JOIN", "FILTER", "AGGREGATE", "HAVING_FILTER",
+                "SORT", "LIMIT", "PROJECT",
+            }:
+                operator_ids = [int(operator_logits.argmax().item())]
         else:
             selected_ids = list(teacher_step.get("table_pointer_ids", []))
             selected_ids += list(teacher_step.get("column_pointer_ids", []))
@@ -167,6 +183,7 @@ class TypedRAPointerDecoder(nn.Module):
             "operator_logits": operator_logits,
             "schema_states": nodes,
             "controller_state": next_state,
+            "forced_action": forced_action,
         }
 
     def forward_trajectory(

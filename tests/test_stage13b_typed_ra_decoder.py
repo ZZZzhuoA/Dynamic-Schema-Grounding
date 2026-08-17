@@ -110,6 +110,34 @@ class Stage13BModelTest(unittest.TestCase):
         outputs[0]["action_logits"].sum().backward()
         self.assertIsNotNone(model.plan_hidden.weight.grad)
 
+    def test_forced_action_uses_predicted_transition_without_teacher_targets(self):
+        if not self.torch_available:
+            self.skipTest("PyTorch is unavailable")
+        import torch
+        from src.modeling.typed_ra_decoder import TypedRAPointerDecoder
+
+        model = TypedRAPointerDecoder(
+            dense_dim=8, hidden_dim=16, relation_count=1, num_layers=1, dropout=0.0
+        )
+        dense = torch.randn(3, 8)
+        query = torch.randn(1, 8)
+        node_types = torch.tensor([0, 1, 1])
+        edges = torch.tensor([[0, 0, 1, 2], [0, 1, 1, 2]])
+        edge_types = torch.zeros(4, dtype=torch.long)
+        base_nodes, query_state, state = model.initialize(dense, query, node_types)
+        output = model.step(
+            base_nodes, query_state, state, node_types, edges, edge_types,
+            torch.empty((2, 0), dtype=torch.long), forced_action="FILTER",
+        )
+        self.assertEqual(output["forced_action"], "FILTER")
+        self.assertEqual(output["controller_state"].shape, state.shape)
+        with self.assertRaises(ValueError):
+            model.step(
+                base_nodes, query_state, state, node_types, edges, edge_types,
+                torch.empty((2, 0), dtype=torch.long),
+                teacher_step={"action": "FILTER"}, forced_action="FILTER",
+            )
+
 
 if __name__ == "__main__":
     unittest.main()
