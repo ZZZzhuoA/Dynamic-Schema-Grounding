@@ -61,6 +61,7 @@ Next SQL Token / Clause
 - [28_stage13c_static_graph_adapter_alignment.md](./28_stage13c_static_graph_adapter_alignment.md)：冻结 RGTA 与冻结 Code LLM 之间的静态 Graph Adapter 对齐实验、训练命令和验收标准。
 - [29_research_path_retrospective.md](./29_research_path_retrospective.md)：从 Stage 0 到 Stage 13C 的完整研究复盘、创新分级、负结果和下一步决策门。
 - [30_stage14_typed_graph_tool_interface.md](./30_stage14_typed_graph_tool_interface.md)：显式 Typed RGTA Schema Tool、约束组装、诊断协议与服务器命令。
+- [31_stage14b_semantic_slot_graph_binder.md](./31_stage14b_semantic_slot_graph_binder.md)：语义槽位条件化 RGTA、表—列层次先验、同表 hard negatives，以及 correct/action-only/shuffled 因果实验。
 
 ## 一句话版本
 
