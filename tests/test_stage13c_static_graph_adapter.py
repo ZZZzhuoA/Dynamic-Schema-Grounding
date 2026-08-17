@@ -2,6 +2,19 @@ import unittest
 
 
 class Stage13CStaticGraphAdapterTest(unittest.TestCase):
+    def test_sql_suffix_roles_follow_causal_logit_slice(self):
+        try:
+            import torch
+            from src.training.stage13c_train_static_graph_adapter import aligned_target_roles
+        except ImportError:
+            self.skipTest("PyTorch is unavailable")
+        # Full sequence has five prompt roles followed by three SQL roles. A
+        # SQL-only forward keeps one preceding logit plus the three SQL logits,
+        # so causal shifting must recover exactly the final three roles.
+        roles = torch.tensor([[0, 0, 0, 0, 0, 1, 2, 3]])
+        nll = torch.zeros((1, 3))
+        self.assertEqual(aligned_target_roles(roles, nll).tolist(), [[1, 2, 3]])
+
     def test_memory_projector_normalizes_input_dtype(self):
         try:
             import torch

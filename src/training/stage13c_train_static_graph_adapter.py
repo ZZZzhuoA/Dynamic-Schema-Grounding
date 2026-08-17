@@ -89,6 +89,16 @@ def sql_only_forward(wrapper, input_ids, labels):
     )
 
 
+def aligned_target_roles(token_roles, nll):
+    """Apply the same suffix selection and causal shift used by ``causal_nll``."""
+    required = nll.shape[1] + 1
+    if token_roles.shape[1] < required:
+        raise ValueError("Token-role sequence is shorter than the supervised logits")
+    if token_roles.shape[1] != required:
+        token_roles = token_roles[:, -required:]
+    return token_roles[:, 1:]
+
+
 def node_target_embeddings(tokenizer, embedding_layer, nodes, device, torch):
     targets = []
     embedding_device = embedding_layer.weight.device
@@ -121,7 +131,7 @@ def generation_objective(
     normal_nll, negative_nll, valid, token_roles, args, torch,
     use_topology_counterfactual=True,
 ):
-    roles = token_roles[:, 1:].to(normal_nll.device)
+    roles = aligned_target_roles(token_roles, normal_nll).to(normal_nll.device)
     weighted_ce = weighted_token_ce(normal_nll, valid, roles, args, torch)
     schema_mask = valid & roles.eq(1)
     if use_topology_counterfactual and schema_mask.any():
@@ -172,7 +182,7 @@ def evaluate_identity(examples, tokenizer, wrapper, args, torch):
             input_ids, labels, token_roles, _ = encoded
             output = sql_only_forward(wrapper, input_ids, labels)
             nll, valid = causal_nll(output.logits, labels, torch)
-            roles = token_roles[:, 1:].to(nll.device)
+            roles = aligned_target_roles(token_roles, nll).to(nll.device)
             losses.append(float(weighted_token_ce(nll, valid, roles, args, torch).cpu()))
             used += 1
     return {
