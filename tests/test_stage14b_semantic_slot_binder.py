@@ -26,6 +26,8 @@ class Stage14BSemanticSlotDataTest(unittest.TestCase):
         result = build_row(row)
         request = result["inference_inputs"]["requests"][0]
         self.assertIn("Continuation School", request["slot_embedding_text"])
+        self.assertNotIn("question:", request["slot_embedding_text"])
+        self.assertEqual(request["value_embedding_text"], "literal values: Continuation School")
         self.assertNotIn("column_pointer_ids", str(result["inference_inputs"]))
         self.assertNotIn("Educational Option Type", request["slot_embedding_text"])
         self.assertEqual(result["training_targets"]["slot_targets"][0]["column_pointer_ids"], [7])
@@ -42,7 +44,11 @@ class Stage14BSemanticSlotDataTest(unittest.TestCase):
             "step_index": 1, "action": "FILTER", "column_pointer_ids": [2],
             "value_targets": [{"kind": "text", "raw_sql_literal": "Alameda", "source": "question"}],
         }, inputs)
-        self.assertNotEqual(left["slot_embedding_text"], right["slot_embedding_text"])
+        self.assertNotEqual(left["value_embedding_text"], right["value_embedding_text"])
+        self.assertNotEqual(
+            (left["slot_embedding_text"], left["value_embedding_text"]),
+            (right["slot_embedding_text"], right["value_embedding_text"]),
+        )
 
 
 class Stage14BSemanticSlotModelTest(unittest.TestCase):
@@ -149,13 +155,20 @@ class Stage14BSemanticSlotModelTest(unittest.TestCase):
             "by_index": {0: {"query_embedding_index": 0, "node_count": 3, "node_embedding_start": 0}},
         }
         slot_cache = {
-            "embeddings": np.random.randn(1, 8).astype("float32"),
-            "by_key": {(0, 0): 0},
+            "focus": np.random.randn(1, 8).astype("float32"),
+            "value": np.zeros((1, 8), dtype="float32"),
+            "by_key": {(0, 0): {
+                "embedding_index": 0, "focus_embedding_index": 0,
+                "value_embedding_index": 0, "has_value": False,
+            }},
+            "by_action": {"PROJECT": [(0, 0)]},
         }
         args = SimpleNamespace(
             pointer_pos_weight=5.0, pointer_loss_weight=1.0,
             listwise_weight=0.3, owner_consistency_weight=0.2,
             hard_negative_weight=0.2, hard_negative_margin=0.5,
+            contrastive_weight=0.3, contrastive_temperature=0.1,
+            semantic_dropout=0.2,
             join_loss_weight=1.0, value_route_loss_weight=0.5,
             operator_loss_weight=0.75, table_top_k=2, column_top_k=2,
             join_top_k=1, max_grad_norm=1.0,
@@ -188,6 +201,17 @@ class Stage14BSemanticSlotModelTest(unittest.TestCase):
         self.assertIn("semantic_scale", trainable)
         self.assertFalse(model.graph_layers[0].q.weight.requires_grad)
         self.assertFalse(model.column_key.weight.requires_grad)
+        self.assertTrue(model.value_input.weight.requires_grad)
+
+    def test_same_action_shuffle_uses_another_record(self):
+        from src.training.stage14b_train_semantic_slot_binder import same_action_donor_key
+
+        cache = {
+            "by_action": {
+                "FILTER": [(0, 1), (0, 2), (4, 1), (9, 3)],
+            }
+        }
+        self.assertEqual(same_action_donor_key(cache, 0, 1, "FILTER"), (4, 1))
 
 
 if __name__ == "__main__":

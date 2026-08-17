@@ -38,6 +38,10 @@ ACTION_CUES = {
     "STOP": (),
 }
 
+EXPECTED_VALUE_TYPES = [
+    "any", "numeric", "temporal", "categorical", "numeric_or_countable", "integer",
+]
+
 
 def read_jsonl(path):
     with Path(path).open("r", encoding="utf-8") as handle:
@@ -60,7 +64,7 @@ def sentence_fragments(text):
     return [clean_text(part) for part in re.split(r"(?<=[?.!;])\s+|\s+(?:and|but)\s+", text) if clean_text(part)]
 
 
-def local_value_context(question, evidence, value_targets, radius=72):
+def local_value_context(question, evidence, value_targets, radius=48):
     contexts = []
     for target in value_targets:
         surface = clean_text(target.get("raw_sql_literal") or target.get("canonical_value"))
@@ -68,6 +72,13 @@ def local_value_context(question, evidence, value_targets, radius=72):
         if source not in {"question", "evidence"}:
             continue
         text = question if source == "question" else evidence
+        matching_fragments = [
+            fragment for fragment in sentence_fragments(text)
+            if surface and surface.casefold() in fragment.casefold()
+        ]
+        if matching_fragments:
+            contexts.extend(matching_fragments[:1])
+            continue
         start, end = target.get("start"), target.get("end")
         if text and isinstance(start, int) and isinstance(end, int) and 0 <= start < end <= len(text):
             contexts.append(clean_text(text[max(0, start - radius) : min(len(text), end + radius)]))
@@ -135,18 +146,18 @@ def build_slot_request(step, inputs):
         "operator_cardinality": len(step.get("operator_targets", [])),
         "value_route_cardinality": len(step.get("value_routes", [])),
     }
-    parts = [
-        f"action: {action}",
-        f"role: {request['role_description']}",
-        f"semantic focus: {request['semantic_text']}",
-        f"question: {question}",
-    ]
-    if evidence:
-        parts.append(f"evidence: {evidence}")
-    if values:
-        parts.append("literal surfaces: " + "; ".join(values))
-    parts.append(f"expected value type: {request['expected_value_type']}")
-    request["slot_embedding_text"] = " | ".join(parts)
+    # Global question/evidence already have their own query embedding.  Repeating
+    # them here made every slot from one question nearly identical.  Stage 14B
+    # Fix1 embeds only the local semantic field and the value field separately.
+    request["slot_embedding_text"] = (
+        f"semantic focus for {action.casefold()}: {request['semantic_text']}"
+    )
+    request["value_embedding_text"] = (
+        "literal values: " + "; ".join(values) if values else "no literal value"
+    )
+    request["expected_value_type_id"] = EXPECTED_VALUE_TYPES.index(
+        request["expected_value_type"]
+    )
     return request
 
 

@@ -5,6 +5,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from src.data.stage13b_prepare_typed_trajectories import ACTIONS
+from src.data.stage14b_build_semantic_slots import EXPECTED_VALUE_TYPES
 from src.modeling.typed_ra_decoder import TypedRAPointerDecoder
 
 
@@ -22,6 +23,11 @@ class SemanticSlotGraphBinder(TypedRAPointerDecoder):
         hidden_dim = self.hidden_dim
         self.slot_dim = int(slot_dim)
         self.slot_input = nn.Linear(self.slot_dim, hidden_dim, bias=False)
+        self.value_input = nn.Linear(self.slot_dim, hidden_dim, bias=False)
+        self.expected_type_embedding = nn.Embedding(len(EXPECTED_VALUE_TYPES), hidden_dim)
+        self.slot_fusion = nn.Sequential(
+            nn.Linear(hidden_dim * 4, hidden_dim), nn.GELU(), nn.Linear(hidden_dim, hidden_dim),
+        )
         self.slot_gate = nn.Sequential(
             nn.Linear(hidden_dim * 3, hidden_dim), nn.GELU(), nn.Linear(hidden_dim, hidden_dim),
             nn.Sigmoid(),
@@ -45,8 +51,17 @@ class SemanticSlotGraphBinder(TypedRAPointerDecoder):
             "unexpected_keys": list(result.unexpected_keys),
         }
 
-    def condition_state(self, state, query, slot_embedding):
-        slot = self.slot_input(slot_embedding.squeeze(0))
+    def condition_state(
+        self, state, query, focus_embedding, value_embedding,
+        expected_type_id, action_state,
+    ):
+        focus = self.slot_input(focus_embedding.squeeze(0))
+        value = self.value_input(value_embedding.squeeze(0))
+        type_tensor = torch.tensor(
+            int(expected_type_id), dtype=torch.long, device=state.device
+        )
+        expected_type = self.expected_type_embedding(type_tensor)
+        slot = self.slot_fusion(torch.cat([focus, value, expected_type, action_state], dim=-1))
         gate = self.slot_gate(torch.cat([state, query, slot], dim=-1))
         conditioned = self.slot_norm(state + gate * slot)
         return conditioned, slot, gate
@@ -67,22 +82,27 @@ class SemanticSlotGraphBinder(TypedRAPointerDecoder):
         join_edge_index,
         action,
         owner_table_index=None,
+        value_embedding=None,
+        expected_type_id=0,
     ):
         if action not in self.action_to_id:
             raise ValueError(f"Unknown action: {action}")
         base_nodes, query, initial_state = self.initialize(
             dense_nodes, query_embedding, node_type_ids
         )
+        action_id = self.action_to_id[action]
+        action_tensor = torch.tensor(action_id, dtype=torch.long, device=initial_state.device)
+        action_state = self.action_embedding(action_tensor)
+        if value_embedding is None:
+            value_embedding = torch.zeros_like(slot_embedding)
         state, slot_state, slot_gate = self.condition_state(
-            initial_state, query, slot_embedding
+            initial_state, query, slot_embedding, value_embedding,
+            expected_type_id, action_state,
         )
         nodes = self._encode_graph(base_nodes, state, edge_index, edge_type)
-        action_id = self.action_to_id[action]
-        action_tensor = torch.tensor(action_id, dtype=torch.long, device=state.device)
-        action_state = self.action_embedding(action_tensor)
         pointer_query = self.pointer_query(torch.cat([state, action_state], dim=-1))
 
-        similarity = self._dense_similarity(dense_nodes, slot_embedding)
+        similarity = self._dense_similarity(dense_nodes, slot_embedding + 0.5 * value_embedding)
         semantic_scale = F.softplus(self.semantic_scale).clamp(max=5.0)
         table_logits = self.table_key(nodes) @ pointer_query + semantic_scale * similarity
         column_logits = self.column_key(nodes) @ pointer_query + semantic_scale * similarity

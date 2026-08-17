@@ -128,6 +128,9 @@ CUDA_VISIBLE_DEVICES=0 python src/training/stage14b_train_semantic_slot_binder.p
   --num-layers 2 \
   --epochs 5 \
   --lr 1e-4 \
+  --contrastive-weight 0.3 \
+  --contrastive-temperature 0.1 \
+  --semantic-dropout 0.2 \
   --freeze-pretrained-backbone \
   --device cuda \
   --seed 42
@@ -136,7 +139,7 @@ CUDA_VISIBLE_DEVICES=0 python src/training/stage14b_train_semantic_slot_binder.p
 ### 5.4 运行三组因果对照
 
 ```bash
-for MODE in correct action_only shuffled; do
+for MODE in correct action_only shuffled same_action_shuffled; do
   CUDA_VISIBLE_DEVICES=0 python src/grounding/stage14b_semantic_slot_tool.py \
     --checkpoint experiments/stage14b_semantic_slot_binder_1000_100_seed42/semantic_slot_binder.pt \
     --graph-file experiments/stage13b_clean_typed_trajectories/dev_trajectories.jsonl \
@@ -164,6 +167,7 @@ python src/evaluation/stage14b_compare_slot_ablation.py \
   --correct-output experiments/stage14b_semantic_slot_tool_100/correct.jsonl \
   --action-only-output experiments/stage14b_semantic_slot_tool_100/action_only.jsonl \
   --shuffled-output experiments/stage14b_semantic_slot_tool_100/shuffled.jsonl \
+  --same-action-shuffled-output experiments/stage14b_semantic_slot_tool_100/same_action_shuffled.jsonl \
   --target-trajectories experiments/stage13b_clean_typed_trajectories/dev_trajectories.jsonl \
   --output-file experiments/stage14b_semantic_slot_tool_100/ablation_summary.json
 ```
@@ -181,3 +185,27 @@ python src/evaluation/stage14b_compare_slot_ablation.py \
 
 如果第 1--4 条提高但第 5--6 条失败，不能声称 semantic slot interface 有效，只能说明重新训练或损失函数改变了排序。
 若本阶段通过，再进入 Stage 14C joint slot-schema assignment；若失败，转向 LLM SQL candidates + RGTA graph verifier。
+
+## 7. 首轮结果与 Fix1 决策
+
+100-example 首轮结果：
+
+| Variant | Column recall | Semantic complete | Assembly recall | Complete coverage |
+|---|---:|---:|---:|---:|
+| correct | 0.422713 | 0.308943 | 0.572040 | 0.01 |
+| action-only zero | 0.129338 | 0.086721 | 0.460770 | 0.00 |
+| within-question shuffled | 0.405363 | 0.289973 | 0.567760 | 0.01 |
+
+`correct` 相对 action-only 提升很大，但相对 shuffled 的 column recall 只高 `0.01735`。这说明模型依赖非零
+slot input，却没有充分学习正确 slot 的语义身份。首轮没有通过性能门，不能进入 Stage 14C。
+
+Stage 14B-fix1 因而作出以下修改：
+
+1. global question/evidence 只进入 query encoder，不再重复写入每个 slot；
+2. focus 与 literal value 分别 embedding；action 与 expected type 使用独立 learned embedding；
+3. 增加 Slot–Schema InfoNCE；
+4. 训练时使用 semantic dropout，使 action-only 成为分布内控制；
+5. 新增跨样本、同 action 的 `same_action_shuffled`，并要求 correct column recall 至少高 0.05、semantic
+   complete 至少高 0.03。
+
+Fix1 必须重新执行 5.1--5.5；旧 slot embedding cache 与旧 Stage 14B checkpoint 不兼容，不能复用。

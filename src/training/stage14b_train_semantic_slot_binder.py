@@ -40,13 +40,30 @@ def write_jsonl(path, rows):
 
 def load_slot_cache(root, split, np):
     root = Path(root)
-    embeddings = np.load(root / f"{split}_slot_embeddings.npy", mmap_mode="r")
+    focus_path = root / f"{split}_focus_embeddings.npy"
+    if not focus_path.exists():
+        focus_path = root / f"{split}_slot_embeddings.npy"
+    focus_embeddings = np.load(focus_path, mmap_mode="r")
+    value_path = root / f"{split}_value_embeddings.npy"
+    value_embeddings = (
+        np.load(value_path, mmap_mode="r")
+        if value_path.exists() else np.zeros_like(focus_embeddings)
+    )
     index = json.loads((root / f"{split}_slot_index.json").read_text(encoding="utf-8"))
     by_key = {
-        (int(row["record_index"]), int(row["step_index"])): int(row["embedding_index"])
+        (int(row["record_index"]), int(row["step_index"])): row
         for row in index
     }
-    return {"embeddings": embeddings, "by_key": by_key, "dense_dim": int(embeddings.shape[1])}
+    by_action = defaultdict(list)
+    for row in index:
+        by_action[row["action"]].append((int(row["record_index"]), int(row["step_index"])))
+    return {
+        "focus": focus_embeddings,
+        "value": value_embeddings,
+        "by_key": by_key,
+        "by_action": dict(by_action),
+        "dense_dim": int(focus_embeddings.shape[1]),
+    }
 
 
 def relation_vocabulary(graphs, init_summary=None):
@@ -109,6 +126,15 @@ def listwise_coverage_loss(logits, positives, valid_mask, torch):
     return torch.logsumexp(logits[valid], dim=0) - torch.logsumexp(logits[positive], dim=0)
 
 
+def slot_schema_contrastive_loss(output, positives, valid_mask, temperature, torch, F):
+    if not positives:
+        return None
+    nodes = F.normalize(output["schema_states"].float(), dim=-1)
+    slot = F.normalize(output["slot_state"].float(), dim=-1)
+    logits = (nodes @ slot) / max(float(temperature), 1e-4)
+    return listwise_coverage_loss(logits, positives, valid_mask, torch)
+
+
 def same_table_hard_negative_loss(logits, positives, nodes, margin, torch):
     losses = []
     positive_set = {int(value) for value in positives}
@@ -136,6 +162,11 @@ def slot_loss(output, target, node_types, owner_indices, nodes, join_pairs, args
         coverage = listwise_coverage_loss(logits, positives, mask, torch)
         if coverage is not None:
             losses.append(args.listwise_weight * coverage)
+        contrastive = slot_schema_contrastive_loss(
+            output, positives, mask, args.contrastive_temperature, torch, F
+        )
+        if contrastive is not None:
+            losses.append(args.contrastive_weight * contrastive)
         if key == "column" and positives:
             hard = same_table_hard_negative_loss(
                 logits, positives, nodes, args.hard_negative_margin, torch
@@ -188,12 +219,30 @@ def aligned_records(graph_rows, slot_rows):
     return result
 
 
-def slot_tensor(cache, record_index, step_index, device, torch):
+def slot_tensor(cache, record_index, step_index, device, torch, field="focus"):
     key = (int(record_index), int(step_index))
     if key not in cache["by_key"]:
         raise KeyError(f"Missing slot embedding for record/step={key}")
-    index = cache["by_key"][key]
-    return torch.tensor(cache["embeddings"][index:index + 1], dtype=torch.float32, device=device)
+    row = cache["by_key"][key]
+    index_name = "focus_embedding_index" if field == "focus" else "value_embedding_index"
+    index = int(row.get(index_name, row["embedding_index"]))
+    values = cache[field][index:index + 1]
+    if field == "value" and not row.get("has_value", True):
+        values = values * 0.0
+    return torch.tensor(values, dtype=torch.float32, device=device)
+
+
+def same_action_donor_key(cache, record_index, step_index, action):
+    current = (int(record_index), int(step_index))
+    candidates = cache["by_action"].get(action, [])
+    if len(candidates) <= 1:
+        return current
+    position = candidates.index(current)
+    for offset in range(1, len(candidates)):
+        candidate = candidates[(position + offset) % len(candidates)]
+        if candidate[0] != current[0]:
+            return candidate
+    return candidates[(position + 1) % len(candidates)]
 
 
 def run_split(model, records, base_cache, slot_cache, relation_to_id, args, runtime, device, optimizer=None):
@@ -215,14 +264,24 @@ def run_split(model, records, base_cache, slot_cache, relation_to_id, args, runt
             requests = slot_row["inference_inputs"]["requests"]
             targets = slot_row["training_targets"]["slot_targets"]
             example_losses, step_rows = [], []
-            slot_embeddings = [
-                slot_tensor(slot_cache, graph["record_index"], request["step_index"], device, torch)
+            focus_embeddings = [
+                slot_tensor(slot_cache, graph["record_index"], request["step_index"], device, torch, "focus")
                 for request in requests
             ]
-            for step_position, (request, target, slot) in enumerate(zip(requests, targets, slot_embeddings)):
+            value_embeddings = [
+                slot_tensor(slot_cache, graph["record_index"], request["step_index"], device, torch, "value")
+                for request in requests
+            ]
+            for step_position, (request, target, focus, value) in enumerate(
+                zip(requests, targets, focus_embeddings, value_embeddings)
+            ):
+                model_focus, model_value = focus, value
+                if training and random.random() < args.semantic_dropout:
+                    model_focus, model_value = torch.zeros_like(focus), torch.zeros_like(value)
                 output = model.forward_slot(
-                    dense, query, slot, node_types, edge_index, edge_type, join_index,
-                    request["action"], owners,
+                    dense, query, model_focus, node_types, edge_index, edge_type, join_index,
+                    request["action"], owners, model_value,
+                    request.get("expected_value_type_id", 0),
                 )
                 loss = slot_loss(output, target, node_types, owners, nodes, join_pairs, args, torch, F)
                 if loss is not None:
@@ -243,17 +302,27 @@ def run_split(model, records, base_cache, slot_cache, relation_to_id, args, runt
                 ]).mean() if target_ids else output["table_logits"].new_zeros(())
                 if target_ids and not training:
                     zero_output = model.forward_slot(
-                        dense, query, torch.zeros_like(slot), node_types, edge_index, edge_type,
-                        join_index, request["action"], owners,
+                        dense, query, torch.zeros_like(focus), node_types, edge_index, edge_type,
+                        join_index, request["action"], owners, torch.zeros_like(value),
+                        request.get("expected_value_type_id", 0),
                     )
                     zero_score = torch.stack([
                         zero_output["table_logits"][idx] if nodes[idx].get("type") == "table" else zero_output["column_logits"][idx]
                         for idx in target_ids
                     ]).mean()
-                    shuffled_slot = slot_embeddings[(step_position + 1) % len(slot_embeddings)]
+                    donor_key = same_action_donor_key(
+                        slot_cache, graph["record_index"], request["step_index"], request["action"]
+                    )
+                    shuffled_focus = slot_tensor(
+                        slot_cache, donor_key[0], donor_key[1], device, torch, "focus"
+                    )
+                    shuffled_value = slot_tensor(
+                        slot_cache, donor_key[0], donor_key[1], device, torch, "value"
+                    )
                     shuffled_output = model.forward_slot(
-                        dense, query, shuffled_slot, node_types, edge_index, edge_type,
-                        join_index, request["action"], owners,
+                        dense, query, shuffled_focus, node_types, edge_index, edge_type,
+                        join_index, request["action"], owners, shuffled_value,
+                        request.get("expected_value_type_id", 0),
                     )
                     shuffled_score = torch.stack([
                         shuffled_output["table_logits"][idx] if nodes[idx].get("type") == "table" else shuffled_output["column_logits"][idx]
@@ -323,7 +392,10 @@ def clone_cpu(model):
 
 
 def freeze_pretrained_backbone(model):
-    trainable_prefixes = ("slot_input.", "slot_gate.", "slot_norm.")
+    trainable_prefixes = (
+        "slot_input.", "value_input.", "expected_type_embedding.",
+        "slot_fusion.", "slot_gate.", "slot_norm.",
+    )
     trainable_scalars = {"semantic_scale", "owner_scale"}
     trainable = []
     for name, parameter in model.named_parameters():
@@ -359,6 +431,9 @@ def main():
     parser.add_argument("--owner-consistency-weight", type=float, default=0.2)
     parser.add_argument("--hard-negative-weight", type=float, default=0.2)
     parser.add_argument("--hard-negative-margin", type=float, default=0.5)
+    parser.add_argument("--contrastive-weight", type=float, default=0.3)
+    parser.add_argument("--contrastive-temperature", type=float, default=0.1)
+    parser.add_argument("--semantic-dropout", type=float, default=0.2)
     parser.add_argument("--join-loss-weight", type=float, default=1.0)
     parser.add_argument("--value-route-loss-weight", type=float, default=0.5)
     parser.add_argument("--operator-loss-weight", type=float, default=0.75)

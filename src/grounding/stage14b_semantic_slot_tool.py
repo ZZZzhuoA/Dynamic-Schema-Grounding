@@ -23,6 +23,7 @@ from src.modeling.stage13c_static_runtime import graph_tensors  # noqa: E402
 from src.training.stage13b_train_typed_ra_decoder import load_cache  # noqa: E402
 from src.training.stage14b_train_semantic_slot_binder import (  # noqa: E402
     load_slot_cache,
+    same_action_donor_key,
     slot_tensor,
 )
 
@@ -74,7 +75,11 @@ def main():
     parser.add_argument("--embedding-cache-dir", required=True)
     parser.add_argument("--slot-embedding-cache-dir", required=True)
     parser.add_argument("--split", choices=["train", "dev"], default="dev")
-    parser.add_argument("--slot-mode", choices=["correct", "action_only", "shuffled"], default="correct")
+    parser.add_argument(
+        "--slot-mode",
+        choices=["correct", "action_only", "shuffled", "same_action_shuffled"],
+        default="correct",
+    )
     parser.add_argument("--output-file", required=True)
     parser.add_argument("--limit", type=int)
     parser.add_argument("--table-top-k", type=int, default=3)
@@ -118,22 +123,35 @@ def main():
             nodes_by_id = {int(node.get("id", position)): node for position, node in enumerate(nodes)}
             owners = owner_table_indices(nodes, device)
             requests = slot_row["inference_inputs"]["requests"]
-            embeddings = [
-                slot_tensor(slot_cache, index, request["step_index"], device, torch)
+            focus_embeddings = [
+                slot_tensor(slot_cache, index, request["step_index"], device, torch, "focus")
+                for request in requests
+            ]
+            value_embeddings = [
+                slot_tensor(slot_cache, index, request["step_index"], device, torch, "value")
                 for request in requests
             ]
             steps = []
             for position, raw_request in enumerate(requests):
                 if args.slot_mode == "correct":
-                    slot = embeddings[position]
+                    focus, value = focus_embeddings[position], value_embeddings[position]
                 elif args.slot_mode == "action_only":
-                    slot = torch.zeros_like(embeddings[position])
+                    focus = torch.zeros_like(focus_embeddings[position])
+                    value = torch.zeros_like(value_embeddings[position])
+                elif args.slot_mode == "shuffled":
+                    donor = (position + 1) % len(focus_embeddings)
+                    focus, value = focus_embeddings[donor], value_embeddings[donor]
                 else:
-                    slot = embeddings[(position + 1) % len(embeddings)]
+                    donor_key = same_action_donor_key(
+                        slot_cache, index, raw_request["step_index"], raw_request["action"]
+                    )
+                    focus = slot_tensor(slot_cache, donor_key[0], donor_key[1], device, torch, "focus")
+                    value = slot_tensor(slot_cache, donor_key[0], donor_key[1], device, torch, "value")
                 request = normalize_request(raw_request)
                 prediction = model.forward_slot(
-                    dense, query, slot, node_types, edge_index, edge_type, join_index,
-                    request["action"], owners,
+                    dense, query, focus, node_types, edge_index, edge_type, join_index,
+                    request["action"], owners, value,
+                    request.get("expected_value_type_id", 0),
                 )
                 steps.append(
                     {

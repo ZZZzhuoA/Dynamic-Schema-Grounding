@@ -63,6 +63,7 @@ def main():
     parser.add_argument("--correct-output", required=True)
     parser.add_argument("--action-only-output", required=True)
     parser.add_argument("--shuffled-output", required=True)
+    parser.add_argument("--same-action-shuffled-output")
     parser.add_argument("--target-trajectories", required=True)
     parser.add_argument("--output-file", required=True)
     args = parser.parse_args()
@@ -71,18 +72,41 @@ def main():
     correct = read_jsonl(args.correct_output)
     action_only = read_jsonl(args.action_only_output)
     shuffled = read_jsonl(args.shuffled_output)
+    same_action_shuffled = (
+        read_jsonl(args.same_action_shuffled_output)
+        if args.same_action_shuffled_output else None
+    )
     metrics = {}
-    for name, rows in (("correct", correct), ("action_only", action_only), ("shuffled", shuffled)):
+    variants = [("correct", correct), ("action_only", action_only), ("shuffled", shuffled)]
+    if same_action_shuffled is not None:
+        variants.append(("same_action_shuffled", same_action_shuffled))
+    for name, rows in variants:
         metrics[name], _ = evaluate(rows, targets)
+    semantic_control_name = "same_action_shuffled" if same_action_shuffled is not None else "shuffled"
+    semantic_control = same_action_shuffled if same_action_shuffled is not None else shuffled
+    semantic_column_delta = (
+        metrics["correct"]["column_recall"] - metrics[semantic_control_name]["column_recall"]
+    )
+    semantic_complete_delta = (
+        metrics["correct"]["semantic_step_complete_rate"]
+        - metrics[semantic_control_name]["semantic_step_complete_rate"]
+    )
     summary = {
         "metrics": metrics,
         "correct_minus_action_only": metric_delta(metrics["correct"], metrics["action_only"]),
         "correct_minus_shuffled": metric_delta(metrics["correct"], metrics["shuffled"]),
+        "semantic_control": semantic_control_name,
+        "correct_minus_semantic_control": metric_delta(
+            metrics["correct"], metrics[semantic_control_name]
+        ),
         "ranking_effect_vs_action_only": compare_rankings(correct, action_only),
         "ranking_effect_vs_shuffled": compare_rankings(correct, shuffled),
+        "ranking_effect_vs_semantic_control": compare_rankings(correct, semantic_control),
         "causal_gate": {
             "correct_beats_action_only_column_recall": metrics["correct"]["column_recall"] > metrics["action_only"]["column_recall"],
             "correct_beats_shuffled_column_recall": metrics["correct"]["column_recall"] > metrics["shuffled"]["column_recall"],
+            "correct_beats_semantic_control_column_recall_by_5pct": semantic_column_delta >= 0.05,
+            "correct_beats_semantic_control_semantic_complete_by_3pct": semantic_complete_delta >= 0.03,
             "correct_beats_action_only_semantic_complete": metrics["correct"]["semantic_step_complete_rate"] > metrics["action_only"]["semantic_step_complete_rate"],
             "ranking_change_vs_action_only_at_least_10pct": compare_rankings(correct, action_only)["ranking_change_rate"] >= 0.10,
         },

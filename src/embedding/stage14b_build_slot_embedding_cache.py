@@ -21,19 +21,24 @@ from src.embedding.stage8g_build_embedding_cache import (  # noqa: E402
 
 
 def collect_slots(rows):
-    texts, index_rows, text_rows = [], [], []
+    focus_texts, value_texts, index_rows, text_rows = [], [], [], []
     for example_index, row in enumerate(rows):
         record_index = int(row["record_index"])
         for request in row["inference_inputs"]["requests"]:
-            embedding_index = len(texts)
-            text = request["slot_embedding_text"]
-            texts.append(text)
+            embedding_index = len(focus_texts)
+            focus_text = request["slot_embedding_text"]
+            value_text = request.get("value_embedding_text", "no literal value")
+            focus_texts.append(focus_text)
+            value_texts.append(value_text)
             index_rows.append(
                 {
                     "record_index": record_index,
                     "step_index": int(request["step_index"]),
                     "request_id": request["request_id"],
                     "embedding_index": embedding_index,
+                    "focus_embedding_index": embedding_index,
+                    "value_embedding_index": embedding_index,
+                    "has_value": bool(request.get("value_surfaces")),
                     "action": request["action"],
                 }
             )
@@ -43,26 +48,33 @@ def collect_slots(rows):
                     "record_index": record_index,
                     "step_index": int(request["step_index"]),
                     "action": request["action"],
-                    "text": text,
+                    "focus_text": focus_text,
+                    "value_text": value_text,
                 }
             )
-    return texts, index_rows, text_rows
+    return focus_texts, value_texts, index_rows, text_rows
 
 
 def build_split(split, path, output_dir, tokenizer, model, runtime, args, limit=None):
     rows = read_jsonl(Path(path), limit)
-    texts, index_rows, text_rows = collect_slots(rows)
-    embeddings = embed_texts(texts, tokenizer, model, runtime, args)
-    runtime["np"].save(output_dir / f"{split}_slot_embeddings.npy", embeddings)
+    focus_texts, value_texts, index_rows, text_rows = collect_slots(rows)
+    focus_embeddings = embed_texts(focus_texts, tokenizer, model, runtime, args)
+    value_embeddings = embed_texts(value_texts, tokenizer, model, runtime, args)
+    # Keep the old filename as a focus alias for simple tooling compatibility.
+    runtime["np"].save(output_dir / f"{split}_slot_embeddings.npy", focus_embeddings)
+    runtime["np"].save(output_dir / f"{split}_focus_embeddings.npy", focus_embeddings)
+    runtime["np"].save(output_dir / f"{split}_value_embeddings.npy", value_embeddings)
     write_json(output_dir / f"{split}_slot_index.json", index_rows)
     if args.write_texts:
         write_jsonl(output_dir / f"{split}_slot_texts.jsonl", text_rows)
     return {
         "split": split,
         "record_count": len(rows),
-        "slot_count": len(texts),
-        "embedding_shape": list(embeddings.shape),
-        "embedding_file": str(output_dir / f"{split}_slot_embeddings.npy"),
+        "slot_count": len(focus_texts),
+        "focus_embedding_shape": list(focus_embeddings.shape),
+        "value_embedding_shape": list(value_embeddings.shape),
+        "focus_embedding_file": str(output_dir / f"{split}_focus_embeddings.npy"),
+        "value_embedding_file": str(output_dir / f"{split}_value_embeddings.npy"),
         "index_file": str(output_dir / f"{split}_slot_index.json"),
     }
 
