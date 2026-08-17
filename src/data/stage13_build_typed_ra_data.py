@@ -17,9 +17,11 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from src.data.stage5g_build_clause_labels import (
+    build_schema_index,
     scan_clause_events,
     transform_record,
 )
+from src.data.stage1_extract_bird_labels import extract_table_aliases, normalize_name
 
 
 AGGREGATE_PATTERN = re.compile(r"(?i)\b(count|sum|avg|min|max|group_concat)\s*\(")
@@ -33,6 +35,14 @@ STRING_LITERAL_PATTERN = re.compile(r"'(?:''|[^'])*'")
 NUMBER_PATTERN = re.compile(r"(?<![A-Za-z0-9_])[-+]?\d+(?:\.\d+)?(?![A-Za-z0-9_])")
 SUBQUERY_PATTERN = re.compile(r"(?is)\(\s*select\b")
 SET_OPERATOR_PATTERN = re.compile(r"(?i)\b(union|intersect|except)\b")
+SUPERLATIVE_LIMIT_ONE_PATTERN = re.compile(
+    r"(?i)\b(?:highest|lowest|largest|smallest|most|least|best|worst|first|last|top)\b"
+)
+SQL_IDENTIFIER = r'(?:`(?:``|[^`])+`|\[[^\]]+\]|"(?:""|[^"])+"|[A-Za-z_][A-Za-z0-9_$]*)'
+QUALIFIED_IDENTIFIER = rf"({SQL_IDENTIFIER})\s*\.\s*({SQL_IDENTIFIER})"
+QUALIFIED_EQUALITY_PATTERN = re.compile(
+    rf"{QUALIFIED_IDENTIFIER}\s*=\s*{QUALIFIED_IDENTIFIER}", re.IGNORECASE
+)
 
 
 def read_jsonl(path, limit=None):
@@ -94,15 +104,34 @@ def schema_partition(schema_items, ids):
     return tables, columns
 
 
-def source_match(value, question, evidence):
+def source_pattern(value, kind):
+    escaped = re.escape(value)
+    if kind == "number":
+        # Sentence punctuation may immediately follow a number, whereas a dot
+        # or comma followed by another digit means this is only a fragment of
+        # a decimal/grouped value (for example 1 inside 1.5 or 1,000).
+        return re.compile(
+            rf"(?<![A-Za-z0-9_])(?<![0-9][.,]){escaped}(?![A-Za-z0-9_]|[.,][0-9])"
+        )
+    if value and (value[0].isalnum() or value[0] == "_"):
+        escaped = rf"(?<![A-Za-z0-9_]){escaped}"
+    if value and (value[-1].isalnum() or value[-1] == "_"):
+        escaped = rf"{escaped}(?![A-Za-z0-9_])"
+    return re.compile(escaped)
+
+
+def source_match(value, question, evidence, kind="string"):
+    pattern = source_pattern(value, kind)
     for source, text in (("question", question or ""), ("evidence", evidence or "")):
-        start = text.find(value)
-        if start >= 0:
+        match = pattern.search(text)
+        if match:
+            start = match.start()
             return {"source": source, "match": "exact", "start": start, "end": start + len(value)}
-    folded = value.casefold()
+    folded_pattern = re.compile(pattern.pattern, re.IGNORECASE)
     for source, text in (("question", question or ""), ("evidence", evidence or "")):
-        start = text.casefold().find(folded)
-        if start >= 0:
+        match = folded_pattern.search(text)
+        if match:
+            start = match.start()
             return {
                 "source": source,
                 "match": "casefold_only",
@@ -128,13 +157,40 @@ def literal_targets(text, question, evidence, clause):
                 "raw_sql_literal": raw,
                 "canonical_value": value,
                 "case_sensitive": any(char.isalpha() for char in value),
-                **source_match(value, question, evidence),
+                **source_match(value, question, evidence, "string"),
             }
         )
     for match in NUMBER_PATTERN.finditer(text):
         if any(occupied[match.start() : match.end()]):
             continue
         raw = match.group(0)
+        source = source_match(raw, question, evidence, "number")
+        if (
+            clause == "limit"
+            and raw in {"1", "+1"}
+            and source["match"] == "none"
+            and SUPERLATIVE_LIMIT_ONE_PATTERN.search(question or "")
+        ):
+            source = {
+                "source": "semantic_inference",
+                "match": "inferred_superlative",
+                "start": None,
+                "end": None,
+            }
+        elif source["match"] == "none" and clause == "limit":
+            source = {
+                "source": "operator_inference_required",
+                "match": "none",
+                "start": None,
+                "end": None,
+            }
+        elif source["match"] == "none" and clause == "select":
+            source = {
+                "source": "expression_constant",
+                "match": "none",
+                "start": None,
+                "end": None,
+            }
         targets.append(
             {
                 "clause": clause,
@@ -142,7 +198,7 @@ def literal_targets(text, question, evidence, clause):
                 "raw_sql_literal": raw,
                 "canonical_value": raw,
                 "case_sensitive": False,
-                **source_match(raw, question, evidence),
+                **source,
             }
         )
     return targets
@@ -201,17 +257,64 @@ def foreign_key_edges(graph, schema_items):
                 "right_column_id": right,
                 "left_table": left_item.get("table"),
                 "right_table": right_item.get("table"),
+                "edge_type": "foreign_key",
             }
         )
     return edges
 
 
-def selected_join_edges(graph, schema_items, table_ids, join_column_ids):
+def unquote_identifier(value):
+    value = value.strip()
+    if value.startswith("[") and value.endswith("]"):
+        return value[1:-1]
+    if value.startswith("`") and value.endswith("`"):
+        return value[1:-1].replace("``", "`")
+    if value.startswith('"') and value.endswith('"'):
+        return value[1:-1].replace('""', '"')
+    return value
+
+
+def explicit_sql_join_edges(sql, schema_items):
+    schema = build_schema_index(schema_items)
+    _, aliases, _ = extract_table_aliases(sql or "", schema)
+    by_id = {int(item["id"]): item for item in schema_items}
+    edges, seen = [], set()
+    for match in QUALIFIED_EQUALITY_PATTERN.finditer(sql or ""):
+        left_owner, left_column, right_owner, right_column = (
+            normalize_name(unquote_identifier(value)) for value in match.groups()
+        )
+        left_table = aliases.get(left_owner, left_owner)
+        right_table = aliases.get(right_owner, right_owner)
+        left_id = schema["column_item_ids"].get((left_table, left_column))
+        right_id = schema["column_item_ids"].get((right_table, right_column))
+        if left_id is None or right_id is None or left_table == right_table:
+            continue
+        key = tuple(sorted((int(left_id), int(right_id))))
+        if key in seen:
+            continue
+        seen.add(key)
+        edges.append(
+            {
+                "left_column_id": int(left_id),
+                "right_column_id": int(right_id),
+                "left_table": by_id[int(left_id)].get("table"),
+                "right_table": by_id[int(right_id)].get("table"),
+                "edge_type": "sql_equality",
+            }
+        )
+    return edges
+
+
+def selected_join_edges(graph, schema_items, table_ids, join_column_ids, sql=""):
     by_id = {int(item["id"]): item for item in schema_items}
     table_names = {str(by_id[item_id].get("name")) for item_id in table_ids if item_id in by_id}
     join_columns = set(join_column_ids)
     candidates = foreign_key_edges(graph, schema_items)
-    selected = []
+    selected = explicit_sql_join_edges(sql, schema_items)
+    seen = {
+        tuple(sorted((edge["left_column_id"], edge["right_column_id"])))
+        for edge in selected
+    }
     for edge in candidates:
         endpoints_selected = {
             edge["left_column_id"], edge["right_column_id"]
@@ -219,10 +322,13 @@ def selected_join_edges(graph, schema_items, table_ids, join_column_ids):
         tables_selected = (
             edge["left_table"] in table_names and edge["right_table"] in table_names
         )
-        # Prefer explicit ON/FK endpoint supervision. Table-only closure is a
-        # fallback for records whose SQL label extraction found no join columns.
-        if endpoints_selected or (not join_columns and tables_selected):
+        # The target-table-induced FK graph is structural supervision even when
+        # clause labeling recovered only one endpoint. Explicit SQL equality
+        # edges above additionally support valid non-FK joins.
+        key = tuple(sorted((edge["left_column_id"], edge["right_column_id"])))
+        if (endpoints_selected or tables_selected) and key not in seen:
             selected.append(edge)
+            seen.add(key)
     return selected
 
 
@@ -307,7 +413,7 @@ def build_typed_plan(record, graph, record_index):
         scan_node_ids.append(scan_node["node_id"])
     current = scan_node_ids[0]
 
-    join_edges = selected_join_edges(graph, schema_items, table_ids, join_columns)
+    join_edges = selected_join_edges(graph, schema_items, table_ids, join_columns, sql)
     if len(table_ids) > 1 or segments.get("join"):
         join_node = make_node(
             f"join_{len(nodes)}", "JOIN", scan_node_ids, schema_items, join_ids, join_expression
@@ -355,14 +461,6 @@ def build_typed_plan(record, graph, record_index):
         nodes.append(node)
         current = node["node_id"]
 
-    project_values = literal_targets(select_expression, question, evidence, "select")
-    project = make_node(
-        f"project_{len(nodes)}", "PROJECT", current, schema_items,
-        clause_labels.get("select", []), select_expression, project_values,
-    )
-    nodes.append(project)
-    current = project["node_id"]
-
     order_expression = " ".join(segments.get("order_by", []))
     if order_expression:
         node = make_node(
@@ -380,6 +478,16 @@ def build_typed_plan(record, graph, record_index):
         )
         nodes.append(node)
         current = node["node_id"]
+
+    # Final projection follows SORT/LIMIT so ordering keys remain available to
+    # the logical plan even when they are absent from the SELECT list.
+    project_values = literal_targets(select_expression, question, evidence, "select")
+    project = make_node(
+        f"project_{len(nodes)}", "PROJECT", current, schema_items,
+        clause_labels.get("select", []), select_expression, project_values,
+    )
+    nodes.append(project)
+    current = project["node_id"]
 
     set_operators = [match.group(1).upper() for match in SET_OPERATOR_PATTERN.finditer(sql)]
     has_subquery = bool(SUBQUERY_PATTERN.search(sql))
@@ -496,6 +604,9 @@ def summarize(rows):
         for row in rows
         for value in row["training_targets"]["value_copy_targets"]
     ]
+    direct_copy_values = [
+        value for value in values if value.get("source") in {"question", "evidence"}
+    ]
     join_rows = [
         row for row in rows
         if len(row["training_targets"]["join_path"]["table_pointer_ids"]) > 1
@@ -534,6 +645,15 @@ def summarize(rows):
         "value_source_counts": dict(value_sources),
         "exact_value_copy_rate": (
             sum(value.get("match") == "exact" for value in values) / len(values) if values else 1.0
+        ),
+        "direct_copy_target_count": len(direct_copy_values),
+        "direct_copy_coverage_rate": (
+            len(direct_copy_values) / len(values) if values else 1.0
+        ),
+        "direct_copy_exact_rate": (
+            sum(value.get("match") == "exact" for value in direct_copy_values)
+            / len(direct_copy_values)
+            if direct_copy_values else 1.0
         ),
         "case_sensitive_value_count": sum(value.get("case_sensitive", False) for value in values),
     }

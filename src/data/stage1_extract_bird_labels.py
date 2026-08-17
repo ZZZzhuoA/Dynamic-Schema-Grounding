@@ -110,8 +110,11 @@ def schema_from_tables_entry(entry):
                 "normalized_name": full_norm,
                 "normalized_table": norm_table,
                 "normalized_column": norm_column,
-                "data_type": column_types[column_index - 1]
-                if column_index > 0 and column_index - 1 < len(column_types)
+                # BIRD keeps the wildcard entry in both column_names_original
+                # and column_types, so their indices are aligned.  Subtracting
+                # one shifts every real column onto the preceding column type.
+                "data_type": column_types[column_index]
+                if column_index < len(column_types)
                 else None,
             }
         )

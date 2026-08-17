@@ -81,9 +81,81 @@ String literals retain exact case and quoting. Each target is classified as:
 - exact copy from question;
 - exact copy from evidence;
 - case-fold-only source match;
-- database value lookup required.
+- database value lookup required;
+- semantic inference from a superlative (`highest`, `most`, and similar) for `LIMIT 1`;
+- operator inference required for an otherwise unexpressed LIMIT constant;
+- expression constant for a literal introduced inside a SELECT expression.
 
 Case-fold-only matches are not safe exact-copy targets. They should be canonicalized through the value index before SQL compilation.
+Numeric copies use complete-value boundaries, so `LIMIT 1` cannot be aligned to the first digit of `1945`.
+
+## Stage 13-A-fix1 correctness repairs
+
+The first full audit exposed three supervision bugs that must be fixed before decoder training:
+
+1. BIRD's `column_names_original` and `column_types` both retain the wildcard at index zero. Stage 1 previously subtracted one from the column index and shifted every real column type onto its predecessor.
+2. A raw substring search aligned short numeric constants to fragments of longer values.
+3. PROJECT preceded SORT, which removed non-output ordering keys from the logical relation.
+
+Fix1 therefore:
+
+- reads `column_types[column_index]`;
+- uses boundary-aware numeric and string source matching;
+- places final PROJECT after SORT and LIMIT;
+- fuses SQL-explicit qualified equality edges with the target-table-induced FK subgraph;
+- distinguishes copied values, inferred operator constants, expression constants, and database lookup values.
+
+On the corrected local 100/100 smoke run, join-path connectivity changed from `0.956/0.901`
+to `1.000/0.986` for train/dev. The lower all-target exact-copy rate is intentional: false
+substring matches are no longer counted as successful copies. Use `direct_copy_exact_rate` to
+measure fidelity only among targets actually assigned to question/evidence copy sources.
+
+Because the Stage 1 type-index bug propagated into graph node features and dense node text, old
+labels, graphs, embedding caches, and models are not compatible with fix1. Preserve them as
+ablations and rebuild into new output directories.
+
+## Mandatory fix1 rebuild
+
+Schema and question cards can be reused because their source schema/question content did not
+change. Rebuild labels first:
+
+```bash
+python src/data/stage1_extract_bird_labels.py \
+  --bird-dir Data/BIRD \
+  --train-question-answer experiments/stage0_train_correction_merge/merged_train_question_answer.json \
+  --output-dir experiments/stage1_label_extraction_corrected_typefix1 \
+  --splits train,dev
+```
+
+Rebuild graph examples with the existing compact cards:
+
+```bash
+python src/data/stage5_build_dsg_data.py \
+  --train-labels experiments/stage1_label_extraction_corrected_typefix1/bird_train_grounding_labels.jsonl \
+  --dev-labels experiments/stage1_label_extraction_corrected_typefix1/bird_dev_grounding_labels.jsonl \
+  --train-tables Data/BIRD/train_databases/train_databases/train_tables.json \
+  --dev-tables Data/BIRD/dev_tables.json \
+  --train-schema-semantic-cards experiments/stage8f_compact_llm_cards_corrected/train_schema_semantic_cards.jsonl \
+  --dev-schema-semantic-cards experiments/stage8f_compact_llm_cards_corrected/dev_schema_semantic_cards.jsonl \
+  --train-question-cards experiments/stage8f_compact_llm_cards_corrected/train_question_cards.jsonl \
+  --dev-question-cards experiments/stage8f_compact_llm_cards_corrected/dev_question_cards.jsonl \
+  --output-dir experiments/stage13a_dsg_data_typefix1
+```
+
+Build fix1 typed RA supervision:
+
+```bash
+python src/data/stage13_build_typed_ra_data.py \
+  --train-labels experiments/stage1_label_extraction_corrected_typefix1/bird_train_grounding_labels.jsonl \
+  --dev-labels experiments/stage1_label_extraction_corrected_typefix1/bird_dev_grounding_labels.jsonl \
+  --train-graphs experiments/stage13a_dsg_data_typefix1/train_examples.jsonl \
+  --dev-graphs experiments/stage13a_dsg_data_typefix1/dev_examples.jsonl \
+  --output-dir experiments/stage13a_typed_ra_typefix1
+```
+
+Only rebuild a dense embedding cache when a subsequent Stage 13 model consumes cached node
+embeddings. Do not reuse `stage8g_embedding_cache_corrected_qwen3_06b`, because its node text
+contains the shifted data types.
 
 ## Server smoke build
 
@@ -141,4 +213,3 @@ summary.json
 ```
 
 Stage 13-B should not begin until full-data coverage and join-path failures have been audited by database and SQL feature.
-
