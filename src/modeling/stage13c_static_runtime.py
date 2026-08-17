@@ -33,7 +33,15 @@ def graph_tensors(example, cache, relation_to_id, device):
     inputs = example.get("inference_inputs", example)
     nodes = inputs.get("schema_nodes") or inputs.get("schema_items") or []
     record_index = int(example.get("metadata", {}).get("record_index", example.get("record_index", 0)))
-    row = cache["by_index"][record_index]
+    # Stage 8G/13B caches expose ``by_index`` while the older Stage 10 helper
+    # calls the same mapping ``index``.  Accept both so a cache's on-disk
+    # format, rather than the Python loader used by the caller, is decisive.
+    index = cache.get("by_index") or cache.get("index")
+    if index is None:
+        raise KeyError("Embedding cache has neither 'by_index' nor 'index'")
+    row = index.get(record_index)
+    if row is None:
+        raise KeyError(f"Embedding cache has no record_index={record_index}")
     query_index = int(row["query_embedding_index"])
     node_count = int(row["node_count"])
     if "node_embedding_indices" in row:

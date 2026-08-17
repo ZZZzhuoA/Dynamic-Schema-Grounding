@@ -26,7 +26,7 @@ from src.modeling.static_graph_adapter import (  # noqa: E402
     GraphMemoryProjector,
     StaticGraphConditionedCausalLM,
 )
-from src.training.stage10_train_factor_graph_reranker import load_cache  # noqa: E402
+from src.training.stage13b_train_typed_ra_decoder import load_cache  # noqa: E402
 from src.training.stage5_train_dsg_grounder import read_jsonl, write_json  # noqa: E402
 
 
@@ -252,7 +252,6 @@ def main():
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     random.seed(args.seed); np.random.seed(args.seed); torch.manual_seed(args.seed)
-    runtime = {"np": np, "torch": torch}
     dtype = {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torch.float32}[args.dtype]
     tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=args.trust_remote_code)
     if tokenizer.pad_token_id is None:
@@ -263,8 +262,8 @@ def main():
     )
     train = read_jsonl(Path(args.train_graph_file), args.train_limit)
     dev = read_jsonl(Path(args.dev_graph_file), args.dev_limit)
-    train_cache = load_cache(args.embedding_cache_dir, "train", runtime)
-    dev_cache = load_cache(args.embedding_cache_dir, "dev", runtime)
+    train_cache = load_cache(args.embedding_cache_dir, "train", np)
+    dev_cache = load_cache(args.embedding_cache_dir, "dev", np)
     graph_device = torch.device(args.graph_device)
     graph_encoder, relation_to_id, graph_summary = load_frozen_typed_graph_encoder(
         args.graph_summary, args.graph_checkpoint, train_cache["dense_dim"], graph_device

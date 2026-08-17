@@ -2,6 +2,46 @@ import unittest
 
 
 class Stage13CStaticGraphAdapterTest(unittest.TestCase):
+    def test_runtime_accepts_legacy_index_cache(self):
+        try:
+            import numpy as np
+            import torch
+            from src.modeling.stage13c_static_runtime import graph_tensors
+        except ImportError:
+            self.skipTest("NumPy or PyTorch is unavailable")
+        example = {
+            "metadata": {"record_index": 7},
+            "inference_inputs": {
+                "schema_nodes": [
+                    {"id": 0, "type": "table", "name": "schools"},
+                    {"id": 1, "type": "column", "name": "schools.Phone"},
+                ],
+                "schema_edges": [
+                    {"src": 0, "dst": 1, "type": "table_to_column"}
+                ],
+            },
+        }
+        cache = {
+            "query": np.ones((1, 4), dtype=np.float32),
+            "node": np.ones((2, 4), dtype=np.float32),
+            "index": {
+                7: {
+                    "query_embedding_index": 0,
+                    "node_embedding_start": 0,
+                    "node_count": 2,
+                }
+            },
+        }
+        dense, query, node_types, edges, edge_types, nodes = graph_tensors(
+            example, cache, {"table_to_column": 0}, torch.device("cpu")
+        )
+        self.assertEqual(tuple(dense.shape), (2, 4))
+        self.assertEqual(tuple(query.shape), (1, 4))
+        self.assertEqual(node_types.tolist(), [0, 1])
+        self.assertEqual(tuple(edges.shape), (2, 1))
+        self.assertEqual(edge_types.tolist(), [0])
+        self.assertEqual(len(nodes), 2)
+
     def test_graph_encoder_changes_when_topology_changes(self):
         try:
             import torch
