@@ -76,22 +76,24 @@ class StaticGraphCrossAdapter(nn.Module):
         self,
         llm_dim,
         graph_dim,
+        adapter_dim=512,
         num_heads=8,
         dropout=0.0,
         residual_scale_init=0.02,
         gate_bias_init=-2.0,
     ):
         super().__init__()
-        if llm_dim % num_heads:
-            raise ValueError("llm_dim must be divisible by num_heads")
+        if adapter_dim % num_heads:
+            raise ValueError("adapter_dim must be divisible by num_heads")
         self.llm_dim = llm_dim
+        self.adapter_dim = adapter_dim
         self.num_heads = num_heads
-        self.head_dim = llm_dim // num_heads
+        self.head_dim = adapter_dim // num_heads
         self.norm = nn.LayerNorm(llm_dim)
-        self.query = nn.Linear(llm_dim, llm_dim, bias=False)
-        self.key = nn.Linear(graph_dim, llm_dim, bias=False)
-        self.value = nn.Linear(graph_dim, llm_dim, bias=False)
-        self.output = nn.Linear(llm_dim, llm_dim, bias=False)
+        self.query = nn.Linear(llm_dim, adapter_dim, bias=False)
+        self.key = nn.Linear(graph_dim, adapter_dim, bias=False)
+        self.value = nn.Linear(graph_dim, adapter_dim, bias=False)
+        self.output = nn.Linear(adapter_dim, llm_dim, bias=False)
         self.context_norm = nn.LayerNorm(llm_dim)
         self.gate = nn.Linear(llm_dim * 2, 1)
         nn.init.constant_(self.gate.bias, float(gate_bias_init))
@@ -117,7 +119,9 @@ class StaticGraphCrossAdapter(nn.Module):
         scores = torch.einsum("bhtd,hnd->bhtn", query, key) / math.sqrt(self.head_dim)
         attention = torch.softmax(scores.float(), dim=-1).to(query.dtype)
         context = torch.einsum("bhtn,hnd->bhtd", attention, value)
-        context = context.transpose(1, 2).contiguous().view(batch, length, self.llm_dim)
+        context = context.transpose(1, 2).contiguous().view(
+            batch, length, self.adapter_dim
+        )
         context = self.context_norm(self.output(context))
         gate = torch.sigmoid(self.gate(torch.cat([normalized, context], dim=-1)))
         update = torch.tanh(self.residual_scale) * gate * context
@@ -140,21 +144,26 @@ class GraphMemoryProjector(nn.Module):
 
     def __init__(
         self, graph_dim, llm_dim, semantic_dim=None, query_dim=None,
+        memory_dim=512,
         dropout=0.0, structure_scale_init=0.1,
     ):
         super().__init__()
         semantic_dim = int(semantic_dim or graph_dim)
         query_dim = int(query_dim or semantic_dim)
         self.semantic_norm = nn.LayerNorm(semantic_dim)
-        self.semantic_projection = nn.Linear(semantic_dim, llm_dim, bias=False)
+        self.memory_dim = int(memory_dim)
+        self.semantic_projection = nn.Linear(semantic_dim, self.memory_dim, bias=False)
         self.graph_norm = nn.LayerNorm(graph_dim)
-        self.graph_projection = nn.Linear(graph_dim, llm_dim, bias=False)
+        self.graph_projection = nn.Linear(graph_dim, self.memory_dim, bias=False)
         self.query_projection = nn.Linear(query_dim, graph_dim, bias=False)
         self.structure_gate = nn.Linear(graph_dim * 2, 1)
         nn.init.constant_(self.structure_gate.bias, -2.0)
         initial = max(min(float(structure_scale_init), 0.999), -0.999)
         self.structure_scale = nn.Parameter(torch.tensor(math.atanh(initial)))
-        self.output_norm = nn.LayerNorm(llm_dim)
+        self.output_norm = nn.LayerNorm(self.memory_dim)
+        # Used only by the node-name alignment objective. Decoder adapters read
+        # the compact memory directly and never materialize 5120-d keys/values.
+        self.alignment_projection = nn.Linear(self.memory_dim, llm_dim, bias=False)
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, graph_memory, semantic_memory=None, query_embedding=None, return_components=False):
@@ -187,7 +196,9 @@ class GraphMemoryProjector(nn.Module):
         if return_components:
             return {
                 "memory": memory,
-                "semantic_memory": self.output_norm(semantic),
+                "semantic_memory": self.alignment_projection(
+                    self.output_norm(semantic)
+                ),
                 "structure_memory": structure,
                 "structure_gate": structure_gate,
             }
@@ -201,6 +212,7 @@ class StaticGraphConditionedCausalLM(nn.Module):
         self,
         base_model,
         graph_dim,
+        adapter_dim=512,
         layer_indices=None,
         layer_fractions=(0.25, 0.5, 0.75, 1.0),
         num_heads=8,
@@ -224,6 +236,7 @@ class StaticGraphConditionedCausalLM(nn.Module):
             adapter = StaticGraphCrossAdapter(
                 llm_dim,
                 graph_dim,
+                adapter_dim=adapter_dim,
                 num_heads=num_heads,
                 dropout=dropout,
                 residual_scale_init=residual_scale_init,

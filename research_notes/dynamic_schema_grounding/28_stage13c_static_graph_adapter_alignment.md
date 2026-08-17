@@ -45,6 +45,12 @@ All trainable adapter parameters remain FP32. Cross-attention converts BF16
 decoder states to FP32 internally, applies a normalized residual initialized at
 scale 0.02, and converts the result back to the decoder dtype.
 
+The decoder connection uses a low-rank attention bottleneck (512 dimensions by
+default), rather than four full 5120-by-5120 projections per LLM layer. During
+teacher forcing, Qwen computes vocabulary logits only for the supervised SQL
+suffix plus its preceding prediction position; prompt logits are not
+materialized.
+
 The normal LLM forward pass must retain autograd. Freezing the LLM means
 `requires_grad=False` on its parameters, not wrapping the forward pass in
 `torch.no_grad()`. The RGTA memory is explicitly detached.
@@ -82,6 +88,7 @@ CUDA_VISIBLE_DEVICES=0,1 python src/training/stage13c_train_static_graph_adapter
   --lr 2e-4 \
   --gradient-accumulation-steps 8 \
   --adapter-layer-fractions 0.25,0.5,0.75,1.0 \
+  --adapter-dim 512 \
   --alignment-weight 0.1 \
   --counterfactual-weight 0.5 \
   --residual-scale-init 0.02 \

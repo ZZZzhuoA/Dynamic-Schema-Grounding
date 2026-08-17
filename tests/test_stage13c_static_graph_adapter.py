@@ -9,14 +9,15 @@ class Stage13CStaticGraphAdapterTest(unittest.TestCase):
         except ImportError:
             self.skipTest("PyTorch is unavailable")
         projector = GraphMemoryProjector(
-            graph_dim=8, semantic_dim=12, query_dim=12, llm_dim=16
+            graph_dim=8, semantic_dim=12, query_dim=12, llm_dim=16,
+            memory_dim=6,
         )
         memory = torch.randn(4, 8, dtype=torch.bfloat16)
         semantics = torch.randn(4, 12, dtype=torch.bfloat16)
         query = torch.randn(1, 12, dtype=torch.bfloat16)
         projected = projector(memory, semantics, query)
         self.assertEqual(projected.dtype, projector.semantic_norm.weight.dtype)
-        self.assertEqual(tuple(projected.shape), (4, 16))
+        self.assertEqual(tuple(projected.shape), (4, 6))
 
     def test_semantic_path_survives_graph_corruption(self):
         try:
@@ -26,7 +27,8 @@ class Stage13CStaticGraphAdapterTest(unittest.TestCase):
             self.skipTest("PyTorch is unavailable")
         torch.manual_seed(17)
         projector = GraphMemoryProjector(
-            graph_dim=8, semantic_dim=12, query_dim=12, llm_dim=16
+            graph_dim=8, semantic_dim=12, query_dim=12, llm_dim=16,
+            memory_dim=6,
         )
         semantics = torch.randn(4, 12)
         query = torch.randn(1, 12)
@@ -41,7 +43,9 @@ class Stage13CStaticGraphAdapterTest(unittest.TestCase):
             from src.modeling.static_graph_adapter import StaticGraphCrossAdapter
         except ImportError:
             self.skipTest("PyTorch is unavailable")
-        adapter = StaticGraphCrossAdapter(llm_dim=16, graph_dim=8, num_heads=4)
+        adapter = StaticGraphCrossAdapter(
+            llm_dim=16, graph_dim=8, adapter_dim=8, num_heads=4
+        )
         hidden = torch.randn(1, 3, 16, dtype=torch.bfloat16)
         memory = torch.randn(5, 8)
         output = adapter(hidden, memory)
@@ -121,7 +125,8 @@ class Stage13CStaticGraphAdapterTest(unittest.TestCase):
             self.skipTest("PyTorch is unavailable")
         torch.manual_seed(11)
         adapter = StaticGraphCrossAdapter(
-            llm_dim=16, graph_dim=8, num_heads=4, residual_scale_init=0.1
+            llm_dim=16, graph_dim=8, adapter_dim=8,
+            num_heads=4, residual_scale_init=0.1
         )
         hidden = torch.randn(1, 5, 16)
         memory = torch.randn(6, 8, requires_grad=True)
@@ -165,7 +170,7 @@ class Stage13CStaticGraphAdapterTest(unittest.TestCase):
         hidden = torch.randn(1, 4, 16)
         baseline = base(hidden).detach()
         wrapper = StaticGraphConditionedCausalLM(
-            base, graph_dim=8, layer_indices=[1], num_heads=4
+            base, graph_dim=8, adapter_dim=8, layer_indices=[1], num_heads=4
         )
         wrapper.freeze_base_model()
         wrapper.set_graph_memory(torch.randn(5, 8))

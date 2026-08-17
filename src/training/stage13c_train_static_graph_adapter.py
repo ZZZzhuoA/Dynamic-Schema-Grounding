@@ -64,6 +64,10 @@ def encode_example(tokenizer, example, max_length, input_device, torch, include_
 
 
 def causal_nll(logits, labels, torch):
+    if logits.shape[1] != labels.shape[1]:
+        if logits.shape[1] > labels.shape[1]:
+            raise ValueError("Logit sequence cannot be longer than labels")
+        labels = labels[:, -logits.shape[1] :]
     logits = logits[:, :-1, :].contiguous()
     labels = labels[:, 1:].to(logits.device).contiguous()
     valid = labels.ne(-100)
@@ -72,6 +76,17 @@ def causal_nll(logits, labels, torch):
         logits.view(-1, logits.shape[-1]), safe.view(-1), reduction="none"
     ).view_as(labels)
     return nll, valid
+
+
+def sql_only_forward(wrapper, input_ids, labels):
+    """Avoid materializing vocabulary logits for the long schema prompt."""
+    supervised = int(labels.ne(-100).sum().item())
+    logits_to_keep = min(supervised + 1, input_ids.shape[1])
+    return wrapper(
+        input_ids=input_ids,
+        use_cache=False,
+        logits_to_keep=logits_to_keep,
+    )
 
 
 def node_target_embeddings(tokenizer, embedding_layer, nodes, device, torch):
@@ -155,7 +170,7 @@ def evaluate_identity(examples, tokenizer, wrapper, args, torch):
                 skipped += 1
                 continue
             input_ids, labels, token_roles, _ = encoded
-            output = wrapper(input_ids=input_ids, use_cache=False)
+            output = sql_only_forward(wrapper, input_ids, labels)
             nll, valid = causal_nll(output.logits, labels, torch)
             roles = token_roles[:, 1:].to(nll.device)
             losses.append(float(weighted_token_ce(nll, valid, roles, args, torch).cpu()))
@@ -204,7 +219,7 @@ def run_split(
                 negative_raw, dense_semantics, query_embedding
             ).detach()
             wrapper.set_graph_memory(negative_memory)
-            negative_output = wrapper(input_ids=input_ids, use_cache=False)
+            negative_output = sql_only_forward(wrapper, input_ids, labels)
             negative_nll, _ = causal_nll(negative_output.logits, labels, torch)
             negative_nll = negative_nll.detach()
         context = torch.enable_grad() if training else torch.no_grad()
@@ -222,7 +237,7 @@ def run_split(
                 projected["semantic_memory"], targets, args.alignment_temperature, torch
             )
             wrapper.set_graph_memory(memory)
-            output = wrapper(input_ids=input_ids, use_cache=False)
+            output = sql_only_forward(wrapper, input_ids, labels)
             normal_nll, valid = causal_nll(output.logits, labels, torch)
             counterfactual_eligible = has_structural_sql(gold_sql(example))
             generation_loss, metrics = generation_objective(
@@ -298,6 +313,7 @@ def main():
     parser.add_argument("--max-length", type=int, default=8192)
     parser.add_argument("--adapter-layer-fractions", default="0.25,0.5,0.75,1.0")
     parser.add_argument("--adapter-heads", type=int, default=8)
+    parser.add_argument("--adapter-dim", type=int, default=512)
     parser.add_argument("--adapter-dropout", type=float, default=0.0)
     parser.add_argument("--residual-scale-init", type=float, default=0.02)
     parser.add_argument("--structure-scale-init", type=float, default=0.1)
@@ -351,11 +367,13 @@ def main():
         llm_dim=llm_dim,
         semantic_dim=train_cache["dense_dim"],
         query_dim=train_cache["dense_dim"],
+        memory_dim=args.adapter_dim,
         dropout=args.adapter_dropout,
         structure_scale_init=args.structure_scale_init,
     ).to(graph_device)
     wrapper = StaticGraphConditionedCausalLM(
-        base_model, graph_dim=llm_dim, layer_fractions=fractions,
+        base_model, graph_dim=args.adapter_dim, adapter_dim=args.adapter_dim,
+        layer_fractions=fractions,
         num_heads=args.adapter_heads, dropout=args.adapter_dropout,
         residual_scale_init=args.residual_scale_init,
     )
@@ -404,6 +422,7 @@ def main():
         **vars(args), "layer_indices": wrapper.layer_indices,
         "layer_path": wrapper.layer_path, "graph_dim": graph_dim,
         "llm_hidden_dim": llm_dim, "relations": list(relation_to_id),
+        "adapter_dim": args.adapter_dim,
         "frozen_modules": ["typed_rgta_graph_encoder", "code_llm"],
         "trainable_modules": ["graph_memory_projector", "cross_attention", "gate"],
     }
