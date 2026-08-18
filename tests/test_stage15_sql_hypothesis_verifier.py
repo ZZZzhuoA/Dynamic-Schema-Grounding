@@ -98,6 +98,7 @@ class Stage15ModelTest(unittest.TestCase):
             torch.tensor([[edge["src"] for edge in edges], [edge["dst"] for edge in edges]]),
             torch.tensor([relation_to_id[edge["type"]] for edge in edges]),
             group["inference_inputs"]["schema_items"],
+            edges,
             group["candidates"],
         )
         self.assertEqual(output["scores"].shape[0], len(group["candidates"]))
@@ -105,7 +106,38 @@ class Stage15ModelTest(unittest.TestCase):
         loss, components = grouped_ranking_loss(output["scores"], labels)
         loss.backward()
         self.assertGreater(float(components["listwise_loss"].detach()), 0.0)
+        self.assertGreater(float(components["hardest_negative_loss"].detach()), 0.0)
         self.assertIsNotNone(model.global_score[-1].weight.grad)
+        self.assertIsNotNone(model.consistency_encoder[0].weight.grad)
+
+    def test_explicit_plan_schema_consistency_detects_scan_and_join_conflicts(self):
+        from src.modeling.sql_hypothesis_verifier import plan_schema_consistency_features
+
+        row = toy_trajectory()
+        schema_items = row["inference_inputs"]["schema_items"]
+        schema_edges = row["inference_inputs"]["schema_edges"]
+        _, gold = plan_schema_consistency_features(
+            schema_items, schema_edges, {"steps": row["teacher_steps"]}
+        )
+        scan_corrupted = {"steps": [dict(step) for step in row["teacher_steps"]]}
+        scan_corrupted["steps"][1] = {
+            **scan_corrupted["steps"][1], "table_pointer_ids": [0]
+        }
+        _, corrupted = plan_schema_consistency_features(
+            schema_items, schema_edges, scan_corrupted
+        )
+        self.assertEqual(gold["owner_scan_coverage"], 1.0)
+        self.assertLess(corrupted["owner_scan_coverage"], 1.0)
+        join_corrupted = {"steps": [dict(step) for step in row["teacher_steps"]]}
+        join_corrupted["steps"][2] = {
+            **join_corrupted["steps"][2],
+            "join_edge_targets": [{"left_column_id": 3, "right_column_id": 4}],
+        }
+        _, bad_join = plan_schema_consistency_features(
+            schema_items, schema_edges, join_corrupted
+        )
+        self.assertEqual(bad_join["fk_validity"], 0.0)
+        self.assertLess(bad_join["required_table_connectivity"], 1.0)
 
 
 class Stage15MetricTest(unittest.TestCase):
@@ -128,6 +160,8 @@ class Stage15MetricTest(unittest.TestCase):
         self.assertEqual(metrics["mrr"], 0.5)
         self.assertEqual(metrics["pairwise_accuracy"], 0.5)
         self.assertEqual(metrics["by_corruption"]["operator"]["pairwise_accuracy"], 1.0)
+        self.assertEqual(metrics["top1_error_by_corruption"]["join_edge"]["count"], 1)
+        self.assertEqual(metrics["mean_hardest_margin"], -1.0)
 
     def test_ties_do_not_receive_hits_at_one(self):
         from src.evaluation.stage15_evaluate_sql_hypothesis_verifier import ranking_metrics

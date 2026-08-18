@@ -82,6 +82,7 @@ def forward_group(model, row, cache, relation_to_id, device, torch):
         edge_index,
         edge_type,
         schema_items,
+        row["inference_inputs"].get("schema_edges", []),
         row["candidates"],
     )
 
@@ -102,7 +103,8 @@ def forward_schema_control(model, row, cache, relation_to_id, device, torch):
         edge_index, len(schema_items), edge_type, structural_ids
     )
     return model(
-        dense, query, node_types, corrupted, edge_type, schema_items, row["candidates"]
+        dense, query, node_types, corrupted, edge_type, schema_items,
+        row["inference_inputs"].get("schema_edges", []), row["candidates"]
     )
 
 
@@ -119,6 +121,11 @@ def prediction_row(row, output):
                 "step_energy": float(detail["step_energy"].detach().float().cpu()),
                 "join_energy": float(detail["join_energy"].detach().float().cpu()),
                 "pointer_validity": float(detail.get("pointer_validity", 0.0)),
+                "consistency_energy": float(
+                    detail.get("consistency_energy", detail["score"] * 0.0)
+                    .detach().float().cpu()
+                ),
+                "consistency_features": detail.get("consistency_features", {}),
             }
         )
     return {
@@ -144,7 +151,7 @@ def run_split(
 
     training = optimizer is not None
     model.train(training)
-    losses, listwise_losses, pairwise_losses, predictions = [], [], [], []
+    losses, listwise_losses, pairwise_losses, hardest_losses, predictions = [], [], [], [], []
     schema_control_gains, schema_control_wins = [], 0
     if training:
         optimizer.zero_grad(set_to_none=True)
@@ -154,7 +161,8 @@ def run_split(
             output = forward_group(model, row, cache, relation_to_id, device, torch)
             labels = labels_tensor(row["candidates"], torch, device)
             loss, components = grouped_ranking_loss(
-                output["scores"], labels, args.margin, args.margin_weight
+                output["scores"], labels, args.margin, args.margin_weight,
+                args.hardest_negative_weight,
             )
             if training:
                 (loss / args.gradient_accumulation_steps).backward()
@@ -165,6 +173,7 @@ def run_split(
             losses.append(float(loss.detach().cpu()))
             listwise_losses.append(float(components["listwise_loss"].detach().cpu()))
             pairwise_losses.append(float(components["pairwise_loss"].detach().cpu()))
+            hardest_losses.append(float(components["hardest_negative_loss"].detach().cpu()))
             predictions.append(prediction_row(row, output))
             if not training:
                 control = forward_schema_control(
@@ -194,6 +203,9 @@ def run_split(
             "loss": sum(losses) / len(losses) if losses else 0.0,
             "listwise_loss": sum(listwise_losses) / len(listwise_losses) if listwise_losses else 0.0,
             "pairwise_loss": sum(pairwise_losses) / len(pairwise_losses) if pairwise_losses else 0.0,
+            "hardest_negative_loss": (
+                sum(hardest_losses) / len(hardest_losses) if hardest_losses else 0.0
+            ),
             "schema_control_positive_gain": (
                 sum(schema_control_gains) / len(schema_control_gains)
                 if schema_control_gains else None
@@ -230,6 +242,7 @@ def main():
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--margin", type=float, default=0.5)
     parser.add_argument("--margin-weight", type=float, default=0.5)
+    parser.add_argument("--hardest-negative-weight", type=float, default=0.5)
     parser.add_argument("--gradient-accumulation-steps", type=int, default=1)
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
     parser.add_argument("--patience", type=int, default=3)

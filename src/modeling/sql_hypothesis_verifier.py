@@ -9,6 +9,125 @@ from src.modeling.dynamic_grounding_controller import StateConditionedRGTALayer
 
 
 PLAN_RELATIONS = ["self", "next", "previous"]
+CONSISTENCY_FEATURE_NAMES = [
+    "owner_scan_coverage",
+    "scan_required_precision",
+    "join_scan_coverage",
+    "fk_validity",
+    "required_table_connectivity",
+    "join_required_coverage",
+    "multi_table_join_present",
+    "extra_scan_ratio",
+    "missing_owner_ratio",
+    "invalid_join_ratio",
+]
+
+
+def plan_schema_consistency_features(schema_items, schema_edges, candidate):
+    """Inference-safe consistency factors derived from a concrete plan binding."""
+    by_id = {int(item["id"]): item for item in schema_items}
+    table_name_to_id = {
+        item.get("name"): item_id
+        for item_id, item in by_id.items()
+        if item.get("type") == "table"
+    }
+
+    def owner(column_id):
+        item = by_id.get(int(column_id), {})
+        return table_name_to_id.get(item.get("table")) if item.get("type") == "column" else None
+
+    scan_tables = {
+        int(table_id)
+        for step in candidate.get("steps", [])
+        if step.get("action") == "SCAN"
+        for table_id in step.get("table_pointer_ids", [])
+        if int(table_id) in by_id and by_id[int(table_id)].get("type") == "table"
+    }
+    referenced_owners = {
+        table_id
+        for step in candidate.get("steps", [])
+        for column_id in step.get("column_pointer_ids", [])
+        for table_id in [owner(column_id)]
+        if table_id is not None
+    }
+    required_tables = scan_tables | referenced_owners
+    join_pairs = [
+        tuple(sorted((int(edge["left_column_id"]), int(edge["right_column_id"]))))
+        for step in candidate.get("steps", [])
+        for edge in step.get("join_edge_targets", [])
+    ]
+    valid_fk_pairs = {
+        tuple(sorted((int(edge["src"]), int(edge["dst"]))))
+        for edge in schema_edges or []
+        if edge.get("type") in {"foreign_key_forward", "foreign_key_backward"}
+    }
+    join_owner_pairs = []
+    for left, right in join_pairs:
+        left_owner, right_owner = owner(left), owner(right)
+        if left_owner is not None and right_owner is not None:
+            join_owner_pairs.append((left_owner, right_owner))
+
+    def ratio(numerator, denominator, empty=1.0):
+        return numerator / denominator if denominator else empty
+
+    owner_scan_coverage = ratio(len(referenced_owners & scan_tables), len(referenced_owners))
+    scan_required_precision = (
+        ratio(len(scan_tables & referenced_owners), len(scan_tables))
+        if referenced_owners else 1.0
+    )
+    join_scan_coverage = ratio(
+        sum(left in scan_tables and right in scan_tables for left, right in join_owner_pairs),
+        len(join_owner_pairs),
+    )
+    fk_validity = ratio(sum(pair in valid_fk_pairs for pair in join_pairs), len(join_pairs))
+    join_required_coverage = ratio(
+        sum(left in required_tables and right in required_tables for left, right in join_owner_pairs),
+        len(join_owner_pairs),
+    )
+
+    adjacency = {table_id: set() for table_id in required_tables}
+    for left, right in join_owner_pairs:
+        if left in required_tables and right in required_tables:
+            adjacency[left].add(right)
+            adjacency[right].add(left)
+    if len(required_tables) <= 1:
+        connectivity = 1.0
+    else:
+        largest = 0
+        unseen = set(required_tables)
+        while unseen:
+            frontier = [unseen.pop()]
+            size = 0
+            while frontier:
+                current = frontier.pop()
+                size += 1
+                for neighbor in adjacency.get(current, set()):
+                    if neighbor in unseen:
+                        unseen.remove(neighbor)
+                        frontier.append(neighbor)
+            largest = max(largest, size)
+        connectivity = largest / len(required_tables)
+
+    multi_table_join_present = float(len(required_tables) <= 1 or bool(join_owner_pairs))
+    extra_scan_ratio = (
+        ratio(len(scan_tables - referenced_owners), len(scan_tables), empty=0.0)
+        if referenced_owners else 0.0
+    )
+    missing_owner_ratio = 1.0 - owner_scan_coverage
+    invalid_join_ratio = 1.0 - fk_validity
+    values = [
+        owner_scan_coverage,
+        scan_required_precision,
+        join_scan_coverage,
+        fk_validity,
+        connectivity,
+        join_required_coverage,
+        multi_table_join_present,
+        extra_scan_ratio,
+        missing_owner_ratio,
+        invalid_join_ratio,
+    ]
+    return values, dict(zip(CONSISTENCY_FEATURE_NAMES, values))
 
 
 class SQLHypothesisGraphVerifier(nn.Module):
@@ -75,8 +194,16 @@ class SQLHypothesisGraphVerifier(nn.Module):
             nn.GELU(),
             nn.Linear(hidden_dim, 1),
         )
+        self.consistency_encoder = nn.Sequential(
+            nn.Linear(len(CONSISTENCY_FEATURE_NAMES), hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+        self.consistency_energy = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim), nn.GELU(), nn.Linear(hidden_dim, 1)
+        )
         self.global_score = nn.Sequential(
-            nn.Linear(hidden_dim * 4 + 3, hidden_dim),
+            nn.Linear(hidden_dim * 5 + 3 + len(CONSISTENCY_FEATURE_NAMES), hidden_dim),
             nn.GELU(),
             nn.Dropout(dropout),
             nn.Linear(hidden_dim, 1),
@@ -128,7 +255,7 @@ class SQLHypothesisGraphVerifier(nn.Module):
             torch.tensor(types, dtype=torch.long, device=device),
         )
 
-    def score_candidate(self, schema_states, query, schema_items, candidate):
+    def score_candidate(self, schema_states, query, schema_items, schema_edges, candidate):
         device = schema_states.device
         id_to_position = {int(item["id"]): index for index, item in enumerate(schema_items)}
         step_states, raw_step_energies, join_scores = [], [], []
@@ -216,19 +343,35 @@ class SQLHypothesisGraphVerifier(nn.Module):
         global_numeric = query.new_tensor(
             [min(len(step_states) / 12.0, 1.0), pointer_validity, float(bool(join_scores))]
         )
+        consistency_values, consistency_debug = plan_schema_consistency_features(
+            schema_items, schema_edges, candidate
+        )
+        consistency_numeric = query.new_tensor(consistency_values)
+        consistency_state = self.consistency_encoder(consistency_numeric)
+        consistency_energy = self.consistency_energy(consistency_state).squeeze()
         score = self.global_score(
             torch.cat(
-                [plan_summary, query, plan_summary * query, torch.abs(plan_summary - query), global_numeric],
+                [
+                    plan_summary,
+                    query,
+                    plan_summary * query,
+                    torch.abs(plan_summary - query),
+                    consistency_state,
+                    global_numeric,
+                    consistency_numeric,
+                ],
                 dim=-1,
             )
         ).squeeze()
-        score = score + 0.25 * step_energy + 0.25 * join_energy
+        score = score + 0.25 * step_energy + 0.25 * join_energy + 0.25 * consistency_energy
         return {
             "score": score,
             "step_energy": step_energy,
             "join_energy": join_energy,
             "plan_summary": plan_summary,
             "pointer_validity": pointer_validity,
+            "consistency_energy": consistency_energy,
+            "consistency_features": consistency_debug,
         }
 
     def forward(
@@ -239,13 +382,14 @@ class SQLHypothesisGraphVerifier(nn.Module):
         edge_index,
         edge_type,
         schema_items,
+        schema_edges,
         candidates,
     ):
         schema_states, query = self.encode_schema(
             dense_nodes, query_embedding, node_type_ids, edge_index, edge_type
         )
         outputs = [
-            self.score_candidate(schema_states, query, schema_items, candidate)
+            self.score_candidate(schema_states, query, schema_items, schema_edges, candidate)
             for candidate in candidates
         ]
         return {
@@ -256,7 +400,13 @@ class SQLHypothesisGraphVerifier(nn.Module):
         }
 
 
-def grouped_ranking_loss(scores, labels, margin=0.5, margin_weight=0.5):
+def grouped_ranking_loss(
+    scores,
+    labels,
+    margin=0.5,
+    margin_weight=0.5,
+    hardest_negative_weight=0.5,
+):
     positive = torch.nonzero(labels > 0.5, as_tuple=False).flatten()
     negative = torch.nonzero(labels <= 0.5, as_tuple=False).flatten()
     if positive.numel() != 1:
@@ -265,9 +415,16 @@ def grouped_ranking_loss(scores, labels, margin=0.5, margin_weight=0.5):
     listwise = F.cross_entropy(scores.unsqueeze(0), target)
     if negative.numel():
         pairwise = F.relu(margin - scores[positive[0]] + scores[negative]).mean()
+        hardest = F.softplus(margin + scores[negative].max() - scores[positive[0]])
     else:
         pairwise = scores.sum() * 0.0
-    return listwise + float(margin_weight) * pairwise, {
+        hardest = scores.sum() * 0.0
+    return (
+        listwise
+        + float(margin_weight) * pairwise
+        + float(hardest_negative_weight) * hardest
+    ), {
         "listwise_loss": listwise,
         "pairwise_loss": pairwise,
+        "hardest_negative_loss": hardest,
     }
