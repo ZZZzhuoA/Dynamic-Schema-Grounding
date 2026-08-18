@@ -209,3 +209,37 @@ Stage 14B-fix1 因而作出以下修改：
    complete 至少高 0.03。
 
 Fix1 必须重新执行 5.1--5.5；旧 slot embedding cache 与旧 Stage 14B checkpoint 不兼容，不能复用。
+
+## 8. Fix1 最终结论：绝对性能有效、语义身份因果验证失败
+
+Fix1 在 BIRD dev 前 100 条上的结果为：
+
+| Variant | Column recall | Semantic complete | Assembly recall | Complete coverage |
+|---|---:|---:|---:|---:|
+| correct | 0.468454 | 0.363144 | 0.580599 | 0.01 |
+| action-only | 0.462145 | 0.349593 | 0.564907 | 0.00 |
+| shuffled | 0.454259 | 0.357724 | 0.573467 | 0.02 |
+| same-action shuffled | 0.465300 | 0.357724 | 0.574893 | 0.01 |
+
+相对 Stage 14A-fix1，`correct` 的 column recall、semantic-step complete 和 assembled schema
+recall 分别提高 `8.36pp`、`5.42pp` 和 `4.28pp`。其中 FILTER、PROJECT、SORT column recall
+分别提高 `8.15pp`、`9.20pp` 和 `14.00pp`，说明局部 focus/value 表示、type/action 融合及
+对比损失对绝对性能有帮助。
+
+但是，`correct` 相对更严格的 `same-action shuffled` 仅获得：
+
+- column recall：`+0.32pp`；
+- semantic complete：`+0.54pp`；
+- assembly recall：`+0.57pp`。
+
+虽然 candidate ranking change rate 为 `14.29%`，变化主要发生在候选内部排序，没有转化为目标列
+进入候选集。与此同时，table recall 与 join-edge recall 相对 Stage 14A 分别下降 `3.86pp` 和
+`3.66pp`。因此预注册的绝对性能门和语义身份因果门均未通过。
+
+本阶段的正式结论是：
+
+> **绝对性能有效、语义身份因果验证失败。** 模型主要利用 action、schema type、全局 question
+> embedding 和图结构先验，没有可靠学习 semantic slot 的具体身份。
+
+因此不进入 Stage 14C joint slot-schema assignment，也不继续调 semantic residual scale。后续转向
+Stage 15：让 LLM 负责提出完整 SQL 假设，让 RGTA 计算候选 SQL 与数据库图之间的后验结构一致性能量。

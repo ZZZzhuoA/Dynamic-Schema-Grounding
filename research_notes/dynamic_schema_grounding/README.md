@@ -62,6 +62,7 @@ Next SQL Token / Clause
 - [29_research_path_retrospective.md](./29_research_path_retrospective.md)：从 Stage 0 到 Stage 13C 的完整研究复盘、创新分级、负结果和下一步决策门。
 - [30_stage14_typed_graph_tool_interface.md](./30_stage14_typed_graph_tool_interface.md)：显式 Typed RGTA Schema Tool、约束组装、诊断协议与服务器命令。
 - [31_stage14b_semantic_slot_graph_binder.md](./31_stage14b_semantic_slot_graph_binder.md)：语义槽位条件化 RGTA、表—列层次先验、同表 hard negatives，以及 correct/action-only/shuffled 因果实验。
+- [32_stage15a_graph_grounded_sql_verifier.md](./32_stage15a_graph_grounded_sql_verifier.md)：LLM SQL 假设之后的 typed plan–schema graph 后验验证器、困难结构负样本及决策门。
 
 ## 一句话版本
 
