@@ -63,6 +63,7 @@ Next SQL Token / Clause
 - [30_stage14_typed_graph_tool_interface.md](./30_stage14_typed_graph_tool_interface.md)：显式 Typed RGTA Schema Tool、约束组装、诊断协议与服务器命令。
 - [31_stage14b_semantic_slot_graph_binder.md](./31_stage14b_semantic_slot_graph_binder.md)：语义槽位条件化 RGTA、表—列层次先验、同表 hard negatives，以及 correct/action-only/shuffled 因果实验。
 - [32_stage15a_graph_grounded_sql_verifier.md](./32_stage15a_graph_grounded_sql_verifier.md)：LLM SQL 假设之后的 typed plan–schema graph 后验验证器、困难结构负样本及决策门。
+- [33_stage15b_real_sql_candidate_reranking.md](./33_stage15b_real_sql_candidate_reranking.md)：真实 LLM SQL 候选生成、candidate-owned typed plan、执行判等及 Stage 15A-fix1 后验重排。
 
 ## 一句话版本
 
