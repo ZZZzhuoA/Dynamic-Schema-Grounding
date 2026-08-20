@@ -75,6 +75,27 @@ def parse_choices(response):
     return parsed
 
 
+def request_payload(model, prompt, n, args, seed, temperature=None, top_p=None):
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": "You are an expert SQLite SQL generator. Return only SQL."},
+            {"role": "user", "content": prompt},
+        ],
+        "n": int(n),
+        "temperature": float(args.temperature if temperature is None else temperature),
+        "top_p": float(args.top_p if top_p is None else top_p),
+        "max_tokens": int(args.max_tokens),
+        "stream": False,
+        "seed": int(seed),
+    }
+    if args.request_logprobs:
+        payload["logprobs"] = True
+    if args.disable_thinking:
+        payload["enable_thinking"] = False
+    return payload
+
+
 class CandidateClient:
     def __init__(self, base_url, api_key, model, timeout):
         self.url = base_url.rstrip("/") + "/chat/completions"
@@ -82,24 +103,10 @@ class CandidateClient:
         self.model = model
         self.timeout = timeout
 
-    def generate(self, prompt, n, args, seed):
-        payload = {
-            "model": self.model,
-            "messages": [
-                {"role": "system", "content": "You are an expert SQLite SQL generator. Return only SQL."},
-                {"role": "user", "content": prompt},
-            ],
-            "n": int(n),
-            "temperature": float(args.temperature),
-            "top_p": float(args.top_p),
-            "max_tokens": int(args.max_tokens),
-            "stream": False,
-            "seed": int(seed),
-        }
-        if args.request_logprobs:
-            payload["logprobs"] = True
-        if args.disable_thinking:
-            payload["enable_thinking"] = False
+    def generate(self, prompt, n, args, seed, temperature=None, top_p=None):
+        payload = request_payload(
+            self.model, prompt, n, args, seed, temperature=temperature, top_p=top_p
+        )
         request = urllib.request.Request(
             self.url,
             data=json.dumps(payload).encode("utf-8"),
@@ -150,6 +157,12 @@ def main():
     parser.add_argument("--model", default=os.environ.get("LLM_MODEL", "qwen2.5-coder-32b"))
     parser.add_argument("--api-key-env", default="LLM_API_KEY")
     parser.add_argument("--candidate-count", type=int, default=8)
+    parser.add_argument(
+        "--greedy-anchor",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Reserve candidate 0 for a separate temperature=0 request.",
+    )
     parser.add_argument("--max-rounds", type=int, default=3)
     parser.add_argument("--temperature", type=float, default=0.7)
     parser.add_argument("--top-p", type=float, default=0.95)
@@ -177,6 +190,35 @@ def main():
         if record_index in completed:
             continue
         candidates, seen, errors = [], set(), []
+        if args.greedy_anchor:
+            try:
+                response = client.generate(
+                    item["prompt"], 1, args, args.seed + record_index * 1009,
+                    temperature=0.0, top_p=1.0,
+                )
+                greedy = parse_choices(response)
+                if greedy:
+                    candidate = greedy[0]
+                    signature = sql_signature(candidate["generated_sql"])
+                    if signature:
+                        seen.add(signature)
+                        candidate.update(
+                            {
+                                "candidate_id": "greedy",
+                                "llm_rank": 0,
+                                "generation_mode": "greedy",
+                                "generation_round": -1,
+                            }
+                        )
+                        candidates.append(candidate)
+            except (
+                urllib.error.HTTPError,
+                urllib.error.URLError,
+                TimeoutError,
+                KeyError,
+                json.JSONDecodeError,
+            ) as exc:
+                errors.append("greedy: " + error_text(exc))
         for round_index in range(args.max_rounds):
             remaining = args.candidate_count - len(candidates)
             if remaining <= 0:
@@ -191,8 +233,9 @@ def main():
                     if not signature or signature in seen:
                         continue
                     seen.add(signature)
-                    candidate["candidate_id"] = f"llm_{len(candidates)}"
+                    candidate["candidate_id"] = f"sample_{len(candidates)}"
                     candidate["llm_rank"] = len(candidates)
+                    candidate["generation_mode"] = "sample"
                     candidate["generation_round"] = round_index
                     candidates.append(candidate)
                     if len(candidates) >= args.candidate_count:

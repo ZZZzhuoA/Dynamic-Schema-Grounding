@@ -1,17 +1,15 @@
 """Apply the Stage 15A-fix1 verifier to real LLM SQL hypotheses."""
 
 import argparse
+import copy
 import json
+import random
 import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
-
-from src.modeling.stage13c_static_runtime import graph_tensors
-from src.training.stage13b_train_typed_ra_decoder import load_cache
-
 
 def read_jsonl(path, limit=None):
     rows = []
@@ -32,6 +30,51 @@ def write_jsonl(path, rows):
             handle.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 
+def shuffled_fk_row(row, seed):
+    """Corrupt FK destinations while preserving all non-FK graph evidence."""
+    result = copy.deepcopy(row)
+    edges = result["inference_inputs"].get("schema_edges", [])
+    indices = [
+        index for index, edge in enumerate(edges)
+        if edge.get("type") in {"foreign_key_forward", "foreign_key_backward"}
+    ]
+    destinations = [int(edges[index]["dst"]) for index in indices]
+    if len(destinations) > 1:
+        rng = random.Random(seed)
+        shift = rng.randrange(1, len(destinations))
+        destinations = destinations[shift:] + destinations[:shift]
+        for index, destination in zip(indices, destinations):
+            edges[index]["dst"] = destination
+    elif destinations:
+        node_count = len(result["inference_inputs"].get("schema_items", []))
+        edges[indices[0]]["dst"] = (destinations[0] + 1) % max(node_count, 1)
+    return result
+
+
+def shuffled_identity_dense(dense, node_types, seed, torch):
+    """Shuffle semantic node embeddings within table/column types, keeping topology fixed."""
+    permutation = list(range(int(dense.shape[0])))
+    rng = random.Random(seed)
+    for node_type in (0, 1):
+        positions = [
+            index for index, value in enumerate(node_types.detach().cpu().tolist())
+            if int(value) == node_type
+        ]
+        shuffled = list(positions)
+        rng.shuffle(shuffled)
+        for target, source in zip(positions, shuffled):
+            permutation[target] = source
+    return dense[torch.tensor(permutation, dtype=torch.long, device=dense.device)]
+
+
+def model_scores(model, tensors, schema_edges, candidates):
+    dense, query, node_types, edge_index, edge_type, schema_items = tensors
+    return model(
+        dense, query, node_types, edge_index, edge_type,
+        schema_items, schema_edges, candidates,
+    )
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--candidate-file", required=True)
@@ -42,6 +85,12 @@ def main():
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--limit", type=int)
     parser.add_argument("--flat-only", action="store_true", help="Do not score partial nested/set-query parses")
+    parser.add_argument(
+        "--control-modes",
+        default="shuffled_fk,shuffled_node_identity",
+        help="Comma-separated causal controls; use an empty string to disable.",
+    )
+    parser.add_argument("--control-seed", type=int, default=42)
     args = parser.parse_args()
 
     try:
@@ -50,6 +99,8 @@ def main():
     except ImportError as exc:
         raise RuntimeError("Stage 15B scoring requires numpy and PyTorch") from exc
     from src.modeling.sql_hypothesis_verifier import SQLHypothesisGraphVerifier
+    from src.modeling.stage13c_static_runtime import graph_tensors
+    from src.training.stage13b_train_typed_ra_decoder import load_cache
 
     device = torch.device(args.device)
     checkpoint = torch.load(args.checkpoint, map_location="cpu")
@@ -71,7 +122,12 @@ def main():
     model.load_state_dict(checkpoint["model_state_dict"], strict=True)
     model.eval()
 
+    control_modes = [value.strip() for value in args.control_modes.split(",") if value.strip()]
+    unknown = set(control_modes) - {"shuffled_fk", "shuffled_node_identity"}
+    if unknown:
+        raise ValueError(f"Unknown control modes: {sorted(unknown)}")
     output, scored_count = [], 0
+    control_scored_counts = {mode: 0 for mode in control_modes}
     with torch.no_grad():
         for row in read_jsonl(args.candidate_file, args.limit):
             eligible_indices = [
@@ -85,15 +141,9 @@ def main():
                     row, cache, relation_to_id, device
                 )
                 candidates = [row["candidates"][index] for index in eligible_indices]
-                scores = model(
-                    dense,
-                    query,
-                    node_types,
-                    edge_index,
-                    edge_type,
-                    schema_items,
-                    row["inference_inputs"].get("schema_edges", []),
-                    candidates,
+                tensors = (dense, query, node_types, edge_index, edge_type, schema_items)
+                scores = model_scores(
+                    model, tensors, row["inference_inputs"].get("schema_edges", []), candidates
                 )
                 for source_index, score, detail in zip(
                     eligible_indices, scores["scores"], scores["candidate_outputs"]
@@ -108,9 +158,40 @@ def main():
                         "consistency_features": detail["consistency_features"],
                     }
                     scored_count += 1
+                control_outputs = {}
+                control_seed = args.control_seed + int(row["record_index"]) * 1009
+                if "shuffled_fk" in control_modes:
+                    control_row = shuffled_fk_row(row, control_seed)
+                    control_tensors = graph_tensors(control_row, cache, relation_to_id, device)
+                    control_outputs["shuffled_fk"] = model_scores(
+                        model,
+                        control_tensors,
+                        control_row["inference_inputs"].get("schema_edges", []),
+                        candidates,
+                    )
+                if "shuffled_node_identity" in control_modes:
+                    shuffled_dense = shuffled_identity_dense(
+                        dense, node_types, control_seed + 17, torch
+                    )
+                    identity_tensors = (
+                        shuffled_dense, query, node_types, edge_index, edge_type, schema_items
+                    )
+                    control_outputs["shuffled_node_identity"] = model_scores(
+                        model,
+                        identity_tensors,
+                        row["inference_inputs"].get("schema_edges", []),
+                        candidates,
+                    )
+                for mode, control in control_outputs.items():
+                    for source_index, score in zip(eligible_indices, control["scores"]):
+                        result["candidates"][source_index].setdefault("control_scores", {})[
+                            mode
+                        ] = float(score.detach().float().cpu())
+                        control_scored_counts[mode] += 1
             for index, candidate in enumerate(result.get("candidates", [])):
                 candidate.setdefault("verifier_score", None)
                 candidate.setdefault("verifier_detail", None)
+                candidate.setdefault("control_scores", {})
             output.append(result)
 
     write_jsonl(args.output_file, output)
@@ -120,6 +201,8 @@ def main():
         "group_count": len(output),
         "candidate_count": sum(len(row.get("candidates", [])) for row in output),
         "scored_candidate_count": scored_count,
+        "control_scored_candidate_counts": control_scored_counts,
+        "control_modes": control_modes,
         "flat_only": args.flat_only,
     }
     Path(args.output_file).with_suffix(".summary.json").write_text(

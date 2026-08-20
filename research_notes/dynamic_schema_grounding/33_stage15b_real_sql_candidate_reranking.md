@@ -112,3 +112,97 @@ Stage 15B 是否值得继续训练真实候选 verifier，依次看：
 3. `flat-only` 与全部候选差异是否显示 parser 为瓶颈；
 4. 若 synthetic Hits@1 很高但 real-candidate verifier 无增益，说明合成 corruption 与 LLM 真实错误分布不匹配，下一步应使用 OOF/真实候选训练，而不是继续调 Stage 15A 合成负样本。
 
+## 6. Stage 15B 首轮结果
+
+在 1393 条 clean dev queries、5686 个去重候选上：
+
+- first sampled candidate EX：`0.5327`；
+- execution-filter EX：`0.5406`；
+- verifier + execution-filter EX：`0.5477`；
+- descriptive hybrid alpha=0.75 EX：`0.5528`；
+- Oracle EX：`0.6432`。
+
+alpha=0.75 相比第一随机样本恢复 82 条、回退 54 条，净增益 28 条。结果证明真实候选后验
+验证有价值，但同时暴露两个实验缺陷：第一候选来自 temperature=0.7，不能称为标准 greedy
+baseline；alpha 也在同一 dev 上观察，不能作为无偏结果。
+
+## 7. Stage 15B-fix1：因果与校准协议
+
+### 7.1 创新点与原理
+
+Stage 15B-fix1 不增加手工 schema 规则，而把后验验证写成可证伪的结构实验：
+
+1. **Greedy-anchored hypothesis set**：候选 0 由独立 temperature=0 请求产生，其余候选负责
+   探索多样性。这样重排增益相对于确定的 LLM policy，而不是随机样本顺序。
+2. **Graph counterfactual controls**：正确图与 shuffled-FK、shuffled-node-identity 使用完全相同的
+   LLM candidates。若只有正确图能提升，才能把收益归因于关系结构和节点语义身份。
+3. **Calibration/held-out separation**：只在 20% calibration queries 上选择融合 alpha，在不相交的
+   80% 上报告 EX，避免融合权重对同一评估集过拟合。
+4. **Oracle-reachable diagnosis**：对“正确 SQL 已在候选集但仍未选中”的问题比较 typed-plan
+   因子，区分 table、column、clause binding、operator、join edge、value route 和 parser failure。
+
+### 7.2 clean-1393 候选生成
+
+使用新输出目录，不能 `--resume` 到 Stage 15B 的旧随机首候选文件：
+
+```bash
+python src/generation/stage15b_generate_sql_candidates.py \
+  --prompt-file experiments/stage3_prompt_sql_generation/prompts_full_schema_dev.jsonl \
+  --record-index-file experiments/stage13b_clean_typed_trajectories/dev_trajectories.jsonl \
+  --output-file experiments/stage15b_fix1_real_candidates/qwen25_greedy_k8_clean1393.jsonl \
+  --base-url http://127.0.0.1:9009/v1 \
+  --model qwen2.5-coder-32b \
+  --candidate-count 8 \
+  --greedy-anchor \
+  --max-rounds 3 \
+  --temperature 0.7 \
+  --top-p 0.95 \
+  --max-tokens 768 \
+  --request-logprobs \
+  --disable-thinking \
+  --resume
+```
+
+完整 1534 条实验删除 `--record-index-file`，输出到另一个文件；prepare 阶段将 graph file 改为：
+
+```text
+experiments/stage13a_typed_ra_typefix1/dev_typed_ra.jsonl
+```
+
+### 7.3 prepare、正确图与反事实图打分
+
+```bash
+python src/data/stage15b_prepare_real_sql_candidates.py \
+  --generation-file experiments/stage15b_fix1_real_candidates/qwen25_greedy_k8_clean1393.jsonl \
+  --graph-file experiments/stage13b_clean_typed_trajectories/dev_trajectories.jsonl \
+  --db-root Data/BIRD/dev_databases \
+  --output-file experiments/stage15b_fix1_real_candidates/qwen25_greedy_k8_clean1393_prepared.jsonl
+
+CUDA_VISIBLE_DEVICES=7 python src/grounding/stage15b_score_real_sql_candidates.py \
+  --candidate-file experiments/stage15b_fix1_real_candidates/qwen25_greedy_k8_clean1393_prepared.jsonl \
+  --checkpoint experiments/stage15a_fix1_consistency_rgta_seed42/sql_hypothesis_verifier.pt \
+  --embedding-cache-dir experiments/stage8g_embedding_cache_corrected_qwen3_06b \
+  --output-file experiments/stage15b_fix1_real_candidates/qwen25_greedy_k8_clean1393_scored.jsonl \
+  --control-modes shuffled_fk,shuffled_node_identity \
+  --control-seed 42 \
+  --device cuda
+```
+
+### 7.4 calibration/held-out 评估与错误诊断
+
+```bash
+python src/evaluation/stage15b_evaluate_real_sql_reranking.py \
+  --scored-file experiments/stage15b_fix1_real_candidates/qwen25_greedy_k8_clean1393_scored.jsonl \
+  --output-dir experiments/stage15b_fix1_real_candidates/evaluation_clean1393 \
+  --hybrid-alphas 0,0.25,0.5,0.75,1 \
+  --calibration-fraction 0.2 \
+  --calibration-seed 42
+
+python src/diagnosis/stage15b_oracle_reranking_diagnosis.py \
+  --scored-file experiments/stage15b_fix1_real_candidates/qwen25_greedy_k8_clean1393_scored.jsonl \
+  --output-dir experiments/stage15b_fix1_real_candidates/diagnosis_clean1393 \
+  --alpha 0.75
+```
+
+诊断命令中的 alpha 应替换为 `metrics.json -> calibrated_protocol.selected_alpha`。正确图的 held-out
+结果必须同时高于 greedy baseline 和两种 counterfactual control，才算通过图结构因果门。
