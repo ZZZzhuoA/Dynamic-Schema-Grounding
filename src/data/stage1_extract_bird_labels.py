@@ -316,10 +316,30 @@ def sql_parse_labels(sql, schema):
     return labels, used_tables
 
 
-def fk_labels(used_tables, schema):
+def fk_labels(used_tables, schema, sql_labels=None, mode="explicit_sql"):
+    """Return FK endpoint labels under an explicit, auditable policy.
+
+    ``all_used_tables`` preserves the original Stage 1 behavior: every FK between
+    any two SQL-used tables is labeled, even if that edge is not present in the
+    SQL.  It is retained only for reproducing legacy experiments.
+
+    ``explicit_sql`` keeps an FK pair only when both endpoints were actually
+    recovered from the SQL text.  The endpoints are already members of
+    ``sql_labels``; the separate source records that they form a schema FK without
+    expanding the gold target.  This avoids adding unrelated parallel FKs such as
+    every ``Match.home_player_*`` edge merely because Match and Player co-occur.
+    """
+    if mode not in {"explicit_sql", "all_used_tables", "none"}:
+        raise ValueError(f"Unsupported fk label mode: {mode}")
+    if mode == "none":
+        return set()
+
+    sql_labels = set(sql_labels or [])
     labels = set()
     for fk in schema["foreign_keys"]:
-        if fk["left_table"] in used_tables and fk["right_table"] in used_tables:
+        tables_used = fk["left_table"] in used_tables and fk["right_table"] in used_tables
+        endpoints_explicit = fk["left_id"] in sql_labels and fk["right_id"] in sql_labels
+        if tables_used and (mode == "all_used_tables" or endpoints_explicit):
             labels.add(fk["left_id"])
             labels.add(fk["right_id"])
     return labels
@@ -329,7 +349,7 @@ def item_names(schema_items, ids):
     return [schema_items[item_id]["name"] for item_id in sorted(ids)]
 
 
-def process_records(records, schemas, split):
+def process_records(records, schemas, split, fk_label_mode="explicit_sql"):
     output = []
     failed = []
     stats = Counter()
@@ -351,8 +371,27 @@ def process_records(records, schemas, split):
         sql_labels, used_tables = sql_parse_labels(record.get("sql") or "", schema)
         labels_by_source["sql_parse"].update(sql_labels)
 
-        join_labels = fk_labels(used_tables, schema)
+        join_labels = fk_labels(
+            used_tables,
+            schema,
+            sql_labels=sql_labels,
+            mode=fk_label_mode,
+        )
         labels_by_source["foreign_key"].update(join_labels)
+
+        # Keep the legacy expansion out of the target while exposing exactly how
+        # many labels the former policy would have added.  This makes old/new
+        # complete-coverage results directly auditable.
+        legacy_join_labels = fk_labels(
+            used_tables,
+            schema,
+            sql_labels=sql_labels,
+            mode="all_used_tables",
+        )
+        legacy_fk_only = legacy_join_labels - sql_labels - hit_labels
+        if legacy_fk_only:
+            stats["legacy_fk_extra_samples"] += 1
+            stats["legacy_fk_extra_labels"] += len(legacy_fk_only)
 
         merged = set()
         for source, ids in labels_by_source.items():
@@ -388,6 +427,11 @@ def process_records(records, schemas, split):
             "label_sources": {
                 source: item_names(schema_items, ids)
                 for source, ids in sorted(labels_by_source.items())
+            },
+            "label_policy": {
+                "fk_label_mode": fk_label_mode,
+                "legacy_fk_extra_ids": sorted(legacy_fk_only),
+                "legacy_fk_extra_names": item_names(schema_items, legacy_fk_only),
             },
             "used_tables_from_sql": sorted(used_tables),
             "hit_info": record.get("hit_info") or {},
@@ -429,6 +473,15 @@ def main():
     parser.add_argument("--output-dir", default="experiments/stage1_label_extraction")
     parser.add_argument("--splits", default="train,dev")
     parser.add_argument("--limit", type=int, default=None)
+    parser.add_argument(
+        "--fk-label-mode",
+        choices=["explicit_sql", "all_used_tables", "none"],
+        default="explicit_sql",
+        help=(
+            "How FK endpoints enter gold schema labels. explicit_sql is the corrected default; "
+            "all_used_tables reproduces the legacy over-closure policy."
+        ),
+    )
     args = parser.parse_args()
 
     bird_dir = Path(args.bird_dir)
@@ -444,6 +497,7 @@ def main():
             "output_dir": str(output_dir),
             "splits": args.splits,
             "limit": args.limit,
+            "fk_label_mode": args.fk_label_mode,
         },
         "schema_db_count": {
             "train": len(train_schemas),
@@ -473,7 +527,12 @@ def main():
         if args.limit is not None:
             records = records[: args.limit]
 
-        output, failed, statistics = process_records(records, schemas, split)
+        output, failed, statistics = process_records(
+            records,
+            schemas,
+            split,
+            fk_label_mode=args.fk_label_mode,
+        )
         write_jsonl(output_dir / f"bird_{split}_grounding_labels.jsonl", output)
         write_jsonl(output_dir / f"bird_{split}_failed_label_cases.jsonl", failed)
         all_stats[split] = statistics
