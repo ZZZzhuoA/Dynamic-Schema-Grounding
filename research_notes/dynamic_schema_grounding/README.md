@@ -65,6 +65,7 @@ Next SQL Token / Clause
 - [32_stage15a_graph_grounded_sql_verifier.md](./32_stage15a_graph_grounded_sql_verifier.md)：LLM SQL 假设之后的 typed plan–schema graph 后验验证器、困难结构负样本及决策门。
 - [33_stage15b_real_sql_candidate_reranking.md](./33_stage15b_real_sql_candidate_reranking.md)：真实 LLM SQL 候选生成、candidate-owned typed plan、执行判等及 Stage 15A-fix1 后验重排。
 - [34_stage10_complete_coverage_label_audit.md](./34_stage10_complete_coverage_label_audit.md)：修正 used-table 全 FK 闭包造成的 gold 污染，并分层诊断 candidate、reranker 与 constrained selector 的完整覆盖损失。
+- [35_stage10e_frozen_llm_semantic_prior.md](./35_stage10e_frozen_llm_semantic_prior.md)：冻结 LLM 生成角色化节点语义先验，作为数值特征注入 Schema-RGTA，并用 zero/shuffled 控制验证语义身份因果作用。
 
 ## 一句话版本
 

@@ -141,6 +141,60 @@ def validate_and_filter_examples(examples, split):
     }
 
 
+def parse_named_files(specs):
+    """Parse repeated NAME=PATH arguments while preserving user-facing names."""
+    result = {}
+    for spec in specs or []:
+        if "=" not in spec:
+            raise ValueError(
+                f"Control file must use NAME=PATH syntax, received: {spec}"
+            )
+        name, path = spec.split("=", 1)
+        name = name.strip()
+        path = path.strip()
+        if not name or not path:
+            raise ValueError(f"Invalid control file specification: {spec}")
+        if not all(character.isalnum() or character in {"_", "-"} for character in name):
+            raise ValueError(
+                f"Control name may contain only letters, digits, '_' and '-': {name}"
+            )
+        if name in result:
+            raise ValueError(f"Duplicate control file name: {name}")
+        result[name] = Path(path)
+    return result
+
+
+def validate_control_alignment(reference, control, name, expected_numeric_dim):
+    if len(reference) != len(control):
+        raise ValueError(
+            f"Control '{name}' length mismatch: reference={len(reference)} control={len(control)}"
+        )
+    for ref, candidate in zip(reference, control):
+        ref_index = int(ref["record_index"])
+        candidate_index = int(candidate["record_index"])
+        if ref_index != candidate_index:
+            raise ValueError(
+                f"Control '{name}' record order mismatch: {ref_index} != {candidate_index}"
+            )
+        ref_ids = [int(node["schema_item_id"]) for node in ref["candidate_nodes"]]
+        candidate_ids = [
+            int(node["schema_item_id"]) for node in candidate["candidate_nodes"]
+        ]
+        if ref_ids != candidate_ids:
+            raise ValueError(
+                f"Control '{name}' candidate identity mismatch at record_index={ref_index}"
+            )
+        dimensions = {
+            len(node.get("numeric_features", []))
+            for node in candidate["candidate_nodes"]
+        }
+        if dimensions != {expected_numeric_dim}:
+            raise ValueError(
+                f"Control '{name}' numeric dimension mismatch at record_index={ref_index}: "
+                f"expected={expected_numeric_dim} actual={sorted(dimensions)}"
+            )
+
+
 def example_to_tensors(example, cache, maps, runtime, device):
     torch = runtime["torch"]
     full_nodes = full_node_embeddings(cache, example["record_index"])
@@ -761,6 +815,16 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--no-save-model", action="store_true")
+    parser.add_argument(
+        "--dev-control-file",
+        action="append",
+        default=[],
+        metavar="NAME=PATH",
+        help=(
+            "Evaluate the best checkpoint on an aligned dev feature control without "
+            "using it for checkpoint selection. May be repeated."
+        ),
+    )
     args = parser.parse_args()
     if args.coverage_loss_weight < 0:
         raise ValueError("coverage_loss_weight must be non-negative")
@@ -789,6 +853,20 @@ def main():
     )
     if not train_examples or not dev_examples:
         raise ValueError("Train/dev factor graph files must be non-empty")
+    numeric_dim = len(train_examples[0]["candidate_nodes"][0]["numeric_features"])
+    if len(dev_examples[0]["candidate_nodes"][0]["numeric_features"]) != numeric_dim:
+        raise ValueError("Train/dev numeric feature dimensions do not match")
+    control_paths = parse_named_files(args.dev_control_file)
+    dev_controls = {}
+    control_validation = {}
+    for name, path in control_paths.items():
+        raw_control = read_jsonl(path, args.dev_limit)
+        control_examples, report = validate_and_filter_examples(
+            raw_control, f"dev_control::{name}"
+        )
+        validate_control_alignment(dev_examples, control_examples, name, numeric_dim)
+        dev_controls[name] = control_examples
+        control_validation[name] = report
     train_cache = load_cache(args.embedding_cache_dir, "train", runtime)
     dev_cache = load_cache(args.embedding_cache_dir, "dev", runtime)
     schema_relations = collect_schema_relations(train_examples + dev_examples)
@@ -797,7 +875,6 @@ def main():
         "schema_relation_to_id": {name: index for index, name in enumerate(schema_relations)},
         "factor_numeric_dim": len(train_examples[0]["factors"][0]["numeric_features"]) if train_examples[0]["factors"] else 3,
     }
-    numeric_dim = len(train_examples[0]["candidate_nodes"][0]["numeric_features"])
     model = runtime["model"](
         dense_dim=train_cache["dense_dim"],
         numeric_dim=numeric_dim,
@@ -814,7 +891,11 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
     write_json(
         output_dir / "data_validation.json",
-        {"train": train_validation, "dev": dev_validation},
+        {
+            "train": train_validation,
+            "dev": dev_validation,
+            "dev_controls": control_validation,
+        },
     )
     config = vars(args).copy()
     config.update(
@@ -973,6 +1054,24 @@ def main():
     )
     write_json(output_dir / "dev_metrics.json", final_metrics)
     write_jsonl(output_dir / "dev_predictions.jsonl", predictions)
+    control_metrics = {}
+    for name, examples in dev_controls.items():
+        metrics, control_predictions = evaluate(
+            model,
+            examples,
+            dev_cache,
+            maps,
+            args,
+            runtime,
+            device,
+            f"dev_control::{name}",
+        )
+        control_metrics[name] = metrics
+        write_json(output_dir / f"dev_control_{name}_metrics.json", metrics)
+        write_jsonl(
+            output_dir / f"dev_control_{name}_predictions.jsonl",
+            control_predictions,
+        )
     summary = {
         "best_epoch": best_epoch,
         "best_checkpoint": best_checkpoint,
@@ -980,6 +1079,7 @@ def main():
         "selection_value": best_value,
         "dev_metrics": final_metrics,
         "best_metrics_during_training": best_metrics,
+        "dev_control_metrics": control_metrics,
         "last_epoch": log_rows[-1]["epoch"] if log_rows else 0,
         "evaluation_count": len(log_rows),
         "global_examples_seen": global_examples_seen,
