@@ -105,9 +105,17 @@ def main():
         else:
             continue
         outcomes[outcome] += 1
-        if outcome == "regressed":
+        if outcome == "recovered":
+            # Explain what the reranker corrected: greedy wrong -> selected correct.
+            comparison_index = baseline
+            reference_index = selected
+        elif outcome == "regressed":
+            # Explain what the reranker broke: selected wrong -> greedy correct.
+            comparison_index = selected
             reference_index = baseline
         else:
+            # Explain the remaining opportunity: selected wrong -> best-scored available correct.
+            comparison_index = selected if selected is not None else baseline
             reference_index = max(
                 correct_indices,
                 key=lambda index: (
@@ -116,7 +124,6 @@ def main():
                     else float("-inf")
                 ),
             )
-        comparison_index = selected if selected is not None else baseline
         differences = difference_types(candidates[comparison_index], candidates[reference_index])
         for name in differences:
             categories[f"{outcome}::{name}"] += 1
@@ -129,6 +136,7 @@ def main():
                 "method": method,
                 "baseline_index": baseline,
                 "selected_index": selected,
+                "comparison_index": comparison_index,
                 "reference_correct_index": reference_index,
                 "difference_types": differences,
                 "baseline_sql": candidates[baseline].get("generated_sql"),
