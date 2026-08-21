@@ -68,6 +68,7 @@ Next SQL Token / Clause
 - [35_stage10e_frozen_llm_semantic_prior.md](./35_stage10e_frozen_llm_semantic_prior.md)：冻结 LLM 生成角色化节点语义先验，作为数值特征注入 Schema-RGTA，并用 zero/shuffled 控制验证语义身份因果作用。
 - [36_stage10f_full_schema_steiner_join_closure.md](./36_stage10f_full_schema_steiner_join_closure.md)：保持语义 Top-30 不变，在完整 Schema FK 图上用 metric-closure MST 补充 Steiner join closure，并独立评估连通性恢复。
 - [37_scope_aware_semantic_label_fix.md](./37_scope_aware_semantic_label_fix.md)：修复同名列、表别名、quoted identifier 与嵌套查询作用域造成的 semantic gold 过标注，并重算 Stage 10-F 覆盖率。
+- [38_stage10g_table_conditioned_column_completion.md](./38_stage10g_table_conditioned_column_completion.md)：利用高置信表 belief 在完整表内检索缺失列，扩展 RGTA 候选图但保持最终固定 Top-30，并通过冻结 LLM prior 与 zero/shuffled 控制检验语义协同。
 
 ## 一句话版本
 
