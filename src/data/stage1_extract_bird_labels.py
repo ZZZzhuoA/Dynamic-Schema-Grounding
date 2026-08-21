@@ -225,12 +225,6 @@ def extract_table_aliases(sql, schema):
                     if possible_alias not in SQL_KEYWORDS:
                         aliases[normalize_name(possible_alias)] = norm_table
 
-    # Some BIRD SQL uses comma joins or quoted identifiers. Add any explicit table
-    # mention as a fallback, but only for exact normalized token matches.
-    for norm_table in schema["table_item_ids"]:
-        if re.search(rf"(?<![a-z0-9_]){re.escape(norm_table)}(?![a-z0-9_])", normalized_sql):
-            used_tables.add(norm_table)
-
     for norm_table in used_tables:
         aliases[norm_table] = norm_table
     return used_tables, aliases, normalized_sql
@@ -282,38 +276,199 @@ def add_delimited_identifier_labels(sql, schema, labels, used_tables, aliases):
         add_column_label_for_name(labels, schema, norm_identifier, candidate_tables)
 
 
-def sql_parse_labels(sql, schema):
-    labels = set()
-    used_tables, aliases, normalized_sql = extract_table_aliases(sql, schema)
+def split_direct_subqueries(sql):
+    """Mask direct SELECT subqueries and return their SQL bodies.
 
-    for norm_table in used_tables:
-        labels.add(schema["table_item_ids"][norm_table])
-
-    add_delimited_identifier_labels(sql, schema, labels, used_tables, aliases)
-
-    # Fully qualified or alias-qualified column references.
-    for (norm_table, norm_column), item_id in schema["column_item_ids"].items():
-        table_candidates = [norm_table]
-        table_candidates.extend(alias for alias, target in aliases.items() if target == norm_table)
-        for table_candidate in table_candidates:
-            patterns = [
-                rf"(?<![a-z0-9_]){re.escape(table_candidate)}\s+{re.escape(norm_column)}(?![a-z0-9_])",
-                rf"(?<![a-z0-9_]){re.escape(table_candidate)}_{re.escape(norm_column)}(?![a-z0-9_])",
-            ]
-            if any(re.search(pattern, normalized_sql) for pattern in patterns):
-                labels.add(item_id)
-                break
-
-    # Unqualified column references. Restrict to used tables when possible.
-    candidate_tables = used_tables or set(schema["table_item_ids"].keys())
-    for norm_column, occurrences in schema["column_norm_to_originals"].items():
-        if not re.search(rf"(?<![a-z0-9_]){re.escape(norm_column)}(?![a-z0-9_])", normalized_sql):
+    The masked parent keeps character positions stable, which lets downstream
+    clause extraction operate on one query block at a time.  Nested subqueries
+    are handled recursively by :func:`query_scopes`.
+    """
+    text = str(sql or "")
+    masked = list(text)
+    subqueries = []
+    quote = None
+    index = 0
+    while index < len(text):
+        char = text[index]
+        if quote:
+            if char == quote:
+                if quote == "'" and index + 1 < len(text) and text[index + 1] == "'":
+                    index += 2
+                    continue
+                quote = None
+            index += 1
             continue
-        # Ambiguous columns are still SQL-used signals, but we mark all
-        # candidates among used tables. Later stages can refine this.
-        add_column_label_for_name(labels, schema, norm_column, candidate_tables)
+        if char in {"'", '"', "`"}:
+            quote = char
+            index += 1
+            continue
+        if char == "[":
+            quote = "]"
+            index += 1
+            continue
+        if char != "(":
+            index += 1
+            continue
 
+        depth = 1
+        inner_quote = None
+        end = index + 1
+        while end < len(text) and depth:
+            current = text[end]
+            if inner_quote:
+                if current == inner_quote:
+                    if inner_quote == "'" and end + 1 < len(text) and text[end + 1] == "'":
+                        end += 2
+                        continue
+                    inner_quote = None
+                end += 1
+                continue
+            if current in {"'", '"', "`"}:
+                inner_quote = current
+            elif current == "[":
+                inner_quote = "]"
+            elif current == "(":
+                depth += 1
+            elif current == ")":
+                depth -= 1
+            end += 1
+        if depth:
+            index += 1
+            continue
+        body = text[index + 1 : end - 1]
+        if re.match(r"(?is)^\s*(?:select|with)\b", body):
+            subqueries.append(body)
+            for position in range(index, end):
+                masked[position] = " "
+            index = end
+        else:
+            index += 1
+    return "".join(masked), subqueries
+
+
+def query_scopes(sql, schema, inherited_aliases=None):
+    """Yield alias-aware SQL query blocks without nested-scope contamination."""
+    masked, subqueries = split_direct_subqueries(sql)
+    used_tables, local_aliases, _ = extract_table_aliases(masked, schema)
+    aliases = dict(inherited_aliases or {})
+    aliases.update(local_aliases)
+    yield {
+        "sql": masked,
+        "used_tables": set(used_tables),
+        "aliases": aliases,
+        "local_aliases": local_aliases,
+    }
+    for subquery in subqueries:
+        yield from query_scopes(subquery, schema, inherited_aliases=aliases)
+
+
+def _qualified_column_references(text):
+    pattern = re.compile(
+        r"(?is)(?<![A-Za-z0-9_])([A-Za-z_][A-Za-z0-9_]*)\s*\.\s*"
+        r"(?:`([^`]+)`|\[([^\]]+)\]|\"([^\"]+)\"|([A-Za-z_][A-Za-z0-9_]*))"
+    )
+    references = []
+    spans = []
+    for match in pattern.finditer(text or ""):
+        column = next(value for value in match.groups()[1:] if value is not None)
+        references.append((normalize_name(match.group(1)), normalize_name(column)))
+        spans.append(match.span())
+    return references, spans
+
+
+def _mask_spans_and_literals(text, spans):
+    chars = list(text or "")
+    for start, end in spans:
+        for index in range(start, end):
+            chars[index] = " "
+    result = "".join(chars)
+    # Values and delimited identifiers are processed separately and must not
+    # leak short tokens (e.g. Charter inside `Charter School (Y/N)`).
+    result = re.sub(r"'(?:''|[^'])*'", " ", result)
+    result = re.sub(r"`[^`]*`|\[[^\]]*\]|\"[^\"]*\"", " ", result)
+    return result
+
+
+def exact_column_labels_in_scope(
+    text,
+    schema,
+    used_tables,
+    aliases,
+    candidate_ids=None,
+):
+    """Resolve columns in one query scope without assigning ambiguous names.
+
+    Qualified references are mapped through their alias owner.  Unqualified
+    references are accepted only when exactly one table in the local scope owns
+    that column.  This deliberately prefers missing a malformed/ambiguous SQL
+    reference over creating false positive gold labels.
+    """
+    allowed = set(candidate_ids) if candidate_ids is not None else None
+    labels = set()
+    references, qualified_spans = _qualified_column_references(text)
+    for prefix, norm_column in references:
+        norm_table = aliases.get(prefix, prefix)
+        item_id = schema["column_item_ids"].get((norm_table, norm_column))
+        if item_id is not None and (allowed is None or item_id in allowed):
+            labels.add(item_id)
+
+    candidate_tables = set(used_tables)
+    if not candidate_tables:
+        candidate_tables.update(aliases.values())
+
+    # Exact standalone quoted identifiers retain spaces and punctuation.
+    qualified_positions = set()
+    for start, end in qualified_spans:
+        qualified_positions.update(range(start, end))
+    for match in re.finditer(r"`([^`]+)`|\[([^\]]+)\]|\"([^\"]+)\"", text or ""):
+        if any(position in qualified_positions for position in range(*match.span())):
+            continue
+        raw_name = next(value for value in match.groups() if value is not None)
+        norm_column = normalize_name(raw_name)
+        occurrences = [
+            (table, item_id)
+            for table, item_id in schema["column_norm_to_originals"].get(norm_column, [])
+            if table in candidate_tables and (allowed is None or item_id in allowed)
+        ]
+        if len(occurrences) == 1:
+            labels.add(occurrences[0][1])
+
+    bare_text = normalize_sql_for_match(_mask_spans_and_literals(text, qualified_spans))
+    for norm_column, occurrences in schema["column_norm_to_originals"].items():
+        if not re.search(
+            rf"(?<![a-z0-9_]){re.escape(norm_column)}(?![a-z0-9_])", bare_text
+        ):
+            continue
+        local = [
+            (table, item_id)
+            for table, item_id in occurrences
+            if table in candidate_tables and (allowed is None or item_id in allowed)
+        ]
+        if len(local) == 1:
+            labels.add(local[0][1])
+    return labels
+
+
+def scope_aware_sql_labels(sql, schema):
+    labels = set()
+    used_tables = set()
+    for scope in query_scopes(sql, schema):
+        local_tables = scope["used_tables"]
+        used_tables.update(local_tables)
+        for norm_table in local_tables:
+            table_id = schema["table_item_ids"].get(norm_table)
+            if table_id is not None:
+                labels.add(table_id)
+        labels.update(
+            exact_column_labels_in_scope(
+                scope["sql"], schema, local_tables, scope["aliases"]
+            )
+        )
     return labels, used_tables
+
+
+def sql_parse_labels(sql, schema):
+    return scope_aware_sql_labels(sql, schema)
 
 
 def fk_labels(used_tables, schema, sql_labels=None, mode="explicit_sql"):

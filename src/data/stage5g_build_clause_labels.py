@@ -15,9 +15,11 @@ from src.data.stage1_extract_bird_labels import (  # noqa: E402
     add_column_label_for_name,
     add_delimited_identifier_labels,
     extract_table_aliases,
+    exact_column_labels_in_scope,
     fk_labels,
     normalize_name,
     normalize_sql_for_match,
+    query_scopes,
 )
 
 
@@ -295,32 +297,37 @@ def column_labels_in_text(text, schema, full_used_tables, full_aliases, candidat
 
 
 def clause_labels_from_sql(sql, schema, candidate_column_ids=None):
-    full_used_tables, aliases, _ = extract_table_aliases(sql or "", schema)
-    spans = top_level_clause_spans(sql or "")
     labels_by_clause = {clause: set() for clause in CLAUSES}
-    clause_spans = {clause: spans.get(clause, []) for clause in CLAUSES}
+    clause_spans = {clause: [] for clause in CLAUSES}
+    all_used_tables = set()
 
-    for clause in CLAUSES:
-        for span in spans.get(clause, []):
-            labels_by_clause[clause].update(
-                column_labels_in_text(
-                    span,
-                    schema,
-                    full_used_tables,
-                    aliases,
-                    candidate_ids=candidate_column_ids,
+    for scope in query_scopes(sql or "", schema):
+        local_sql = scope["sql"]
+        local_tables = scope["used_tables"]
+        aliases = scope["aliases"]
+        all_used_tables.update(local_tables)
+        spans = top_level_clause_spans(local_sql)
+        for clause in CLAUSES:
+            clause_spans[clause].extend(spans.get(clause, []))
+            for span in spans.get(clause, []):
+                labels_by_clause[clause].update(
+                    exact_column_labels_in_scope(
+                        span,
+                        schema,
+                        local_tables,
+                        aliases,
+                        candidate_ids=candidate_column_ids,
+                    )
                 )
-            )
-            table_labels, _ = table_mentions_in_text(span, schema)
-            if clause == "join":
-                labels_by_clause[clause].update(table_labels)
+                if clause == "join":
+                    table_labels, _ = table_mentions_in_text(span, schema)
+                    labels_by_clause[clause].update(table_labels)
+        for norm_table in local_tables:
+            table_id = schema["table_item_ids"].get(norm_table)
+            if table_id is not None:
+                labels_by_clause["join"].add(table_id)
 
-    for norm_table in full_used_tables:
-        table_id = schema["table_item_ids"].get(norm_table)
-        if table_id is not None:
-            labels_by_clause["join"].add(table_id)
-
-    labels_by_clause["join"].update(fk_labels(full_used_tables, schema))
+    labels_by_clause["join"].update(fk_labels(all_used_tables, schema))
 
     return labels_by_clause, clause_spans
 
