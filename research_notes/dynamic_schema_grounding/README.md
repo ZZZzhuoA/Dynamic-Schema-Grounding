@@ -66,6 +66,7 @@ Next SQL Token / Clause
 - [33_stage15b_real_sql_candidate_reranking.md](./33_stage15b_real_sql_candidate_reranking.md)：真实 LLM SQL 候选生成、candidate-owned typed plan、执行判等及 Stage 15A-fix1 后验重排。
 - [34_stage10_complete_coverage_label_audit.md](./34_stage10_complete_coverage_label_audit.md)：修正 used-table 全 FK 闭包造成的 gold 污染，并分层诊断 candidate、reranker 与 constrained selector 的完整覆盖损失。
 - [35_stage10e_frozen_llm_semantic_prior.md](./35_stage10e_frozen_llm_semantic_prior.md)：冻结 LLM 生成角色化节点语义先验，作为数值特征注入 Schema-RGTA，并用 zero/shuffled 控制验证语义身份因果作用。
+- [36_stage10f_full_schema_steiner_join_closure.md](./36_stage10f_full_schema_steiner_join_closure.md)：保持语义 Top-30 不变，在完整 Schema FK 图上用 metric-closure MST 补充 Steiner join closure，并独立评估连通性恢复。
 
 ## 一句话版本
 
