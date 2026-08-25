@@ -261,6 +261,43 @@ class Stage16AGraphGroundedSFTTest(unittest.TestCase):
             self.assertNotIn("gold_ids", predictions[0])
             self.assertEqual(predictions[0]["oof_fold_id"], 0)
 
+    def test_final_oof_merger_explicitly_recovers_skipped_empty_candidate(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            heldout = root / "heldout.json"
+            heldout.write_text(
+                json.dumps({"record_indices": [0], "db_ids": ["demo"]}),
+                encoding="utf-8",
+            )
+            output_dir = root / "folds/fold_0"
+            output_dir.mkdir(parents=True)
+            (output_dir / "dev_predictions.jsonl").write_text("", encoding="utf-8")
+            predictions, folds = MERGER.merge_oof_predictions(
+                {
+                    "record_count": 1,
+                    "folds": [
+                        {"fold_id": 0, "heldout_index_file": str(heldout)}
+                    ],
+                },
+                root / "folds",
+                "dev_predictions.jsonl",
+                fallback_graphs={
+                    0: {
+                        "record_index": 0,
+                        "db_id": "demo",
+                        "question_id": 0,
+                        "candidate_nodes": [],
+                        "baseline_selected_ids": [],
+                    }
+                },
+            )
+            self.assertEqual(predictions[0]["top_30"], [])
+            self.assertEqual(
+                predictions[0]["grounding_provenance"],
+                "strict_oof_inference_safe_fallback",
+            )
+            self.assertEqual(folds[0]["fallback_prediction_count"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()

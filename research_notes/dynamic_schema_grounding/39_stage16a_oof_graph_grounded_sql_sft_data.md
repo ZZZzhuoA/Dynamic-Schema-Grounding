@@ -101,8 +101,15 @@ Merge and certify the held-out outputs:
 python src/evaluation/stage16a_merge_oof_schema_predictions.py \
   --fold-manifest "$MANIFEST" \
   --fold-output-dir "$OOF_RUN" \
+  --fallback-graph-file "$GRAPH" \
   --output-dir experiments/stage16a_oof_schema_predictions_seed42
 ```
+
+Some corrected BIRD train records have no trainable candidate graph and are
+therefore intentionally skipped by the Stage 10 trainer. The merger represents
+them explicitly using only inference-safe baseline candidates from `GRAPH` (or an
+empty semantic core when none exists). They remain in SFT because the complete
+schema fallback is still available; no gold schema node is injected.
 
 ### 2. Build train join closure from the merged OOF belief
 
