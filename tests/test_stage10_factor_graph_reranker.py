@@ -1,4 +1,6 @@
 import importlib.util
+import json
+import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -120,6 +122,23 @@ class Stage10FactorGraphDataTest(unittest.TestCase):
         self.assertNotIn(4, candidate_ids)
         self.assertEqual(result["missing_gold_ids"], [4])
         self.assertLess(result["candidate_oracle_recall"], 1.0)
+
+
+class Stage10OOFFilteringTest(unittest.TestCase):
+    def test_record_index_manifest_filters_without_reindexing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "indices.json"
+            path.write_text(json.dumps({"record_indices": [2, 5]}), encoding="utf-8")
+            allowed = TRAINING.read_record_index_set(path)
+            examples = [{"record_index": value} for value in [1, 2, 5, 8]]
+            selected = TRAINING.filter_record_indices(examples, allowed, "heldout")
+            self.assertEqual([row["record_index"] for row in selected], [2, 5])
+
+    def test_record_index_manifest_rejects_missing_rows(self):
+        with self.assertRaisesRegex(ValueError, "missing rows"):
+            TRAINING.filter_record_indices(
+                [{"record_index": 1}], {1, 9}, "heldout"
+            )
 
     def test_validation_skips_only_empty_unlabeled_candidate_graphs(self):
         empty = {

@@ -54,6 +54,34 @@ def load_cache(cache_dir, split, runtime):
     }
 
 
+def read_record_index_set(path):
+    if not path:
+        return None
+    payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    values = payload.get("record_indices") if isinstance(payload, dict) else payload
+    if not isinstance(values, list):
+        raise ValueError(f"Record-index file must contain a list: {path}")
+    result = {int(value) for value in values}
+    if len(result) != len(values):
+        raise ValueError(f"Duplicate record indices in {path}")
+    return result
+
+
+def filter_record_indices(examples, allowed, label):
+    if allowed is None:
+        return examples
+    selected = [
+        example
+        for example in examples
+        if int(example.get("record_index", -1)) in allowed
+    ]
+    observed = {int(example.get("record_index", -1)) for example in selected}
+    missing = sorted(allowed - observed)
+    if missing:
+        raise ValueError(f"{label} record-index file references missing rows: {missing[:10]}")
+    return selected
+
+
 def full_node_embeddings(cache, record_index):
     row = cache["index"].get(int(record_index))
     if row is None:
@@ -743,6 +771,10 @@ def main():
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--train-limit", type=int, default=None)
     parser.add_argument("--dev-limit", type=int, default=None)
+    parser.add_argument("--train-record-index-file", default=None)
+    parser.add_argument("--dev-record-index-file", default=None)
+    parser.add_argument("--train-cache-split", default="train")
+    parser.add_argument("--dev-cache-split", default="dev")
     parser.add_argument("--model-type", choices=["mlp", "schema_rgta", "factor_rgta"], default="factor_rgta")
     parser.add_argument("--hidden-dim", type=int, default=256)
     parser.add_argument("--num-layers", type=int, default=2)
@@ -811,6 +843,15 @@ def main():
     parser.add_argument("--selection-metric", default="constrained_complete_coverage@30")
     parser.add_argument("--selection-mode", choices=["max", "min"], default="max")
     parser.add_argument("--patience", type=int, default=3)
+    parser.add_argument(
+        "--checkpoint-policy",
+        choices=["best", "last"],
+        default="best",
+        help=(
+            "Use 'last' for strict OOF folds: held-out metrics cannot select a "
+            "checkpoint or trigger early stopping."
+        ),
+    )
     parser.add_argument("--min-delta", type=float, default=0.0)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default="cpu")
@@ -843,8 +884,20 @@ def main():
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(args.seed)
     device = torch.device(args.device)
-    raw_train_examples = read_jsonl(Path(args.train_file), args.train_limit)
-    raw_dev_examples = read_jsonl(Path(args.dev_file), args.dev_limit)
+    train_indices = read_record_index_set(args.train_record_index_file)
+    dev_indices = read_record_index_set(args.dev_record_index_file)
+    raw_train_examples = read_jsonl(
+        Path(args.train_file), None if train_indices is not None else args.train_limit
+    )
+    raw_dev_examples = read_jsonl(
+        Path(args.dev_file), None if dev_indices is not None else args.dev_limit
+    )
+    raw_train_examples = filter_record_indices(raw_train_examples, train_indices, "train")
+    raw_dev_examples = filter_record_indices(raw_dev_examples, dev_indices, "dev")
+    if args.train_limit is not None:
+        raw_train_examples = raw_train_examples[: args.train_limit]
+    if args.dev_limit is not None:
+        raw_dev_examples = raw_dev_examples[: args.dev_limit]
     train_examples, train_validation = validate_and_filter_examples(
         raw_train_examples, "train"
     )
@@ -867,8 +920,8 @@ def main():
         validate_control_alignment(dev_examples, control_examples, name, numeric_dim)
         dev_controls[name] = control_examples
         control_validation[name] = report
-    train_cache = load_cache(args.embedding_cache_dir, "train", runtime)
-    dev_cache = load_cache(args.embedding_cache_dir, "dev", runtime)
+    train_cache = load_cache(args.embedding_cache_dir, args.train_cache_split, runtime)
+    dev_cache = load_cache(args.embedding_cache_dir, args.dev_cache_split, runtime)
     schema_relations = collect_schema_relations(train_examples + dev_examples)
     relation_count = len(train_examples[0]["role_labels"][0])
     maps = {
@@ -914,6 +967,7 @@ def main():
                 "gradient_accumulation_steps": args.gradient_accumulation_steps,
                 "eval_every_examples": args.eval_every_examples,
                 "checkpoint_selection": args.selection_metric,
+                "checkpoint_policy": args.checkpoint_policy,
                 "early_stopping_unit": "epoch",
                 "coverage_loss": {
                     "weight": args.coverage_loss_weight,
@@ -966,9 +1020,16 @@ def main():
             model, dev_examples, dev_cache, maps, args, runtime, device, "dev"
         )
         selected_value = get_metric(dev_metrics, args.selection_metric)
-        improved = is_better_metric(
-            selected_value, best_value, args.selection_mode, args.min_delta
-        )
+        if args.checkpoint_policy == "last":
+            improved = bool(
+                epoch == args.epochs
+                and checkpoint_type == "epoch_end"
+                and examples_seen_in_epoch >= len(train_examples)
+            )
+        else:
+            improved = is_better_metric(
+                selected_value, best_value, args.selection_mode, args.min_delta
+            )
         checkpoint = {
             "epoch": epoch,
             "examples_seen_in_epoch": examples_seen_in_epoch,
@@ -1028,7 +1089,11 @@ def main():
             device,
             optimizer,
             epoch,
-            progress_callback=progress_callback if args.eval_every_examples else None,
+            progress_callback=(
+                progress_callback
+                if args.eval_every_examples and args.checkpoint_policy == "best"
+                else None
+            ),
         )
         improved = evaluate_checkpoint(
             epoch,
@@ -1044,7 +1109,11 @@ def main():
             epochs_without_improvement = 0
         else:
             epochs_without_improvement += 1
-        if args.patience > 0 and epochs_without_improvement >= args.patience:
+        if (
+            args.checkpoint_policy == "best"
+            and args.patience > 0
+            and epochs_without_improvement >= args.patience
+        ):
             break
     write_jsonl(output_dir / "train_log.jsonl", log_rows)
     if best_state is not None:
