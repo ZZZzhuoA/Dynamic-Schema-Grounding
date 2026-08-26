@@ -1,0 +1,300 @@
+"""Aggregate Stage 17-A1 trained baselines and paired checkpoint controls."""
+
+import argparse
+import hashlib
+import json
+import statistics
+from pathlib import Path
+
+
+PRIMARY_METRICS = (
+    "complete_coverage@30",
+    "schema_recall@30",
+    "table_recall@30",
+    "column_recall@30",
+    "complete_coverage@50",
+    "mrr",
+)
+CONTROL_MODES = (
+    "zero_query_edges",
+    "shuffled_schema_edges",
+    "shuffled_node_identity",
+)
+DATA_KEYS = (
+    "train_graph_file",
+    "dev_graph_file",
+    "train_label_file",
+    "dev_label_file",
+    "embedding_cache_dir",
+    "train_limit",
+    "dev_limit",
+)
+
+
+def read_json(path):
+    return json.loads(Path(path).read_text(encoding="utf-8"))
+
+
+def write_json(path, payload):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def file_sha256(path):
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def assignments(values, option):
+    parsed = {}
+    for value in values or []:
+        if "=" not in value:
+            raise ValueError(f"{option} expects KEY=PATH, got {value!r}")
+        key, path = value.split("=", 1)
+        key = key.strip()
+        if not key or key in parsed:
+            raise ValueError(f"Duplicate or empty key for {option}: {key!r}")
+        parsed[key] = Path(path)
+    return parsed
+
+
+def trained_run(path, expected_model_type=None, expected_control=None):
+    summary = read_json(path / "training_summary.json")
+    metrics = summary["dev_metrics"]
+    config = summary["config"]
+    model_config = summary["model_config"]
+    if expected_model_type and model_config.get("model_type") != expected_model_type:
+        raise ValueError(
+            f"{path} has model_type={model_config.get('model_type')!r}, "
+            f"expected {expected_model_type!r}"
+        )
+    if expected_control and model_config.get("control_mode") != expected_control:
+        raise ValueError(
+            f"{path} has control_mode={model_config.get('control_mode')!r}, "
+            f"expected {expected_control!r}"
+        )
+    return {
+        "path": str(path),
+        "metrics": {metric: float(metrics[metric]) for metric in PRIMARY_METRICS},
+        "sample_count": int(metrics["sample_count"]),
+        "data_config": {key: config.get(key) for key in DATA_KEYS},
+        "best_epoch": summary.get("best_epoch"),
+        "checkpoint_sha256": file_sha256(path / "best.pt")
+        if (path / "best.pt").exists()
+        else None,
+    }
+
+
+def metric_summary(runs):
+    output = {}
+    for metric in PRIMARY_METRICS:
+        values = [run["metrics"][metric] for run in runs.values()]
+        output[metric] = {
+            "mean": statistics.fmean(values),
+            "std": statistics.pstdev(values),
+            "values": {
+                str(seed): runs[seed]["metrics"][metric] for seed in sorted(runs)
+            },
+        }
+    return output
+
+
+def assert_matched_runs(normal, mlp):
+    if set(normal) != set(mlp):
+        raise ValueError(
+            f"Normal/MLP seeds differ: normal={sorted(normal)} mlp={sorted(mlp)}"
+        )
+    reference = None
+    for family, runs in (("normal", normal), ("mlp", mlp)):
+        for seed, run in runs.items():
+            fingerprint = run["data_config"]
+            if reference is None:
+                reference = fingerprint
+            elif fingerprint != reference:
+                raise ValueError(
+                    f"Data configuration mismatch for {family} seed={seed}: "
+                    f"expected={reference}, observed={fingerprint}"
+                )
+    sample_counts = {run["sample_count"] for run in list(normal.values()) + list(mlp.values())}
+    if len(sample_counts) != 1:
+        raise ValueError(f"Sample counts differ across trained runs: {sorted(sample_counts)}")
+    return reference
+
+
+def load_interventions(paths, normal):
+    if set(paths) != set(normal):
+        raise ValueError(
+            f"Normal/intervention seeds differ: normal={sorted(normal)} "
+            f"intervention={sorted(paths)}"
+        )
+    output = {}
+    for seed, path in paths.items():
+        summary = read_json(path / "intervention_summary.json")
+        if not summary.get("parameters_unchanged"):
+            raise ValueError(f"Intervention parameters changed for seed={seed}: {path}")
+        missing = sorted(set(CONTROL_MODES) - set(summary.get("metrics", {})))
+        if missing:
+            raise ValueError(f"Intervention seed={seed} misses controls: {missing}")
+        if not summary.get("reference_normal_reproduced"):
+            raise ValueError(
+                f"Intervention seed={seed} did not verify reference normal predictions"
+            )
+        expected_sha = normal[seed].get("checkpoint_sha256")
+        if expected_sha and summary.get("checkpoint_sha256") != expected_sha:
+            raise ValueError(
+                f"Intervention seed={seed} used a different checkpoint: "
+                f"expected={expected_sha} observed={summary.get('checkpoint_sha256')}"
+            )
+        expected_dev = {
+            "dev_graph_file": normal[seed]["data_config"]["dev_graph_file"],
+            "dev_label_file": normal[seed]["data_config"]["dev_label_file"],
+            "embedding_cache_dir": normal[seed]["data_config"]["embedding_cache_dir"],
+            "dev_limit": normal[seed]["data_config"]["dev_limit"],
+        }
+        if summary.get("data_config") != expected_dev:
+            raise ValueError(
+                f"Intervention seed={seed} uses a different dev data configuration: "
+                f"expected={expected_dev} observed={summary.get('data_config')}"
+            )
+        normal_metrics = summary["metrics"]["normal"]
+        for metric in PRIMARY_METRICS:
+            if abs(float(normal_metrics[metric]) - normal[seed]["metrics"][metric]) > 1e-12:
+                raise ValueError(
+                    f"Intervention normal does not reproduce trained normal for seed={seed}, "
+                    f"metric={metric}"
+                )
+        output[seed] = {
+            "path": str(path),
+            "checkpoint_sha256": summary["checkpoint_sha256"],
+            "metrics": {
+                mode: {
+                    metric: float(summary["metrics"][mode][metric])
+                    for metric in PRIMARY_METRICS
+                }
+                for mode in CONTROL_MODES
+            },
+        }
+    return output
+
+
+def paired_deltas(left, right):
+    output = {}
+    for metric in PRIMARY_METRICS:
+        values = {
+            str(seed): left[seed]["metrics"][metric] - right[seed]["metrics"][metric]
+            for seed in sorted(left)
+        }
+        output[metric] = {
+            "mean": statistics.fmean(values.values()),
+            "std": statistics.pstdev(values.values()),
+            "values": values,
+        }
+    return output
+
+
+def intervention_deltas(normal, interventions):
+    output = {}
+    for mode in CONTROL_MODES:
+        output[mode] = {}
+        for metric in PRIMARY_METRICS:
+            values = {
+                str(seed): normal[seed]["metrics"][metric]
+                - interventions[seed]["metrics"][mode][metric]
+                for seed in sorted(normal)
+            }
+            output[mode][metric] = {
+                "mean": statistics.fmean(values.values()),
+                "std": statistics.pstdev(values.values()),
+                "values": values,
+            }
+    return output
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--normal-run", action="append", required=True, help="SEED=DIR")
+    parser.add_argument("--mlp-run", action="append", required=True, help="SEED=DIR")
+    parser.add_argument(
+        "--intervention-run", action="append", required=True, help="SEED=DIR"
+    )
+    parser.add_argument(
+        "--retrained-run", action="append", default=[], help="CONTROL=DIR"
+    )
+    parser.add_argument("--output-file", required=True)
+    parser.add_argument("--identity-near-largest-tolerance", type=float, default=0.005)
+    args = parser.parse_args()
+
+    normal_paths = assignments(args.normal_run, "--normal-run")
+    mlp_paths = assignments(args.mlp_run, "--mlp-run")
+    intervention_paths = assignments(args.intervention_run, "--intervention-run")
+    retrained_paths = assignments(args.retrained_run, "--retrained-run")
+    normal = {
+        int(seed): trained_run(path, "qrgta", "normal")
+        for seed, path in normal_paths.items()
+    }
+    mlp = {
+        int(seed): trained_run(path, "mlp_residual", "normal")
+        for seed, path in mlp_paths.items()
+    }
+    data_config = assert_matched_runs(normal, mlp)
+    interventions = load_interventions(
+        {int(seed): path for seed, path in intervention_paths.items()}, normal
+    )
+    unknown_retrained = sorted(set(retrained_paths) - set(CONTROL_MODES))
+    if unknown_retrained:
+        raise ValueError(f"Unknown retrained controls: {unknown_retrained}")
+    retrained = {
+        mode: trained_run(path, "qrgta", mode)
+        for mode, path in retrained_paths.items()
+    }
+    for mode, run in retrained.items():
+        if run["data_config"] != data_config:
+            raise ValueError(f"Retrained control {mode} uses a different data configuration")
+
+    qrgta_minus_mlp = paired_deltas(normal, mlp)
+    control_deltas = intervention_deltas(normal, interventions)
+    complete_drops = {
+        mode: control_deltas[mode]["complete_coverage@30"]["mean"]
+        for mode in CONTROL_MODES
+    }
+    identity_drop = complete_drops["shuffled_node_identity"]
+    largest_drop = max(complete_drops.values())
+    checks = {
+        "qrgta_mean_complete_coverage@30_gt_mlp": qrgta_minus_mlp[
+            "complete_coverage@30"
+        ]["mean"]
+        > 0,
+        "all_controls_drop_complete_coverage@30_for_every_seed": all(
+            value > 0
+            for mode in CONTROL_MODES
+            for value in control_deltas[mode]["complete_coverage@30"]["values"].values()
+        ),
+        "shuffled_node_identity_near_largest_mean_drop": identity_drop
+        >= largest_drop - args.identity_near_largest_tolerance,
+    }
+    output = {
+        "seeds": sorted(normal),
+        "data_config": data_config,
+        "normal_qrgta": metric_summary(normal),
+        "depth_matched_mlp": metric_summary(mlp),
+        "qrgta_minus_mlp": qrgta_minus_mlp,
+        "checkpoint_interventions_normal_minus_control": control_deltas,
+        "retrained_seed42_controls": retrained,
+        "decision_checks": checks,
+        "decision_passed": all(checks.values()),
+        "identity_near_largest_tolerance": args.identity_near_largest_tolerance,
+        "interpretation_policy": {
+            "checkpoint_intervention": "Measures whether the trained normal QRGTA depends on the intervened information.",
+            "retrained_control": "Measures how much performance can be relearned after the information is destroyed during training.",
+        },
+    }
+    write_json(args.output_file, output)
+    print(json.dumps(output, ensure_ascii=False, indent=2))
+
+
+if __name__ == "__main__":
+    main()

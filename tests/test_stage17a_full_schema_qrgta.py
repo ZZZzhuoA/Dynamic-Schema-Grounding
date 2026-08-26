@@ -1,7 +1,13 @@
 import importlib.util
+import json
+import sys
+import tempfile
 import unittest
+from contextlib import redirect_stdout
+from io import StringIO
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -21,6 +27,14 @@ TRAINING = load_module(
 EVALUATION = load_module(
     "stage17a_evaluate_full_schema_qrgta",
     "src/evaluation/stage17a_evaluate_full_schema_qrgta.py",
+)
+CONTROLS = load_module(
+    "stage17a_run_checkpoint_controls",
+    "src/evaluation/stage17a_run_checkpoint_controls.py",
+)
+SUMMARY = load_module(
+    "stage17a_summarize_causal_controls",
+    "src/evaluation/stage17a_summarize_causal_controls.py",
 )
 
 
@@ -166,6 +180,54 @@ class Stage17AModelTest(unittest.TestCase):
         )
         self.assertEqual(tensors["query_edge_destination"].numel(), 0)
 
+    def test_shuffled_schema_edges_preserve_relation_marginals_and_self_loops(self):
+        example = self.aligned_example()
+        relations = TRAINING.relation_mapping([example], [example])
+        normal_index, normal_type = TRAINING.schema_edge_tensors(
+            example, relations, "normal", 42, self.runtime, "cpu"
+        )
+        shuffled_index, shuffled_type = TRAINING.schema_edge_tensors(
+            example, relations, "shuffled_schema_edges", 42, self.runtime, "cpu"
+        )
+        self.assertEqual(normal_type.tolist(), shuffled_type.tolist())
+        self.assertEqual(normal_index[0].tolist(), shuffled_index[0].tolist())
+        self.assertCountEqual(normal_index[1].tolist(), shuffled_index[1].tolist())
+        self_loop = relations["self_loop"]
+        normal_loops = [
+            (int(normal_index[0, i]), int(normal_index[1, i]))
+            for i, relation in enumerate(normal_type.tolist())
+            if relation == self_loop
+        ]
+        shuffled_loops = [
+            (int(shuffled_index[0, i]), int(shuffled_index[1, i]))
+            for i, relation in enumerate(shuffled_type.tolist())
+            if relation == self_loop
+        ]
+        self.assertEqual(normal_loops, shuffled_loops)
+
+    def test_shuffled_node_identity_stays_within_schema_type(self):
+        example = self.aligned_example()
+        relations = TRAINING.relation_mapping([example], [example])
+        normal = TRAINING.example_to_tensors(
+            example, self.cache(), relations, self.args(), self.runtime, "cpu"
+        )
+        shuffled = TRAINING.example_to_tensors(
+            example,
+            self.cache(),
+            relations,
+            self.args("shuffled_node_identity"),
+            self.runtime,
+            "cpu",
+        )
+        self.assertEqual(normal["node_types"].tolist(), shuffled["node_types"].tolist())
+        for node_type in (0, 1):
+            positions = [
+                i for i, value in enumerate(normal["node_types"].tolist()) if value == node_type
+            ]
+            before = sorted(tuple(normal["dense_nodes"][i].tolist()) for i in positions)
+            after = sorted(tuple(shuffled["dense_nodes"][i].tolist()) for i in positions)
+            self.assertEqual(before, after)
+
     def test_qrgta_forward_backward_supports_variable_full_schema(self):
         torch = self.runtime["torch"]
         example = self.aligned_example()
@@ -194,6 +256,221 @@ class Stage17AModelTest(unittest.TestCase):
         )
         self.assertTrue(torch.isfinite(loss))
         self.assertGreater(gradient_total, 0.0)
+
+    def test_depth_matched_mlp_forward_backward_ignores_graph_edges(self):
+        torch = self.runtime["torch"]
+        example = self.aligned_example()
+        relations = TRAINING.relation_mapping([example], [example])
+        normal = TRAINING.example_to_tensors(
+            example, self.cache(), relations, self.args(), self.runtime, "cpu"
+        )
+        shuffled = TRAINING.example_to_tensors(
+            example,
+            self.cache(),
+            relations,
+            self.args("shuffled_schema_edges"),
+            self.runtime,
+            "cpu",
+        )
+        model = self.runtime["model"](
+            dense_dim=16,
+            relation_count=len(relations),
+            hidden_dim=16,
+            num_layers=2,
+            num_heads=4,
+            dropout=0.0,
+            model_type="mlp_residual",
+        )
+        model.eval()
+        first = TRAINING.forward_model(model, normal)
+        second = TRAINING.forward_model(model, shuffled)
+        self.assertTrue(torch.equal(first["logits"], second["logits"]))
+        loss = self.runtime["loss"](first["logits"], normal["labels"])
+        loss.backward()
+        self.assertTrue(any(parameter.grad is not None for parameter in model.parameters()))
+
+    def test_model_state_digest_is_stable(self):
+        model = self.runtime["model"](
+            dense_dim=16,
+            relation_count=7,
+            hidden_dim=16,
+            num_layers=1,
+            num_heads=4,
+            dropout=0.0,
+            model_type="qrgta",
+        )
+        first = CONTROLS.state_dict_sha256(model)
+        second = CONTROLS.state_dict_sha256(model)
+        self.assertEqual(first, second)
+
+    def test_checkpoint_controls_write_paired_leakage_free_outputs(self):
+        torch = self.runtime["torch"]
+        np = self.runtime["np"]
+        graph = graph_record()
+        label = label_record()
+        example = self.aligned_example()
+        relations = TRAINING.relation_mapping([example], [example])
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            graph_path = root / "dev_examples.jsonl"
+            label_path = root / "dev_labels.jsonl"
+            TRAINING.write_jsonl(graph_path, [graph])
+            TRAINING.write_jsonl(label_path, [label])
+            cache_dir = root / "cache"
+            cache_dir.mkdir()
+            cache = self.cache()
+            np.save(cache_dir / "dev_query_embeddings.npy", cache["query"])
+            np.save(cache_dir / "dev_node_embeddings.npy", cache["nodes"])
+            (cache_dir / "dev_index.json").write_text(
+                json.dumps(list(cache["by_record"].values())), encoding="utf-8"
+            )
+            model_config = {
+                "dense_dim": 16,
+                "relation_count": len(relations),
+                "hidden_dim": 16,
+                "num_layers": 1,
+                "num_heads": 4,
+                "dropout": 0.0,
+                "model_type": "qrgta",
+                "relations": relations,
+                "control_mode": "normal",
+            }
+            model = self.runtime["model"](
+                dense_dim=16,
+                relation_count=len(relations),
+                hidden_dim=16,
+                num_layers=1,
+                num_heads=4,
+                dropout=0.0,
+                model_type="qrgta",
+            )
+            checkpoint_path = root / "best.pt"
+            torch.save(
+                {
+                    "model_state_dict": model.state_dict(),
+                    "model_config": model_config,
+                    "epoch": 1,
+                },
+                checkpoint_path,
+            )
+            output_dir = root / "controls"
+            argv = [
+                "stage17a_run_checkpoint_controls.py",
+                "--checkpoint",
+                str(checkpoint_path),
+                "--dev-graph-file",
+                str(graph_path),
+                "--dev-label-file",
+                str(label_path),
+                "--embedding-cache-dir",
+                str(cache_dir),
+                "--output-dir",
+                str(output_dir),
+                "--device",
+                "cpu",
+            ]
+            with mock.patch.object(sys, "argv", argv):
+                with redirect_stdout(StringIO()):
+                    CONTROLS.main()
+            summary = json.loads(
+                (output_dir / "intervention_summary.json").read_text(encoding="utf-8")
+            )
+            self.assertTrue(summary["parameters_unchanged"])
+            self.assertEqual(set(summary["metrics"]), set(CONTROLS.CONTROL_MODES))
+            prediction = json.loads(
+                (output_dir / "normal" / "dev_predictions.jsonl")
+                .read_text(encoding="utf-8")
+                .strip()
+            )
+            self.assertNotIn("gold_ids", prediction)
+
+
+class Stage17ASummaryTest(unittest.TestCase):
+    def metric_payload(self, complete):
+        return {
+            "sample_count": 100,
+            "complete_coverage@30": complete,
+            "schema_recall@30": complete + 0.1,
+            "table_recall@30": complete + 0.12,
+            "column_recall@30": complete + 0.08,
+            "complete_coverage@50": complete + 0.15,
+            "mrr": complete + 0.05,
+        }
+
+    def write_training_run(self, path, model_type, control_mode, complete):
+        path.mkdir(parents=True)
+        data_config = {
+            "train_graph_file": "train_graph.jsonl",
+            "dev_graph_file": "dev_graph.jsonl",
+            "train_label_file": "train_labels.jsonl",
+            "dev_label_file": "dev_labels.jsonl",
+            "embedding_cache_dir": "cache",
+            "train_limit": None,
+            "dev_limit": None,
+        }
+        (path / "training_summary.json").write_text(
+            json.dumps(
+                {
+                    "best_epoch": 1,
+                    "dev_metrics": self.metric_payload(complete),
+                    "config": data_config,
+                    "model_config": {
+                        "model_type": model_type,
+                        "control_mode": control_mode,
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        (path / "best.pt").write_bytes(f"{model_type}:{control_mode}".encode("utf-8"))
+
+    def test_summary_reports_paired_deltas_and_rejects_no_runs(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            argv = ["stage17a_summarize_causal_controls.py"]
+            for seed in (42, 43, 44):
+                normal = root / f"normal_{seed}"
+                mlp = root / f"mlp_{seed}"
+                intervention = root / f"intervention_{seed}"
+                self.write_training_run(normal, "qrgta", "normal", 0.8)
+                self.write_training_run(mlp, "mlp_residual", "normal", 0.7)
+                intervention.mkdir()
+                normal_metrics = self.metric_payload(0.8)
+                controls = {
+                    "zero_query_edges": self.metric_payload(0.78),
+                    "shuffled_schema_edges": self.metric_payload(0.76),
+                    "shuffled_node_identity": self.metric_payload(0.74),
+                }
+                (intervention / "intervention_summary.json").write_text(
+                    json.dumps(
+                        {
+                            "parameters_unchanged": True,
+                            "checkpoint_sha256": SUMMARY.file_sha256(normal / "best.pt"),
+                            "reference_normal_reproduced": True,
+                            "data_config": {
+                                "dev_graph_file": "dev_graph.jsonl",
+                                "dev_label_file": "dev_labels.jsonl",
+                                "embedding_cache_dir": "cache",
+                                "dev_limit": None,
+                            },
+                            "metrics": {"normal": normal_metrics, **controls},
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                argv.extend(["--normal-run", f"{seed}={normal}"])
+                argv.extend(["--mlp-run", f"{seed}={mlp}"])
+                argv.extend(["--intervention-run", f"{seed}={intervention}"])
+            output = root / "summary.json"
+            argv.extend(["--output-file", str(output)])
+            with mock.patch.object(sys, "argv", argv):
+                with redirect_stdout(StringIO()):
+                    SUMMARY.main()
+            result = json.loads(output.read_text(encoding="utf-8"))
+            self.assertAlmostEqual(
+                result["qrgta_minus_mlp"]["complete_coverage@30"]["mean"], 0.1
+            )
+            self.assertTrue(result["decision_passed"])
 
 
 if __name__ == "__main__":

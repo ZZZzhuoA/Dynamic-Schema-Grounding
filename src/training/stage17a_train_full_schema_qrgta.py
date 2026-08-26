@@ -247,8 +247,9 @@ def schema_edge_tensors(example, relations, control_mode, seed, runtime, device)
         types.append(relations[str(edge["type"])])
     if control_mode == "shuffled_schema_edges" and sources:
         grouped = defaultdict(list)
+        self_loop_id = relations.get("self_loop")
         for index, relation_id in enumerate(types):
-            if sources[index] != destinations[index]:
+            if relation_id != self_loop_id:
                 grouped[relation_id].append(index)
         for relation_id, edge_ids in grouped.items():
             permutation = deterministic_permutation(
@@ -264,6 +265,21 @@ def schema_edge_tensors(example, relations, control_mode, seed, runtime, device)
         edge_index = torch.empty((2, 0), dtype=torch.long, device=device)
     edge_type = torch.tensor(types, dtype=torch.long, device=device)
     return edge_index, edge_type
+
+
+def within_type_identity_permutation(nodes, seed, runtime):
+    """Shuffle semantic identities only among nodes with the same schema type."""
+    torch = runtime["torch"]
+    permutation = torch.arange(len(nodes), dtype=torch.long)
+    by_type = defaultdict(list)
+    for index, node in enumerate(nodes):
+        by_type[str(node.get("type"))].append(index)
+    for offset, node_type in enumerate(sorted(by_type)):
+        indices = by_type[node_type]
+        local = deterministic_permutation(len(indices), seed + offset * 1009, runtime)
+        source_indices = torch.tensor(indices, dtype=torch.long)[local]
+        permutation[torch.tensor(indices, dtype=torch.long)] = source_indices
+    return permutation
 
 
 def example_to_tensors(example, cache, relations, args, runtime, device):
@@ -289,11 +305,12 @@ def example_to_tensors(example, cache, relations, args, runtime, device):
         device=device,
     )
     if args.control_mode == "shuffled_node_identity":
-        permutation = deterministic_permutation(
-            len(example["nodes"]), args.seed + example["record_index"] * 131, runtime
+        permutation = within_type_identity_permutation(
+            example["nodes"],
+            args.seed + example["record_index"] * 131,
+            runtime,
         ).to(device)
         dense = dense[permutation]
-        node_types = node_types[permutation]
     edge_index, edge_type = schema_edge_tensors(
         example, relations, args.control_mode, args.seed, runtime, device
     )
@@ -525,7 +542,9 @@ def main():
     parser.add_argument("--dev-label-file", required=True)
     parser.add_argument("--embedding-cache-dir", required=True)
     parser.add_argument("--output-dir", required=True)
-    parser.add_argument("--model-type", choices=["qrgta", "mlp"], default="qrgta")
+    parser.add_argument(
+        "--model-type", choices=["qrgta", "mlp", "mlp_residual"], default="qrgta"
+    )
     parser.add_argument("--hidden-dim", type=int, default=256)
     parser.add_argument("--num-layers", type=int, default=3)
     parser.add_argument("--num-heads", type=int, default=8)
@@ -581,10 +600,14 @@ def main():
         "model_type": args.model_type,
         "relations": relations,
         "control_mode": args.control_mode,
+        "control_semantics": {
+            "zero_query_edges": "Remove Query-to-Schema graph messages but retain the final query-conditioned scorer.",
+            "shuffled_schema_edges": "Permute non-self edge destinations within relation type.",
+            "shuffled_node_identity": "Permute dense semantic identities within table/column type.",
+        },
     }
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    write_json(output_dir / "model_config.json", model_config)
 
     model = runtime["model"](
         dense_dim=model_config["dense_dim"],
@@ -595,6 +618,10 @@ def main():
         dropout=args.dropout,
         model_type=args.model_type,
     ).to(device)
+    model_config["trainable_parameter_count"] = sum(
+        int(parameter.numel()) for parameter in model.parameters() if parameter.requires_grad
+    )
+    write_json(output_dir / "model_config.json", model_config)
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=args.lr, weight_decay=args.weight_decay
     )

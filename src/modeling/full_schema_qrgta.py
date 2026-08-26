@@ -143,6 +143,24 @@ class SparseQRGTAEncoderLayer(nn.Module):
         return schema_states
 
 
+class ResidualNodeMLPLayer(nn.Module):
+    """Depth-matched node-local baseline with no graph message passing."""
+
+    def __init__(self, hidden_dim, dropout):
+        super().__init__()
+        self.norm = nn.LayerNorm(hidden_dim)
+        self.ffn = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim * 4),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim * 4, hidden_dim),
+        )
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, schema_states):
+        return self.norm(schema_states + self.dropout(self.ffn(schema_states)))
+
+
 class FullSchemaQRGTA(nn.Module):
     """Binary full-schema node grounder with an optional graph-free MLP mode."""
 
@@ -157,7 +175,7 @@ class FullSchemaQRGTA(nn.Module):
         model_type="qrgta",
     ):
         super().__init__()
-        if model_type not in {"qrgta", "mlp"}:
+        if model_type not in {"qrgta", "mlp", "mlp_residual"}:
             raise ValueError(f"Unsupported model_type: {model_type}")
         self.model_type = model_type
         self.node_input = nn.Linear(dense_dim, hidden_dim)
@@ -175,6 +193,12 @@ class FullSchemaQRGTA(nn.Module):
                     hidden_dim, num_heads, relation_count, dropout
                 )
                 for _ in range(num_layers if model_type == "qrgta" else 0)
+            ]
+        )
+        self.node_mlp_layers = nn.ModuleList(
+            [
+                ResidualNodeMLPLayer(hidden_dim, dropout)
+                for _ in range(num_layers if model_type == "mlp_residual" else 0)
             ]
         )
         self.scorer = nn.Sequential(
@@ -213,6 +237,8 @@ class FullSchemaQRGTA(nn.Module):
                 query_edge_type,
                 query_edge_similarity,
             )
+        for layer in self.node_mlp_layers:
+            schema_states = layer(schema_states)
         query_matrix = query_state.unsqueeze(0).expand_as(schema_states)
         pair = torch.cat(
             [

@@ -70,6 +70,8 @@ Next SQL Token / Clause
 - [37_scope_aware_semantic_label_fix.md](./37_scope_aware_semantic_label_fix.md)：修复同名列、表别名、quoted identifier 与嵌套查询作用域造成的 semantic gold 过标注，并重算 Stage 10-F 覆盖率。
 - [38_stage10g_table_conditioned_column_completion.md](./38_stage10g_table_conditioned_column_completion.md)：利用高置信表 belief 在完整表内检索缺失列，扩展 RGTA 候选图但保持最终固定 Top-30，并通过冻结 LLM prior 与 zero/shuffled 控制检验语义协同。
 - [39_stage16a_oof_graph_grounded_sql_sft_data.md](./39_stage16a_oof_graph_grounded_sql_sft_data.md)：不引入 IR，构造最终 Schema-RGTA 也严格按数据库 OOF 的 Graph-grounded direct-SQL SFT 数据；Top-30 作为软 belief，并保留角色候选、值证据、Join closure 与完整 schema fallback。
+- [40_stage17a_full_schema_binary_qrgta.md](./40_stage17a_full_schema_binary_qrgta.md)：取消候选裁剪，在完整 Schema 上训练 Query-conditioned binary QRGTA；记录 corrected-scope 标签、Question Card、Full Graph 与 embedding cache 必须同版本重建的复现约束和完整服务器命令。
+- [41_stage17a1_mlp_and_causal_controls.md](./41_stage17a1_mlp_and_causal_controls.md)：加入深度匹配的逐节点 MLP、同 checkpoint 的 Query/Schema-edge/node-identity 因果干预、seed42 重训控制，以及跨 seed 的严格汇总与判定协议。
 
 ## 一句话版本
 
