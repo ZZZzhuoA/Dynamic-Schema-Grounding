@@ -20,6 +20,11 @@ CONTROL_MODES = (
     "shuffled_schema_edges",
     "shuffled_node_identity",
 )
+PATH_CONTROL_MODES = (
+    "shuffled_distance_buckets",
+    "shuffled_path_signatures",
+    "zero_path_features",
+)
 DATA_KEYS = (
     "train_graph_file",
     "dev_graph_file",
@@ -82,6 +87,8 @@ def trained_run(path, expected_model_type=None, expected_control=None):
         "metrics": {metric: float(metrics[metric]) for metric in PRIMARY_METRICS},
         "sample_count": int(metrics["sample_count"]),
         "data_config": {key: config.get(key) for key in DATA_KEYS},
+        "model_type": model_config.get("model_type"),
+        "control_mode": model_config.get("control_mode"),
         "best_epoch": summary.get("best_epoch"),
         "checkpoint_sha256": file_sha256(path / "best.pt")
         if (path / "best.pt").exists()
@@ -175,7 +182,8 @@ def load_interventions(paths, normal):
                     metric: float(summary["metrics"][mode][metric])
                     for metric in PRIMARY_METRICS
                 }
-                for mode in CONTROL_MODES
+                for mode in CONTROL_MODES + PATH_CONTROL_MODES
+                if mode in summary["metrics"]
             },
         }
     return output
@@ -196,9 +204,9 @@ def paired_deltas(left, right):
     return output
 
 
-def intervention_deltas(normal, interventions):
+def intervention_deltas(normal, interventions, modes=CONTROL_MODES):
     output = {}
-    for mode in CONTROL_MODES:
+    for mode in modes:
         output[mode] = {}
         for metric in PRIMARY_METRICS:
             values = {
@@ -244,7 +252,8 @@ def main():
     interventions = load_interventions(
         {int(seed): path for seed, path in intervention_paths.items()}, normal
     )
-    unknown_retrained = sorted(set(retrained_paths) - set(CONTROL_MODES))
+    known_retrained_modes = set(CONTROL_MODES) | set(PATH_CONTROL_MODES)
+    unknown_retrained = sorted(set(retrained_paths) - known_retrained_modes)
     if unknown_retrained:
         raise ValueError(f"Unknown retrained controls: {unknown_retrained}")
     retrained = {
@@ -257,6 +266,15 @@ def main():
 
     qrgta_minus_mlp = paired_deltas(normal, mlp)
     control_deltas = intervention_deltas(normal, interventions)
+    normal_is_path_qrgta = all(run.get("model_type") == "path_qrgta" for run in normal.values())
+    available_path_controls = [
+        mode
+        for mode in PATH_CONTROL_MODES
+        if all(mode in interventions[seed]["metrics"] for seed in normal)
+    ] if normal_is_path_qrgta else []
+    path_control_deltas = intervention_deltas(
+        normal, interventions, tuple(available_path_controls)
+    ) if available_path_controls else {}
     complete_drops = {
         mode: control_deltas[mode]["complete_coverage@30"]["mean"]
         for mode in CONTROL_MODES
@@ -276,6 +294,25 @@ def main():
         "shuffled_node_identity_near_largest_mean_drop": identity_drop
         >= largest_drop - args.identity_near_largest_tolerance,
     }
+    if available_path_controls:
+        checks["shuffled_path_signatures_drop_complete_coverage@30_every_seed"] = all(
+            value > 0
+            for value in path_control_deltas["shuffled_path_signatures"][
+                "complete_coverage@30"
+            ]["values"].values()
+        ) if "shuffled_path_signatures" in path_control_deltas else False
+        distance_or_zero = []
+        for mode in ("shuffled_distance_buckets", "zero_path_features"):
+            if mode in path_control_deltas:
+                distance_or_zero.extend(
+                    value > 0
+                    for value in path_control_deltas[mode]["complete_coverage@30"][
+                        "values"
+                    ].values()
+                )
+        checks["distance_or_zero_path_features_drop_complete_coverage@30_at_least_2_of_3"] = (
+            sum(distance_or_zero) >= 2
+        )
     output = {
         "seeds": sorted(normal),
         "data_config": data_config,
@@ -283,6 +320,7 @@ def main():
         "depth_matched_mlp": metric_summary(mlp),
         "qrgta_minus_mlp": qrgta_minus_mlp,
         "checkpoint_interventions_normal_minus_control": control_deltas,
+        "path_checkpoint_interventions_normal_minus_control": path_control_deltas,
         "retrained_seed42_controls": retrained,
         "decision_checks": checks,
         "decision_passed": all(checks.values()),

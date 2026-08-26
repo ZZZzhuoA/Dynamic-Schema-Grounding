@@ -116,6 +116,45 @@ class Stage17AAlignmentTest(unittest.TestCase):
         self.assertEqual(rankings[0], [0, 1, 2, 3, 4])
         self.assertNotIn("gold_ids", prediction)
 
+    def test_path_candidate_construction_is_deterministic_and_preserves_direct_edges(self):
+        example = TRAINING.align_graphs_and_labels(
+            [graph_record()], [label_record()], "dev"
+        )[0][0]
+        relations = TRAINING.relation_mapping([example], [example])
+        first = TRAINING.build_path_rows(
+            example,
+            relations,
+            max_path_distance=3,
+            max_path_edges_per_destination=None,
+            query_similarity=None,
+        )
+        second = TRAINING.build_path_rows(
+            example,
+            relations,
+            max_path_distance=3,
+            max_path_edges_per_destination=None,
+            query_similarity=None,
+        )
+        self.assertEqual(first, second)
+        direct = [row for row in first if row["is_direct"]]
+        self.assertEqual(len(direct), len(example["schema_edges"]))
+        self.assertTrue(any(row["src"] == 1 and row["dst"] == 2 and row["distance"] == 2 for row in first))
+
+    def test_path_cap_does_not_remove_direct_schema_edges(self):
+        example = TRAINING.align_graphs_and_labels(
+            [graph_record()], [label_record()], "dev"
+        )[0][0]
+        relations = TRAINING.relation_mapping([example], [example])
+        capped = TRAINING.build_path_rows(
+            example,
+            relations,
+            max_path_distance=3,
+            max_path_edges_per_destination=0,
+            query_similarity=None,
+        )
+        self.assertEqual(len(capped), len(example["schema_edges"]))
+        self.assertTrue(all(row["is_direct"] for row in capped))
+
 
 class Stage17AModelTest(unittest.TestCase):
     @classmethod
@@ -256,6 +295,91 @@ class Stage17AModelTest(unittest.TestCase):
         )
         self.assertTrue(torch.isfinite(loss))
         self.assertGreater(gradient_total, 0.0)
+
+    def path_args(self, example, relations, control="normal"):
+        return SimpleNamespace(
+            control_mode=control,
+            seed=42,
+            model_type="path_qrgta",
+            max_path_distance=3,
+            max_path_edges_per_destination=32,
+            distance_buckets=TRAINING.distance_bucket_mapping(3),
+            path_signatures=TRAINING.collect_path_signatures([example], relations, 3),
+            coverage_surrogate_weight=0.1,
+            coverage_margin=0.1,
+            coverage_target_k=30,
+        )
+
+    def test_path_qrgta_forward_backward_supports_variable_full_schema(self):
+        torch = self.runtime["torch"]
+        example = self.aligned_example()
+        relations = TRAINING.relation_mapping([example], [example])
+        args = self.path_args(example, relations)
+        tensors = TRAINING.example_to_tensors(
+            example, self.cache(), relations, args, self.runtime, "cpu"
+        )
+        self.assertGreater(tensors["schema_edge_index"].shape[1], len(example["schema_edges"]))
+        model = self.runtime["model"](
+            dense_dim=16,
+            relation_count=len(relations),
+            hidden_dim=16,
+            num_layers=2,
+            num_heads=4,
+            dropout=0.0,
+            model_type="path_qrgta",
+            distance_bucket_count=len(args.distance_buckets),
+            path_signature_count=len(args.path_signatures),
+        )
+        output = TRAINING.forward_model(model, tensors)
+        self.assertEqual(output["logits"].shape, (5,))
+        loss = TRAINING.training_loss(output, tensors["labels"], args, self.runtime)
+        loss.backward()
+        gradient_total = sum(
+            float(parameter.grad.abs().sum())
+            for parameter in model.parameters()
+            if parameter.grad is not None
+        )
+        self.assertTrue(torch.isfinite(loss))
+        self.assertGreater(gradient_total, 0.0)
+
+    def test_zero_path_features_preserves_edge_count_and_neutralizes_schema_features(self):
+        example = self.aligned_example()
+        relations = TRAINING.relation_mapping([example], [example])
+        normal_args = self.path_args(example, relations)
+        zero_args = self.path_args(example, relations, "zero_path_features")
+        normal = TRAINING.example_to_tensors(
+            example, self.cache(), relations, normal_args, self.runtime, "cpu"
+        )
+        zero = TRAINING.example_to_tensors(
+            example, self.cache(), relations, zero_args, self.runtime, "cpu"
+        )
+        self.assertTrue(self.runtime["torch"].equal(normal["schema_edge_index"], zero["schema_edge_index"]))
+        self.assertEqual(normal["schema_edge_type"].tolist(), zero["schema_edge_type"].tolist())
+        self.assertEqual(
+            zero["schema_distance_bucket"].tolist(),
+            [zero_args.distance_buckets[TRAINING.DISTANCE_SELF]] * zero["schema_edge_type"].numel(),
+        )
+        self.assertEqual(
+            zero["schema_path_signature"].tolist(),
+            [zero_args.path_signatures[TRAINING.NEUTRAL_PATH_SIGNATURE]] * zero["schema_edge_type"].numel(),
+        )
+
+    def test_shuffled_path_controls_preserve_schema_edge_identity(self):
+        example = self.aligned_example()
+        relations = TRAINING.relation_mapping([example], [example])
+        normal_args = self.path_args(example, relations)
+        normal = TRAINING.example_to_tensors(
+            example, self.cache(), relations, normal_args, self.runtime, "cpu"
+        )
+        for mode in ("shuffled_distance_buckets", "shuffled_path_signatures"):
+            control_args = self.path_args(example, relations, mode)
+            control = TRAINING.example_to_tensors(
+                example, self.cache(), relations, control_args, self.runtime, "cpu"
+            )
+            self.assertTrue(
+                self.runtime["torch"].equal(normal["schema_edge_index"], control["schema_edge_index"])
+            )
+            self.assertEqual(normal["schema_edge_type"].tolist(), control["schema_edge_type"].tolist())
 
     def test_depth_matched_mlp_forward_backward_ignores_graph_edges(self):
         torch = self.runtime["torch"]

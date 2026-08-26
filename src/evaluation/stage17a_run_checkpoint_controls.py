@@ -28,6 +28,9 @@ CONTROL_MODES = (
     "zero_query_edges",
     "shuffled_schema_edges",
     "shuffled_node_identity",
+    "shuffled_distance_buckets",
+    "shuffled_path_signatures",
+    "zero_path_features",
 )
 PRIMARY_METRICS = (
     "complete_coverage@30",
@@ -161,9 +164,9 @@ def load_checkpoint_model(checkpoint_path, runtime, device):
     config = checkpoint.get("model_config")
     if not isinstance(config, dict):
         raise ValueError("Checkpoint does not contain model_config")
-    if config.get("model_type") != "qrgta":
+    if config.get("model_type") not in {"qrgta", "path_qrgta"}:
         raise ValueError(
-            "Checkpoint intervention requires a normal qrgta checkpoint, got "
+            "Checkpoint intervention requires a normal qrgta/path_qrgta checkpoint, got "
             f"{config.get('model_type')!r}"
         )
     if config.get("control_mode", "normal") != "normal":
@@ -179,6 +182,8 @@ def load_checkpoint_model(checkpoint_path, runtime, device):
         num_heads=int(config["num_heads"]),
         dropout=float(config["dropout"]),
         model_type=str(config["model_type"]),
+        distance_bucket_count=int(config.get("distance_bucket_count", 1)),
+        path_signature_count=int(config.get("path_signature_count", 1)),
     ).to(device)
     model.load_state_dict(checkpoint["model_state_dict"], strict=True)
     return model, config, checkpoint.get("epoch")
@@ -235,7 +240,28 @@ def main():
     results = {}
     prediction_rows = {}
     for mode in modes:
-        control_args = SimpleNamespace(control_mode=mode, seed=args.seed)
+        control_args = SimpleNamespace(
+            control_mode=mode,
+            seed=args.seed,
+            model_type=model_config.get("model_type", "qrgta"),
+            distance_buckets={
+                str(key): int(value)
+                for key, value in model_config.get("distance_bucket_mapping", {}).items()
+            },
+            path_signatures={
+                str(key): int(value)
+                for key, value in model_config.get("path_type_mapping", {}).items()
+            },
+            max_path_distance=int(model_config.get("max_path_distance", 3)),
+            max_path_edges_per_destination=model_config.get(
+                "max_path_edges_per_destination", 32
+            ),
+            coverage_surrogate_weight=float(
+                model_config.get("coverage_surrogate_weight", 0.0)
+            ),
+            coverage_margin=float(model_config.get("coverage_margin", 0.1)),
+            coverage_target_k=int(model_config.get("coverage_target_k", 30)),
+        )
         metrics, predictions = evaluate(
             model,
             examples,
@@ -312,6 +338,9 @@ def main():
             "zero_query_edges": "Remove Query-to-Schema graph messages; retain the final query-conditioned scorer.",
             "shuffled_schema_edges": "Permute non-self edge destinations within relation type while preserving relation/source/destination marginals.",
             "shuffled_node_identity": "Permute dense semantic embeddings within table/column type while preserving node IDs, types, graph edges, and labels.",
+            "shuffled_distance_buckets": "Shuffle non-query schema edge distance buckets while preserving edge index, relation type, and path signature.",
+            "shuffled_path_signatures": "Shuffle non-query schema edge path signatures while preserving edge index, relation type, and distance bucket.",
+            "zero_path_features": "Keep path-augmented schema edges but neutralize non-query path and distance features.",
         },
     }
     write_json(output_dir / "intervention_summary.json", summary)

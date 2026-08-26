@@ -143,6 +143,166 @@ class SparseQRGTAEncoderLayer(nn.Module):
         return schema_states
 
 
+class PathAwareSparseQRGTAEncoderLayer(nn.Module):
+    """Sparse QRGTA layer with query-gated path and distance features."""
+
+    def __init__(
+        self,
+        hidden_dim,
+        num_heads,
+        relation_count,
+        distance_bucket_count,
+        path_signature_count,
+        dropout,
+    ):
+        super().__init__()
+        if hidden_dim % num_heads:
+            raise ValueError("hidden_dim must be divisible by num_heads")
+        self.hidden_dim = hidden_dim
+        self.num_heads = num_heads
+        self.head_dim = hidden_dim // num_heads
+        self.q_proj = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        self.k_proj = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        self.v_proj = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        self.relation_key = nn.Embedding(relation_count, hidden_dim)
+        self.relation_value = nn.Embedding(relation_count, hidden_dim)
+        self.relation_bias = nn.Embedding(relation_count, num_heads)
+        self.distance_key = nn.Embedding(distance_bucket_count, hidden_dim)
+        self.distance_value = nn.Embedding(distance_bucket_count, hidden_dim)
+        self.distance_bias = nn.Embedding(distance_bucket_count, num_heads)
+        self.path_key = nn.Embedding(path_signature_count, hidden_dim)
+        self.path_value = nn.Embedding(path_signature_count, hidden_dim)
+        self.path_bias = nn.Embedding(path_signature_count, num_heads)
+        self.path_gate = nn.Sequential(
+            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, num_heads),
+        )
+        self.query_similarity_scale = nn.Parameter(torch.ones(num_heads))
+        self.output = nn.Linear(hidden_dim, hidden_dim)
+        self.attention_norm = nn.LayerNorm(hidden_dim)
+        self.ffn_norm = nn.LayerNorm(hidden_dim)
+        self.ffn = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim * 4),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim * 4, hidden_dim),
+        )
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(
+        self,
+        schema_states,
+        query_state,
+        schema_edge_index,
+        schema_edge_type,
+        schema_edge_scalar,
+        schema_distance_bucket,
+        schema_path_signature,
+        query_edge_destination,
+        query_edge_type,
+        query_edge_similarity,
+        query_distance_bucket,
+        query_path_signature,
+    ):
+        node_count = schema_states.shape[0]
+        device = schema_states.device
+
+        source_states = torch.cat([query_state.unsqueeze(0), schema_states], dim=0)
+        structural_source = schema_edge_index[0] + 1
+        structural_destination = schema_edge_index[1]
+        query_source = torch.zeros_like(query_edge_destination)
+        source = torch.cat([structural_source, query_source], dim=0)
+        destination = torch.cat(
+            [structural_destination, query_edge_destination], dim=0
+        )
+        relation = torch.cat([schema_edge_type, query_edge_type], dim=0)
+        scalar = torch.cat([schema_edge_scalar, query_edge_similarity], dim=0)
+        distance_bucket = torch.cat(
+            [schema_distance_bucket, query_distance_bucket], dim=0
+        )
+        path_signature = torch.cat(
+            [schema_path_signature, query_path_signature], dim=0
+        )
+        is_query_edge = torch.cat(
+            [
+                torch.zeros_like(schema_edge_scalar, dtype=torch.bool),
+                torch.ones_like(query_edge_similarity, dtype=torch.bool),
+            ],
+            dim=0,
+        )
+
+        if source.numel() == 0:
+            message = torch.zeros_like(schema_states)
+        else:
+            query = self.q_proj(schema_states).view(
+                node_count, self.num_heads, self.head_dim
+            )[destination]
+            key = self.k_proj(source_states).view(
+                source_states.shape[0], self.num_heads, self.head_dim
+            )[source]
+            value = self.v_proj(source_states).view(
+                source_states.shape[0], self.num_heads, self.head_dim
+            )[source]
+            relation_key = self.relation_key(relation).view(
+                -1, self.num_heads, self.head_dim
+            )
+            relation_value = self.relation_value(relation).view(
+                -1, self.num_heads, self.head_dim
+            )
+            distance_key = self.distance_key(distance_bucket).view(
+                -1, self.num_heads, self.head_dim
+            )
+            distance_value = self.distance_value(distance_bucket).view(
+                -1, self.num_heads, self.head_dim
+            )
+            path_key = self.path_key(path_signature).view(
+                -1, self.num_heads, self.head_dim
+            )
+            path_value = self.path_value(path_signature).view(
+                -1, self.num_heads, self.head_dim
+            )
+            path_embedding = (
+                self.distance_key(distance_bucket) + self.path_key(path_signature)
+            )
+            gate_input = torch.cat(
+                [query_state.unsqueeze(0).expand_as(path_embedding), path_embedding],
+                dim=-1,
+            )
+            path_gate = torch.sigmoid(self.path_gate(gate_input))
+            gate_heads = path_gate.unsqueeze(-1)
+            gated_key = relation_key + gate_heads * (distance_key + path_key)
+            gated_value = relation_value + gate_heads * (distance_value + path_value)
+
+            scores = ((query * (key + gated_key)).sum(dim=-1) / math.sqrt(self.head_dim))
+            scores = scores + self.relation_bias(relation)
+            scores = scores + path_gate * (
+                self.distance_bias(distance_bucket) + self.path_bias(path_signature)
+            )
+            scores = scores + (
+                scalar.unsqueeze(-1)
+                * is_query_edge.to(scores.dtype).unsqueeze(-1)
+                * self.query_similarity_scale.unsqueeze(0)
+            )
+            attention = _segment_softmax(scores, destination, node_count)
+            weighted = (value + gated_value) * attention.unsqueeze(-1)
+            message_heads = torch.zeros(
+                (node_count, self.num_heads, self.head_dim),
+                dtype=weighted.dtype,
+                device=device,
+            )
+            message_heads.index_add_(0, destination, weighted)
+            message = message_heads.reshape(node_count, self.hidden_dim)
+
+        schema_states = self.attention_norm(
+            schema_states + self.dropout(self.output(message))
+        )
+        schema_states = self.ffn_norm(
+            schema_states + self.dropout(self.ffn(schema_states))
+        )
+        return schema_states
+
+
 class ResidualNodeMLPLayer(nn.Module):
     """Depth-matched node-local baseline with no graph message passing."""
 
@@ -173,9 +333,11 @@ class FullSchemaQRGTA(nn.Module):
         num_heads=8,
         dropout=0.1,
         model_type="qrgta",
+        distance_bucket_count=1,
+        path_signature_count=1,
     ):
         super().__init__()
-        if model_type not in {"qrgta", "mlp", "mlp_residual"}:
+        if model_type not in {"qrgta", "path_qrgta", "mlp", "mlp_residual"}:
             raise ValueError(f"Unsupported model_type: {model_type}")
         self.model_type = model_type
         self.node_input = nn.Linear(dense_dim, hidden_dim)
@@ -187,13 +349,23 @@ class FullSchemaQRGTA(nn.Module):
         self.node_type = nn.Embedding(2, hidden_dim)
         self.node_norm = nn.LayerNorm(hidden_dim)
         self.query_norm = nn.LayerNorm(hidden_dim)
+        if model_type == "qrgta":
+            layer_cls = lambda: SparseQRGTAEncoderLayer(
+                hidden_dim, num_heads, relation_count, dropout
+            )
+        elif model_type == "path_qrgta":
+            layer_cls = lambda: PathAwareSparseQRGTAEncoderLayer(
+                hidden_dim,
+                num_heads,
+                relation_count,
+                distance_bucket_count,
+                path_signature_count,
+                dropout,
+            )
+        else:
+            layer_cls = None
         self.layers = nn.ModuleList(
-            [
-                SparseQRGTAEncoderLayer(
-                    hidden_dim, num_heads, relation_count, dropout
-                )
-                for _ in range(num_layers if model_type == "qrgta" else 0)
-            ]
+            [layer_cls() for _ in range(num_layers)] if layer_cls else []
         )
         self.node_mlp_layers = nn.ModuleList(
             [
@@ -218,6 +390,10 @@ class FullSchemaQRGTA(nn.Module):
         query_edge_destination,
         query_edge_type,
         query_edge_similarity,
+        schema_distance_bucket=None,
+        schema_path_signature=None,
+        query_distance_bucket=None,
+        query_path_signature=None,
     ):
         schema_states = self.node_norm(
             self.node_input(dense_nodes) + self.node_type(node_types)
@@ -227,16 +403,39 @@ class FullSchemaQRGTA(nn.Module):
         )
         schema_edge_scalar = dense_nodes.new_zeros(schema_edge_type.shape[0])
         for layer in self.layers:
-            schema_states = layer(
-                schema_states,
-                query_state,
-                schema_edge_index,
-                schema_edge_type,
-                schema_edge_scalar,
-                query_edge_destination,
-                query_edge_type,
-                query_edge_similarity,
-            )
+            if self.model_type == "path_qrgta":
+                if (
+                    schema_distance_bucket is None
+                    or schema_path_signature is None
+                    or query_distance_bucket is None
+                    or query_path_signature is None
+                ):
+                    raise ValueError("path_qrgta requires path and distance tensors")
+                schema_states = layer(
+                    schema_states,
+                    query_state,
+                    schema_edge_index,
+                    schema_edge_type,
+                    schema_edge_scalar,
+                    schema_distance_bucket,
+                    schema_path_signature,
+                    query_edge_destination,
+                    query_edge_type,
+                    query_edge_similarity,
+                    query_distance_bucket,
+                    query_path_signature,
+                )
+            else:
+                schema_states = layer(
+                    schema_states,
+                    query_state,
+                    schema_edge_index,
+                    schema_edge_type,
+                    schema_edge_scalar,
+                    query_edge_destination,
+                    query_edge_type,
+                    query_edge_similarity,
+                )
         for layer in self.node_mlp_layers:
             schema_states = layer(schema_states)
         query_matrix = query_state.unsqueeze(0).expand_as(schema_states)
