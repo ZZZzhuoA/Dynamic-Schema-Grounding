@@ -1,6 +1,18 @@
 # Dynamic Schema Grounding for LLM-based Text-to-SQL
 
-本目录整理一个面向 Text-to-SQL 的研究方案：
+## 新 session 必读入口
+
+本目录保存 Stage 0–17 的详细历史档案，不再承担当前状态入口。新 session 请按以下顺序阅读：
+
+1. [`../../AGENTS.md`](../../AGENTS.md)：最小规则与当前任务；
+2. [`../../PROJECT_HANDOFF.md`](../../PROJECT_HANDOFF.md)：项目脉络、当前架构与决策门；
+3. [`../../RESULTS_LEDGER.md`](../../RESULTS_LEDGER.md)：统一结果台账和证据等级；
+4. [`../../REPRODUCTION.md`](../../REPRODUCTION.md)：从 BIRD 到 Stage 17-A1 的权威命令；
+5. 只有需要阶段细节时，再查阅本目录的对应记录。
+
+## 研究主线的演化
+
+本目录最初围绕以下 Text-to-SQL 研究假设建立：
 
 > 将 Schema Grounding 从一次性的 schema linking，改造成 SQL 生成过程中的动态隐变量，并通过 recurrent cross-attention 与 hidden-state steering 注入 LLM decoding。
 
@@ -21,11 +33,13 @@ Next SQL Token / Clause
 ```
 
 这不是简单把相关表列写进 prompt，而是让 schema grounding 成为 LLM 推理过程中的可更新神经状态。
+Stage 0–16 对 prompt、logits bias、continuous steering、typed tool 和 verifier 做了系统探索；动态
+grounding 仍是长期方向，但当前实现尚未形成稳定端到端正结果。
 
-> 当前实验状态：静态 relation-conditioned RGTA 与 structured Top-K selection 已得到完整 dev
-> 证据；直接 prompt 化、logits bias 和连续 hidden-state steering 未得到端到端 EX 支持。
-> Stage 13C 静态 Graph Adapter 未通过图因果门，当前转入 Stage 14 显式 Typed RGTA Schema Tool。
-> 完整证据与负结果见
+> 当前实验状态：主线为 **Stage 17 Full-Schema Binary QRGTA**。全部 table/column 节点进入
+> query-conditioned graph，不再受旧 candidate graph 入口裁剪。Stage 17-A1 正在通过
+> depth-matched MLP、frozen-checkpoint interventions 和 seed42 retrained controls 验证图结构贡献。
+> 当前状态见 [`../../PROJECT_HANDOFF.md`](../../PROJECT_HANDOFF.md)，历史证据与负结果见
 > [29_research_path_retrospective.md](./29_research_path_retrospective.md)。
 
 ## 文件结构

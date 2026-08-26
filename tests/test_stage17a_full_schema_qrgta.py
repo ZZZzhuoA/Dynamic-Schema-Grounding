@@ -303,6 +303,57 @@ class Stage17AModelTest(unittest.TestCase):
         second = CONTROLS.state_dict_sha256(model)
         self.assertEqual(first, second)
 
+    def test_reference_check_accepts_metric_equivalent_numerical_tie_drift(self):
+        def record(order, scores):
+            return {
+                "record_index": 7,
+                "ranked_schema": [
+                    {
+                        "schema_item_id": schema_id,
+                        "logit": scores[schema_id],
+                        "rank": rank,
+                    }
+                    for rank, schema_id in enumerate(order, start=1)
+                ],
+            }
+
+        reference = record([1, 2, 3], {1: 2.0, 2: -1.0, 3: -1.0000001})
+        actual = record([1, 3, 2], {1: 2.0, 2: -1.0000001, 3: -1.0})
+        examples = [{"record_index": 7, "gold_ids": [1]}]
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "reference.jsonl"
+            TRAINING.write_jsonl(path, [reference])
+            result = CONTROLS.assert_reference_normal_matches(
+                [actual], path, examples, score_atol=1e-5
+            )
+        self.assertTrue(result["metric_equivalent"])
+        self.assertFalse(result["exact_full_ranking"])
+        self.assertEqual(result["numerical_rank_drift_record_indices"], [7])
+
+    def test_reference_check_rejects_non_equivalent_score_drift(self):
+        reference = {
+            "record_index": 7,
+            "ranked_schema": [
+                {"schema_item_id": 1, "logit": 2.0, "rank": 1},
+                {"schema_item_id": 2, "logit": -1.0, "rank": 2},
+            ],
+        }
+        actual = {
+            "record_index": 7,
+            "ranked_schema": [
+                {"schema_item_id": 2, "logit": 0.0, "rank": 1},
+                {"schema_item_id": 1, "logit": 1.0, "rank": 2},
+            ],
+        }
+        examples = [{"record_index": 7, "gold_ids": [1]}]
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "reference.jsonl"
+            TRAINING.write_jsonl(path, [reference])
+            with self.assertRaisesRegex(ValueError, "not metric-equivalent"):
+                CONTROLS.assert_reference_normal_matches(
+                    [actual], path, examples, score_atol=1e-5
+                )
+
     def test_checkpoint_controls_write_paired_leakage_free_outputs(self):
         torch = self.runtime["torch"]
         np = self.runtime["np"]

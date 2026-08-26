@@ -125,7 +125,12 @@ done
 ## Frozen-checkpoint interventions
 
 `--reference-normal-predictions` makes the command fail if normal inference no
-longer reproduces the ranking produced during training.
+longer reproduces the metric-relevant ranking produced during training. Sparse CUDA
+aggregation can swap numerically tied nodes in the tail. Such drift is accepted only
+when Top-10/20/30/50 sets and the first-Gold rank are unchanged and every per-node
+logit remains within `--reference-logit-atol` (default `1e-5`). The summary records
+whether the full ranking was exact and lists every tolerated drift record. A Top-K,
+MRR, schema-identity, or larger-score mismatch still fails.
 
 ```bash
 for SEED in 42 43 44; do

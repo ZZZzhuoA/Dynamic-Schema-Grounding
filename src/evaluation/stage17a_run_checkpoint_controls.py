@@ -58,31 +58,101 @@ def state_dict_sha256(model):
     return digest.hexdigest()
 
 
-def ranked_id_rows(records):
-    return {
-        int(record["record_index"]): [
-            int(row["schema_item_id"]) for row in record.get("ranked_schema", [])
-        ]
-        for record in records
-    }
+def prediction_rows(records):
+    return {int(record["record_index"]): record for record in records}
 
 
-def assert_reference_normal_matches(actual, reference_path):
+def _ranked_ids(record):
+    return [int(row["schema_item_id"]) for row in record.get("ranked_schema", [])]
+
+
+def _first_gold_rank(ranked_ids, gold_ids):
+    gold = set(gold_ids)
+    return next(
+        (rank for rank, schema_id in enumerate(ranked_ids, start=1) if schema_id in gold),
+        None,
+    )
+
+
+def assert_reference_normal_matches(
+    actual, reference_path, examples, score_atol=1e-5, top_ks=(10, 20, 30, 50)
+):
+    """Accept metric-equivalent CUDA tie drift while preserving a strict audit trail.
+
+    Sparse CUDA index aggregation can move nearly tied logits by a few ulps. Requiring
+    every one of N schema nodes to retain the exact total order rejects otherwise
+    identical checkpoints even when all reported Top-K sets and MRR are unchanged.
+    """
     expected = read_jsonl(reference_path)
-    actual_ids = ranked_id_rows(actual)
-    expected_ids = ranked_id_rows(expected)
-    if actual_ids.keys() != expected_ids.keys():
-        missing = sorted(expected_ids.keys() - actual_ids.keys())
-        foreign = sorted(actual_ids.keys() - expected_ids.keys())
+    actual_by_id = prediction_rows(actual)
+    expected_by_id = prediction_rows(expected)
+    if actual_by_id.keys() != expected_by_id.keys():
+        missing = sorted(expected_by_id.keys() - actual_by_id.keys())
+        foreign = sorted(actual_by_id.keys() - expected_by_id.keys())
         raise ValueError(
             f"Normal prediction identity mismatch: missing={missing[:10]} foreign={foreign[:10]}"
         )
-    mismatched = [key for key in actual_ids if actual_ids[key] != expected_ids[key]]
-    if mismatched:
-        raise ValueError(
-            "Normal checkpoint intervention run does not reproduce the reference "
-            f"ranking for record_index values {mismatched[:10]}"
+    gold_by_id = {int(example["record_index"]): example["gold_ids"] for example in examples}
+    diagnostics = []
+    invalid = []
+    max_abs_logit_delta = 0.0
+    for key in actual_by_id:
+        actual_record = actual_by_id[key]
+        expected_record = expected_by_id[key]
+        actual_ids = _ranked_ids(actual_record)
+        expected_ids = _ranked_ids(expected_record)
+        if set(actual_ids) != set(expected_ids) or len(actual_ids) != len(expected_ids):
+            invalid.append({"record_index": key, "reason": "schema_identity_set_changed"})
+            continue
+        actual_scores = {
+            int(row["schema_item_id"]): float(row["logit"])
+            for row in actual_record.get("ranked_schema", [])
+        }
+        expected_scores = {
+            int(row["schema_item_id"]): float(row["logit"])
+            for row in expected_record.get("ranked_schema", [])
+        }
+        row_max_delta = max(
+            (abs(actual_scores[schema_id] - expected_scores[schema_id]) for schema_id in actual_ids),
+            default=0.0,
         )
+        max_abs_logit_delta = max(max_abs_logit_delta, row_max_delta)
+        if actual_ids == expected_ids:
+            continue
+        first_difference = next(
+            index for index, pair in enumerate(zip(actual_ids, expected_ids)) if pair[0] != pair[1]
+        )
+        top_k_set_equal = {
+            str(k): set(actual_ids[:k]) == set(expected_ids[:k]) for k in top_ks
+        }
+        first_gold_equal = _first_gold_rank(
+            actual_ids, gold_by_id.get(key, [])
+        ) == _first_gold_rank(expected_ids, gold_by_id.get(key, []))
+        diagnostic = {
+            "record_index": key,
+            "first_different_rank": first_difference + 1,
+            "top_k_set_equal": top_k_set_equal,
+            "first_gold_rank_equal": first_gold_equal,
+            "max_abs_logit_delta": row_max_delta,
+        }
+        diagnostics.append(diagnostic)
+        if not all(top_k_set_equal.values()) or not first_gold_equal or row_max_delta > score_atol:
+            invalid.append(diagnostic)
+    if invalid:
+        raise ValueError(
+            "Normal checkpoint intervention run is not metric-equivalent to the reference: "
+            f"{invalid[:10]}"
+        )
+    return {
+        "metric_equivalent": True,
+        "exact_full_ranking": not diagnostics,
+        "numerical_rank_drift_count": len(diagnostics),
+        "numerical_rank_drift_record_indices": [row["record_index"] for row in diagnostics],
+        "max_abs_logit_delta": max_abs_logit_delta,
+        "score_atol": score_atol,
+        "top_ks_checked": list(top_ks),
+        "drift_details": diagnostics,
+    }
 
 
 def load_checkpoint_model(checkpoint_path, runtime, device):
@@ -123,6 +193,7 @@ def main():
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--control-modes", default=",".join(CONTROL_MODES))
     parser.add_argument("--reference-normal-predictions", default=None)
+    parser.add_argument("--reference-logit-atol", type=float, default=1e-5)
     parser.add_argument("--dev-limit", type=int, default=None)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--seed", type=int, default=42)
@@ -192,9 +263,13 @@ def main():
         results[mode] = metrics
         prediction_rows[mode] = predictions
 
+    reference_check = None
     if args.reference_normal_predictions:
-        assert_reference_normal_matches(
-            prediction_rows["normal"], args.reference_normal_predictions
+        reference_check = assert_reference_normal_matches(
+            prediction_rows["normal"],
+            args.reference_normal_predictions,
+            examples,
+            score_atol=args.reference_logit_atol,
         )
     state_sha_after = state_dict_sha256(model)
     if state_sha_before != state_sha_after:
@@ -223,7 +298,10 @@ def main():
         "metrics": results,
         "normal_minus_control": deltas,
         "reference_normal_predictions": args.reference_normal_predictions,
-        "reference_normal_reproduced": bool(args.reference_normal_predictions),
+        "reference_normal_reproduced": bool(
+            reference_check and reference_check["metric_equivalent"]
+        ),
+        "reference_normal_check": reference_check,
         "data_config": {
             "dev_graph_file": args.dev_graph_file,
             "dev_label_file": args.dev_label_file,
