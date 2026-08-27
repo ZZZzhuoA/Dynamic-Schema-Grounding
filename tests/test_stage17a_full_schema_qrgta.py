@@ -139,6 +139,8 @@ class Stage17AAlignmentTest(unittest.TestCase):
         direct = [row for row in first if row["is_direct"]]
         self.assertEqual(len(direct), len(example["schema_edges"]))
         self.assertTrue(any(row["src"] == 1 and row["dst"] == 2 and row["distance"] == 2 for row in first))
+        signatures = TRAINING.collect_path_signatures([example], relations, 3)
+        self.assertIn("PATH:table_to_column>column_to_table", signatures)
 
     def test_path_cap_does_not_remove_direct_schema_edges(self):
         example = TRAINING.align_graphs_and_labels(
@@ -154,6 +156,13 @@ class Stage17AAlignmentTest(unittest.TestCase):
         )
         self.assertEqual(len(capped), len(example["schema_edges"]))
         self.assertTrue(all(row["is_direct"] for row in capped))
+
+    def test_unknown_path_signature_can_fall_back_to_neutral_for_old_checkpoints(self):
+        path_signatures = {TRAINING.NEUTRAL_PATH_SIGNATURE: 0}
+        self.assertEqual(
+            path_signatures.get("PATH:table_to_column>column_to_table", path_signatures[TRAINING.NEUTRAL_PATH_SIGNATURE]),
+            0,
+        )
 
 
 class Stage17AModelTest(unittest.TestCase):

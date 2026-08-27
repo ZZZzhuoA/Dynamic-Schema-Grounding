@@ -1,6 +1,7 @@
 """Train the Stage 17-A0 full-schema binary QRGTA grounder."""
 
 import argparse
+import itertools
 import json
 import random
 import sys
@@ -273,6 +274,12 @@ def _local_edges_for_paths(example, relations):
 
 def collect_path_signatures(examples, relations, max_path_distance):
     names = {NEUTRAL_PATH_SIGNATURE, "QUERY_TO_TABLE", "QUERY_TO_COLUMN"}
+    schema_relation_names = sorted(
+        name for name in relations if name not in {QUERY_TO_TABLE, QUERY_TO_COLUMN}
+    )
+    for distance in range(1, int(max_path_distance) + 1):
+        for relation_sequence in itertools.product(schema_relation_names, repeat=distance):
+            names.add(path_signature_name(list(relation_sequence)))
     for example in examples:
         path_rows = build_path_rows(
             example,
@@ -472,7 +479,11 @@ def path_aware_schema_edge_tensors(
         ]
         for row in rows
     ]
-    signatures = [path_signatures[row["path_signature"]] for row in rows]
+    neutral_signature_id = path_signatures[NEUTRAL_PATH_SIGNATURE]
+    signatures = [
+        path_signatures.get(row["path_signature"], neutral_signature_id)
+        for row in rows
+    ]
     is_direct = [row["is_direct"] for row in rows]
 
     edge_index = torch.tensor(
