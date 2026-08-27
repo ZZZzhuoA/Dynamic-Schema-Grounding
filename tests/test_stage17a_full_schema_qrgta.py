@@ -656,6 +656,57 @@ class Stage17ASummaryTest(unittest.TestCase):
             )
             self.assertTrue(result["decision_passed"])
 
+    def test_summary_accepts_path_qrgta_normal_runs(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            argv = ["stage17a_summarize_causal_controls.py"]
+            for seed in (42, 43, 44):
+                normal = root / f"path_normal_{seed}"
+                mlp = root / f"mlp_{seed}"
+                intervention = root / f"intervention_{seed}"
+                self.write_training_run(normal, "path_qrgta", "normal", 0.8)
+                self.write_training_run(mlp, "mlp_residual", "normal", 0.7)
+                intervention.mkdir()
+                controls = {
+                    "zero_query_edges": self.metric_payload(0.78),
+                    "shuffled_schema_edges": self.metric_payload(0.76),
+                    "shuffled_node_identity": self.metric_payload(0.74),
+                    "shuffled_distance_buckets": self.metric_payload(0.79),
+                    "shuffled_path_signatures": self.metric_payload(0.77),
+                    "zero_path_features": self.metric_payload(0.79),
+                }
+                (intervention / "intervention_summary.json").write_text(
+                    json.dumps(
+                        {
+                            "parameters_unchanged": True,
+                            "checkpoint_sha256": SUMMARY.file_sha256(normal / "best.pt"),
+                            "reference_normal_reproduced": True,
+                            "data_config": {
+                                "dev_graph_file": "dev_graph.jsonl",
+                                "dev_label_file": "dev_labels.jsonl",
+                                "embedding_cache_dir": "cache",
+                                "dev_limit": None,
+                            },
+                            "metrics": {"normal": self.metric_payload(0.8), **controls},
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                argv.extend(["--normal-run", f"{seed}={normal}"])
+                argv.extend(["--mlp-run", f"{seed}={mlp}"])
+                argv.extend(["--intervention-run", f"{seed}={intervention}"])
+            output = root / "summary.json"
+            argv.extend(["--output-file", str(output)])
+            with mock.patch.object(sys, "argv", argv):
+                with redirect_stdout(StringIO()):
+                    SUMMARY.main()
+            result = json.loads(output.read_text(encoding="utf-8"))
+            self.assertIn(
+                "shuffled_path_signatures",
+                result["path_checkpoint_interventions_normal_minus_control"],
+            )
+            self.assertTrue(result["decision_passed"])
+
 
 if __name__ == "__main__":
     unittest.main()

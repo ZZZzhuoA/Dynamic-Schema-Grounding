@@ -72,10 +72,16 @@ def trained_run(path, expected_model_type=None, expected_control=None):
     metrics = summary["dev_metrics"]
     config = summary["config"]
     model_config = summary["model_config"]
-    if expected_model_type and model_config.get("model_type") != expected_model_type:
+    if isinstance(expected_model_type, (set, tuple, list)):
+        expected_model_types = set(expected_model_type)
+    elif expected_model_type:
+        expected_model_types = {expected_model_type}
+    else:
+        expected_model_types = set()
+    if expected_model_types and model_config.get("model_type") not in expected_model_types:
         raise ValueError(
             f"{path} has model_type={model_config.get('model_type')!r}, "
-            f"expected {expected_model_type!r}"
+            f"expected one of {sorted(expected_model_types)!r}"
         )
     if expected_control and model_config.get("control_mode") != expected_control:
         raise ValueError(
@@ -241,7 +247,7 @@ def main():
     intervention_paths = assignments(args.intervention_run, "--intervention-run")
     retrained_paths = assignments(args.retrained_run, "--retrained-run")
     normal = {
-        int(seed): trained_run(path, "qrgta", "normal")
+        int(seed): trained_run(path, {"qrgta", "path_qrgta"}, "normal")
         for seed, path in normal_paths.items()
     }
     mlp = {
@@ -257,7 +263,11 @@ def main():
     if unknown_retrained:
         raise ValueError(f"Unknown retrained controls: {unknown_retrained}")
     retrained = {
-        mode: trained_run(path, "qrgta", mode)
+        mode: trained_run(
+            path,
+            {run["model_type"] for run in normal.values()},
+            mode,
+        )
         for mode, path in retrained_paths.items()
     }
     for mode, run in retrained.items():
