@@ -303,6 +303,181 @@ class PathAwareSparseQRGTAEncoderLayer(nn.Module):
         return schema_states
 
 
+class PersistentGatedPathAwareSparseQRGTAEncoderLayer(PathAwareSparseQRGTAEncoderLayer):
+    """Path-aware sparse layer with identity-preserving gated delta updates."""
+
+    def __init__(
+        self,
+        hidden_dim,
+        num_heads,
+        relation_count,
+        distance_bucket_count,
+        path_signature_count,
+        dropout,
+    ):
+        super().__init__(
+            hidden_dim,
+            num_heads,
+            relation_count,
+            distance_bucket_count,
+            path_signature_count,
+            dropout,
+        )
+        gate_input_dim = hidden_dim * 5
+        self.message_update_gate = nn.Sequential(
+            nn.Linear(gate_input_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+        self.ffn_update_gate = nn.Sequential(
+            nn.Linear(gate_input_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+
+    def _gate_input(self, states, delta, query_state):
+        query_matrix = query_state.unsqueeze(0).expand_as(states)
+        return torch.cat(
+            [states, delta, query_matrix, states * query_matrix, torch.abs(states - query_matrix)],
+            dim=-1,
+        )
+
+    def forward(
+        self,
+        schema_states,
+        query_state,
+        schema_edge_index,
+        schema_edge_type,
+        schema_edge_scalar,
+        schema_distance_bucket,
+        schema_path_signature,
+        query_edge_destination,
+        query_edge_type,
+        query_edge_similarity,
+        query_distance_bucket,
+        query_path_signature,
+        zero_update_gates=False,
+    ):
+        node_count = schema_states.shape[0]
+        device = schema_states.device
+
+        source_states = torch.cat([query_state.unsqueeze(0), schema_states], dim=0)
+        structural_source = schema_edge_index[0] + 1
+        structural_destination = schema_edge_index[1]
+        query_source = torch.zeros_like(query_edge_destination)
+        source = torch.cat([structural_source, query_source], dim=0)
+        destination = torch.cat(
+            [structural_destination, query_edge_destination], dim=0
+        )
+        relation = torch.cat([schema_edge_type, query_edge_type], dim=0)
+        scalar = torch.cat([schema_edge_scalar, query_edge_similarity], dim=0)
+        distance_bucket = torch.cat(
+            [schema_distance_bucket, query_distance_bucket], dim=0
+        )
+        path_signature = torch.cat(
+            [schema_path_signature, query_path_signature], dim=0
+        )
+        is_query_edge = torch.cat(
+            [
+                torch.zeros_like(schema_edge_scalar, dtype=torch.bool),
+                torch.ones_like(query_edge_similarity, dtype=torch.bool),
+            ],
+            dim=0,
+        )
+
+        if source.numel() == 0:
+            message = torch.zeros_like(schema_states)
+        else:
+            query = self.q_proj(schema_states).view(
+                node_count, self.num_heads, self.head_dim
+            )[destination]
+            key = self.k_proj(source_states).view(
+                source_states.shape[0], self.num_heads, self.head_dim
+            )[source]
+            value = self.v_proj(source_states).view(
+                source_states.shape[0], self.num_heads, self.head_dim
+            )[source]
+            relation_key = self.relation_key(relation).view(
+                -1, self.num_heads, self.head_dim
+            )
+            relation_value = self.relation_value(relation).view(
+                -1, self.num_heads, self.head_dim
+            )
+            distance_key = self.distance_key(distance_bucket).view(
+                -1, self.num_heads, self.head_dim
+            )
+            distance_value = self.distance_value(distance_bucket).view(
+                -1, self.num_heads, self.head_dim
+            )
+            path_key = self.path_key(path_signature).view(
+                -1, self.num_heads, self.head_dim
+            )
+            path_value = self.path_value(path_signature).view(
+                -1, self.num_heads, self.head_dim
+            )
+            path_embedding = (
+                self.distance_key(distance_bucket) + self.path_key(path_signature)
+            )
+            gate_input = torch.cat(
+                [query_state.unsqueeze(0).expand_as(path_embedding), path_embedding],
+                dim=-1,
+            )
+            path_gate = torch.sigmoid(self.path_gate(gate_input))
+            gate_heads = path_gate.unsqueeze(-1)
+            gated_key = relation_key + gate_heads * (distance_key + path_key)
+            gated_value = relation_value + gate_heads * (distance_value + path_value)
+
+            scores = ((query * (key + gated_key)).sum(dim=-1) / math.sqrt(self.head_dim))
+            scores = scores + self.relation_bias(relation)
+            scores = scores + path_gate * (
+                self.distance_bias(distance_bucket) + self.path_bias(path_signature)
+            )
+            scores = scores + (
+                scalar.unsqueeze(-1)
+                * is_query_edge.to(scores.dtype).unsqueeze(-1)
+                * self.query_similarity_scale.unsqueeze(0)
+            )
+            attention = _segment_softmax(scores, destination, node_count)
+            weighted = (value + gated_value) * attention.unsqueeze(-1)
+            message_heads = torch.zeros(
+                (node_count, self.num_heads, self.head_dim),
+                dtype=weighted.dtype,
+                device=device,
+            )
+            message_heads.index_add_(0, destination, weighted)
+            message = message_heads.reshape(node_count, self.hidden_dim)
+
+        message_delta = self.output(message)
+        if zero_update_gates:
+            message_gate = torch.zeros_like(schema_states)
+            ffn_gate = torch.zeros_like(schema_states)
+            next_states = schema_states
+            ffn_delta = torch.zeros_like(schema_states)
+        else:
+            message_gate = torch.sigmoid(
+                self.message_update_gate(
+                    self._gate_input(schema_states, message_delta, query_state)
+                )
+            )
+            h_msg = self.attention_norm(
+                schema_states + message_gate * self.dropout(message_delta)
+            )
+            ffn_delta = self.ffn(h_msg)
+            ffn_gate = torch.sigmoid(
+                self.ffn_update_gate(self._gate_input(h_msg, ffn_delta, query_state))
+            )
+            next_states = self.ffn_norm(h_msg + ffn_gate * self.dropout(ffn_delta))
+
+        diagnostics = {
+            "message_gate": message_gate,
+            "ffn_gate": ffn_gate,
+            "layer_delta_norm": torch.linalg.vector_norm(next_states - schema_states, dim=-1),
+            "message_delta_norm": torch.linalg.vector_norm(message_delta, dim=-1),
+            "ffn_delta_norm": torch.linalg.vector_norm(ffn_delta, dim=-1),
+        }
+        return next_states, diagnostics
+
+
 class ResidualNodeMLPLayer(nn.Module):
     """Depth-matched node-local baseline with no graph message passing."""
 
@@ -337,7 +512,7 @@ class FullSchemaQRGTA(nn.Module):
         path_signature_count=1,
     ):
         super().__init__()
-        if model_type not in {"qrgta", "path_qrgta", "mlp", "mlp_residual"}:
+        if model_type not in {"qrgta", "path_qrgta", "persistent_path_qrgta", "mlp", "mlp_residual"}:
             raise ValueError(f"Unsupported model_type: {model_type}")
         self.model_type = model_type
         self.node_input = nn.Linear(dense_dim, hidden_dim)
@@ -355,6 +530,15 @@ class FullSchemaQRGTA(nn.Module):
             )
         elif model_type == "path_qrgta":
             layer_cls = lambda: PathAwareSparseQRGTAEncoderLayer(
+                hidden_dim,
+                num_heads,
+                relation_count,
+                distance_bucket_count,
+                path_signature_count,
+                dropout,
+            )
+        elif model_type == "persistent_path_qrgta":
+            layer_cls = lambda: PersistentGatedPathAwareSparseQRGTAEncoderLayer(
                 hidden_dim,
                 num_heads,
                 relation_count,
@@ -394,37 +578,59 @@ class FullSchemaQRGTA(nn.Module):
         schema_path_signature=None,
         query_distance_bucket=None,
         query_path_signature=None,
+        zero_update_gates=False,
+        record_persistent_diagnostics=False,
     ):
         schema_states = self.node_norm(
             self.node_input(dense_nodes) + self.node_type(node_types)
         )
+        initial_schema_states = schema_states
         query_state = self.query_norm(
             self.query_input(query_embedding).reshape(-1, schema_states.shape[-1])[0]
         )
         schema_edge_scalar = dense_nodes.new_zeros(schema_edge_type.shape[0])
+        persistent_diagnostics = []
         for layer in self.layers:
-            if self.model_type == "path_qrgta":
+            if self.model_type in {"path_qrgta", "persistent_path_qrgta"}:
                 if (
                     schema_distance_bucket is None
                     or schema_path_signature is None
                     or query_distance_bucket is None
                     or query_path_signature is None
                 ):
-                    raise ValueError("path_qrgta requires path and distance tensors")
-                schema_states = layer(
-                    schema_states,
-                    query_state,
-                    schema_edge_index,
-                    schema_edge_type,
-                    schema_edge_scalar,
-                    schema_distance_bucket,
-                    schema_path_signature,
-                    query_edge_destination,
-                    query_edge_type,
-                    query_edge_similarity,
-                    query_distance_bucket,
-                    query_path_signature,
-                )
+                    raise ValueError(f"{self.model_type} requires path and distance tensors")
+                if self.model_type == "persistent_path_qrgta":
+                    schema_states, layer_diagnostics = layer(
+                        schema_states,
+                        query_state,
+                        schema_edge_index,
+                        schema_edge_type,
+                        schema_edge_scalar,
+                        schema_distance_bucket,
+                        schema_path_signature,
+                        query_edge_destination,
+                        query_edge_type,
+                        query_edge_similarity,
+                        query_distance_bucket,
+                        query_path_signature,
+                        zero_update_gates=zero_update_gates,
+                    )
+                    persistent_diagnostics.append(layer_diagnostics)
+                else:
+                    schema_states = layer(
+                        schema_states,
+                        query_state,
+                        schema_edge_index,
+                        schema_edge_type,
+                        schema_edge_scalar,
+                        schema_distance_bucket,
+                        schema_path_signature,
+                        query_edge_destination,
+                        query_edge_type,
+                        query_edge_similarity,
+                        query_distance_bucket,
+                        query_path_signature,
+                    )
             else:
                 schema_states = layer(
                     schema_states,
@@ -449,11 +655,40 @@ class FullSchemaQRGTA(nn.Module):
             dim=-1,
         )
         logits = self.scorer(pair).squeeze(-1)
-        return {
+        output = {
             "logits": logits,
             "probabilities": torch.sigmoid(logits),
             "schema_states": schema_states,
         }
+        if self.model_type == "persistent_path_qrgta" and record_persistent_diagnostics:
+            if persistent_diagnostics:
+                message_gates = torch.cat(
+                    [item["message_gate"].reshape(-1) for item in persistent_diagnostics]
+                )
+                ffn_gates = torch.cat(
+                    [item["ffn_gate"].reshape(-1) for item in persistent_diagnostics]
+                )
+                layer_delta_norms = torch.cat(
+                    [item["layer_delta_norm"].reshape(-1) for item in persistent_diagnostics]
+                )
+            else:
+                message_gates = schema_states.new_zeros(1)
+                ffn_gates = schema_states.new_zeros(1)
+                layer_delta_norms = schema_states.new_zeros(1)
+            output["persistent_diagnostics"] = {
+                "avg_message_gate": message_gates.mean(),
+                "avg_ffn_gate": ffn_gates.mean(),
+                "min_message_gate": message_gates.min(),
+                "max_message_gate": message_gates.max(),
+                "avg_layer_delta_norm": layer_delta_norms.mean(),
+                "avg_final_delta_norm": torch.linalg.vector_norm(
+                    schema_states - initial_schema_states, dim=-1
+                ).mean(),
+                "avg_identity_cosine_input_to_final": F.cosine_similarity(
+                    initial_schema_states, schema_states, dim=-1
+                ).mean(),
+            }
+        return output
 
 
 def balanced_binary_loss(logits, labels):

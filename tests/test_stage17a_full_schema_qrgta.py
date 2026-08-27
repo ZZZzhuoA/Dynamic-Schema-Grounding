@@ -305,11 +305,11 @@ class Stage17AModelTest(unittest.TestCase):
         self.assertTrue(torch.isfinite(loss))
         self.assertGreater(gradient_total, 0.0)
 
-    def path_args(self, example, relations, control="normal"):
+    def path_args(self, example, relations, control="normal", model_type="path_qrgta"):
         return SimpleNamespace(
             control_mode=control,
             seed=42,
-            model_type="path_qrgta",
+            model_type=model_type,
             max_path_distance=3,
             max_path_edges_per_destination=32,
             distance_buckets=TRAINING.distance_bucket_mapping(3),
@@ -317,6 +317,7 @@ class Stage17AModelTest(unittest.TestCase):
             coverage_surrogate_weight=0.1,
             coverage_margin=0.1,
             coverage_target_k=30,
+            record_persistent_diagnostics=True,
         )
 
     def test_path_qrgta_forward_backward_supports_variable_full_schema(self):
@@ -350,6 +351,137 @@ class Stage17AModelTest(unittest.TestCase):
         )
         self.assertTrue(torch.isfinite(loss))
         self.assertGreater(gradient_total, 0.0)
+
+    def test_persistent_path_qrgta_forward_backward_and_diagnostics(self):
+        torch = self.runtime["torch"]
+        example = self.aligned_example()
+        relations = TRAINING.relation_mapping([example], [example])
+        args = self.path_args(example, relations, model_type="persistent_path_qrgta")
+        tensors = TRAINING.example_to_tensors(
+            example, self.cache(), relations, args, self.runtime, "cpu"
+        )
+        model = self.runtime["model"](
+            dense_dim=16,
+            relation_count=len(relations),
+            hidden_dim=16,
+            num_layers=2,
+            num_heads=4,
+            dropout=0.0,
+            model_type="persistent_path_qrgta",
+            distance_bucket_count=len(args.distance_buckets),
+            path_signature_count=len(args.path_signatures),
+        )
+        output = TRAINING.forward_model(model, tensors)
+        self.assertEqual(output["logits"].shape, (5,))
+        diagnostics = output["persistent_diagnostics"]
+        for key in (
+            "avg_message_gate",
+            "avg_ffn_gate",
+            "min_message_gate",
+            "max_message_gate",
+            "avg_identity_cosine_input_to_final",
+            "avg_layer_delta_norm",
+            "avg_final_delta_norm",
+        ):
+            self.assertIn(key, diagnostics)
+            self.assertTrue(torch.isfinite(diagnostics[key]))
+        self.assertGreaterEqual(float(diagnostics["min_message_gate"]), 0.0)
+        self.assertLessEqual(float(diagnostics["max_message_gate"]), 1.0)
+        loss = TRAINING.training_loss(output, tensors["labels"], args, self.runtime)
+        loss.backward()
+        gradient_total = sum(
+            float(parameter.grad.abs().sum())
+            for parameter in model.parameters()
+            if parameter.grad is not None
+        )
+        self.assertTrue(torch.isfinite(loss))
+        self.assertGreater(gradient_total, 0.0)
+
+    def test_persistent_path_qrgta_requires_path_tensors(self):
+        example = self.aligned_example()
+        relations = TRAINING.relation_mapping([example], [example])
+        tensors = TRAINING.example_to_tensors(
+            example,
+            self.cache(),
+            relations,
+            self.path_args(example, relations, model_type="persistent_path_qrgta"),
+            self.runtime,
+            "cpu",
+        )
+        tensors["schema_distance_bucket"] = None
+        model = self.runtime["model"](
+            dense_dim=16,
+            relation_count=len(relations),
+            hidden_dim=16,
+            num_layers=1,
+            num_heads=4,
+            dropout=0.0,
+            model_type="persistent_path_qrgta",
+            distance_bucket_count=5,
+            path_signature_count=12,
+        )
+        with self.assertRaisesRegex(ValueError, "requires path and distance tensors"):
+            TRAINING.forward_model(model, tensors)
+
+    def test_zero_update_gates_preserves_initial_identity_state(self):
+        torch = self.runtime["torch"]
+        example = self.aligned_example()
+        relations = TRAINING.relation_mapping([example], [example])
+        args = self.path_args(
+            example, relations, control="zero_update_gates", model_type="persistent_path_qrgta"
+        )
+        tensors = TRAINING.example_to_tensors(
+            example, self.cache(), relations, args, self.runtime, "cpu"
+        )
+        model = self.runtime["model"](
+            dense_dim=16,
+            relation_count=len(relations),
+            hidden_dim=16,
+            num_layers=2,
+            num_heads=4,
+            dropout=0.0,
+            model_type="persistent_path_qrgta",
+            distance_bucket_count=len(args.distance_buckets),
+            path_signature_count=len(args.path_signatures),
+        )
+        output = TRAINING.forward_model(model, tensors)
+        with torch.no_grad():
+            initial = model.node_norm(
+                model.node_input(tensors["dense_nodes"]) + model.node_type(tensors["node_types"])
+            )
+        self.assertTrue(torch.allclose(output["schema_states"], initial, atol=1e-6))
+        self.assertEqual(float(output["persistent_diagnostics"]["avg_message_gate"]), 0.0)
+        self.assertEqual(float(output["persistent_diagnostics"]["avg_ffn_gate"]), 0.0)
+
+    def test_persistent_diagnostics_are_metrics_not_predictions(self):
+        example = self.aligned_example()
+        relations = TRAINING.relation_mapping([example], [example])
+        args = self.path_args(example, relations, model_type="persistent_path_qrgta")
+        model = self.runtime["model"](
+            dense_dim=16,
+            relation_count=len(relations),
+            hidden_dim=16,
+            num_layers=1,
+            num_heads=4,
+            dropout=0.0,
+            model_type="persistent_path_qrgta",
+            distance_bucket_count=len(args.distance_buckets),
+            path_signature_count=len(args.path_signatures),
+        )
+        metrics, predictions = TRAINING.evaluate(
+            model,
+            [example],
+            self.cache(),
+            relations,
+            args,
+            self.runtime,
+            "cpu",
+            "dev",
+            predictions=True,
+        )
+        self.assertIn("persistent_diagnostics", metrics)
+        self.assertNotIn("persistent_diagnostics", predictions[0])
+        self.assertNotIn("gold_ids", predictions[0])
 
     def test_zero_path_features_preserves_edge_count_and_neutralizes_schema_features(self):
         example = self.aligned_example()
@@ -704,6 +836,62 @@ class Stage17ASummaryTest(unittest.TestCase):
             self.assertIn(
                 "shuffled_path_signatures",
                 result["path_checkpoint_interventions_normal_minus_control"],
+            )
+            self.assertTrue(result["decision_passed"])
+
+    def test_summary_accepts_persistent_path_qrgta_normal_runs(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            argv = ["stage17a_summarize_causal_controls.py"]
+            for seed in (42, 43, 44):
+                normal = root / f"persistent_normal_{seed}"
+                mlp = root / f"mlp_{seed}"
+                intervention = root / f"intervention_{seed}"
+                self.write_training_run(normal, "persistent_path_qrgta", "normal", 0.8)
+                mlp_complete = 0.7
+                self.write_training_run(mlp, "mlp_residual", "normal", mlp_complete)
+                intervention.mkdir()
+                controls = {
+                    "zero_query_edges": self.metric_payload(0.78),
+                    "shuffled_schema_edges": self.metric_payload(0.76),
+                    "shuffled_node_identity": self.metric_payload(0.74),
+                    "shuffled_distance_buckets": self.metric_payload(0.79),
+                    "shuffled_path_signatures": self.metric_payload(0.77),
+                    "zero_path_features": self.metric_payload(0.79),
+                    "zero_update_gates": self.metric_payload(0.75),
+                }
+                (intervention / "intervention_summary.json").write_text(
+                    json.dumps(
+                        {
+                            "parameters_unchanged": True,
+                            "checkpoint_sha256": SUMMARY.file_sha256(normal / "best.pt"),
+                            "reference_normal_reproduced": True,
+                            "data_config": {
+                                "dev_graph_file": "dev_graph.jsonl",
+                                "dev_label_file": "dev_labels.jsonl",
+                                "embedding_cache_dir": "cache",
+                                "dev_limit": None,
+                            },
+                            "metrics": {"normal": self.metric_payload(0.8), **controls},
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                argv.extend(["--normal-run", f"{seed}={normal}"])
+                argv.extend(["--mlp-run", f"{seed}={mlp}"])
+                argv.extend(["--intervention-run", f"{seed}={intervention}"])
+            output = root / "summary.json"
+            argv.extend(["--output-file", str(output)])
+            with mock.patch.object(sys, "argv", argv):
+                with redirect_stdout(StringIO()):
+                    SUMMARY.main()
+            result = json.loads(output.read_text(encoding="utf-8"))
+            self.assertIn(
+                "zero_update_gates",
+                result["persistent_checkpoint_interventions_normal_minus_control"],
+            )
+            self.assertTrue(
+                result["decision_checks"]["zero_update_gates_drop_complete_coverage@30_every_seed"]
             )
             self.assertTrue(result["decision_passed"])
 

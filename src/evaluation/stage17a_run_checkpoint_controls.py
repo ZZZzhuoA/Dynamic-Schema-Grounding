@@ -28,10 +28,16 @@ CONTROL_MODES = (
     "zero_query_edges",
     "shuffled_schema_edges",
     "shuffled_node_identity",
+)
+PATH_CONTROL_MODES = (
     "shuffled_distance_buckets",
     "shuffled_path_signatures",
     "zero_path_features",
 )
+PERSISTENT_CONTROL_MODES = (
+    "zero_update_gates",
+)
+ALL_CONTROL_MODES = CONTROL_MODES + PATH_CONTROL_MODES + PERSISTENT_CONTROL_MODES
 PRIMARY_METRICS = (
     "complete_coverage@30",
     "schema_recall@30",
@@ -164,9 +170,9 @@ def load_checkpoint_model(checkpoint_path, runtime, device):
     config = checkpoint.get("model_config")
     if not isinstance(config, dict):
         raise ValueError("Checkpoint does not contain model_config")
-    if config.get("model_type") not in {"qrgta", "path_qrgta"}:
+    if config.get("model_type") not in {"qrgta", "path_qrgta", "persistent_path_qrgta"}:
         raise ValueError(
-            "Checkpoint intervention requires a normal qrgta/path_qrgta checkpoint, got "
+            "Checkpoint intervention requires a normal qrgta/path_qrgta/persistent_path_qrgta checkpoint, got "
             f"{config.get('model_type')!r}"
         )
     if config.get("control_mode", "normal") != "normal":
@@ -196,20 +202,13 @@ def main():
     parser.add_argument("--dev-label-file", required=True)
     parser.add_argument("--embedding-cache-dir", required=True)
     parser.add_argument("--output-dir", required=True)
-    parser.add_argument("--control-modes", default=",".join(CONTROL_MODES))
+    parser.add_argument("--control-modes", default=None)
     parser.add_argument("--reference-normal-predictions", default=None)
     parser.add_argument("--reference-logit-atol", type=float, default=1e-5)
     parser.add_argument("--dev-limit", type=int, default=None)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
-
-    modes = [value.strip() for value in args.control_modes.split(",") if value.strip()]
-    unknown = sorted(set(modes) - set(CONTROL_MODES))
-    if unknown or len(modes) != len(set(modes)):
-        raise ValueError(f"Invalid or duplicate control modes: unknown={unknown}, modes={modes}")
-    if "normal" not in modes:
-        raise ValueError("--control-modes must include normal for paired deltas")
 
     runtime = import_runtime()
     torch = runtime["torch"]
@@ -221,6 +220,21 @@ def main():
     model, model_config, checkpoint_epoch = load_checkpoint_model(
         args.checkpoint, runtime, device
     )
+    model_type = str(model_config.get("model_type", "qrgta"))
+    default_modes = list(CONTROL_MODES)
+    if model_type in {"path_qrgta", "persistent_path_qrgta"}:
+        default_modes.extend(PATH_CONTROL_MODES)
+    if model_type == "persistent_path_qrgta":
+        default_modes.extend(PERSISTENT_CONTROL_MODES)
+    modes_text = args.control_modes or ",".join(default_modes)
+    modes = [value.strip() for value in modes_text.split(",") if value.strip()]
+    unknown = sorted(set(modes) - set(ALL_CONTROL_MODES))
+    if unknown or len(modes) != len(set(modes)):
+        raise ValueError(f"Invalid or duplicate control modes: unknown={unknown}, modes={modes}")
+    if "normal" not in modes:
+        raise ValueError("--control-modes must include normal for paired deltas")
+    if model_type != "persistent_path_qrgta" and "zero_update_gates" in modes:
+        raise ValueError("zero_update_gates requires a persistent_path_qrgta checkpoint")
     if cache["dense_dim"] != int(model_config["dense_dim"]):
         raise ValueError(
             f"Embedding dimension mismatch: cache={cache['dense_dim']} "
@@ -261,6 +275,9 @@ def main():
             ),
             coverage_margin=float(model_config.get("coverage_margin", 0.1)),
             coverage_target_k=int(model_config.get("coverage_target_k", 30)),
+            record_persistent_diagnostics=bool(
+                model_config.get("record_persistent_diagnostics", True)
+            ),
         )
         metrics, predictions = evaluate(
             model,
@@ -341,6 +358,7 @@ def main():
             "shuffled_distance_buckets": "Shuffle non-query schema edge distance buckets while preserving edge index, relation type, and path signature.",
             "shuffled_path_signatures": "Shuffle non-query schema edge path signatures while preserving edge index, relation type, and distance bucket.",
             "zero_path_features": "Keep path-augmented schema edges but neutralize non-query path and distance features.",
+            "zero_update_gates": "Keep path-augmented edges but set persistent message/FFN update gates to zero.",
         },
     }
     write_json(output_dir / "intervention_summary.json", summary)

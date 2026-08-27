@@ -25,6 +25,9 @@ PATH_CONTROL_MODES = (
     "shuffled_path_signatures",
     "zero_path_features",
 )
+PERSISTENT_CONTROL_MODES = (
+    "zero_update_gates",
+)
 DATA_KEYS = (
     "train_graph_file",
     "dev_graph_file",
@@ -95,6 +98,7 @@ def trained_run(path, expected_model_type=None, expected_control=None):
         "data_config": {key: config.get(key) for key in DATA_KEYS},
         "model_type": model_config.get("model_type"),
         "control_mode": model_config.get("control_mode"),
+        "persistent_diagnostics": metrics.get("persistent_diagnostics", {}),
         "best_epoch": summary.get("best_epoch"),
         "checkpoint_sha256": file_sha256(path / "best.pt")
         if (path / "best.pt").exists()
@@ -188,7 +192,7 @@ def load_interventions(paths, normal):
                     metric: float(summary["metrics"][mode][metric])
                     for metric in PRIMARY_METRICS
                 }
-                for mode in CONTROL_MODES + PATH_CONTROL_MODES
+                for mode in CONTROL_MODES + PATH_CONTROL_MODES + PERSISTENT_CONTROL_MODES
                 if mode in summary["metrics"]
             },
         }
@@ -247,7 +251,7 @@ def main():
     intervention_paths = assignments(args.intervention_run, "--intervention-run")
     retrained_paths = assignments(args.retrained_run, "--retrained-run")
     normal = {
-        int(seed): trained_run(path, {"qrgta", "path_qrgta"}, "normal")
+        int(seed): trained_run(path, {"qrgta", "path_qrgta", "persistent_path_qrgta"}, "normal")
         for seed, path in normal_paths.items()
     }
     mlp = {
@@ -258,7 +262,7 @@ def main():
     interventions = load_interventions(
         {int(seed): path for seed, path in intervention_paths.items()}, normal
     )
-    known_retrained_modes = set(CONTROL_MODES) | set(PATH_CONTROL_MODES)
+    known_retrained_modes = set(CONTROL_MODES) | set(PATH_CONTROL_MODES) | set(PERSISTENT_CONTROL_MODES)
     unknown_retrained = sorted(set(retrained_paths) - known_retrained_modes)
     if unknown_retrained:
         raise ValueError(f"Unknown retrained controls: {unknown_retrained}")
@@ -277,14 +281,25 @@ def main():
     qrgta_minus_mlp = paired_deltas(normal, mlp)
     control_deltas = intervention_deltas(normal, interventions)
     normal_is_path_qrgta = all(run.get("model_type") == "path_qrgta" for run in normal.values())
+    normal_is_persistent_path_qrgta = all(
+        run.get("model_type") == "persistent_path_qrgta" for run in normal.values()
+    )
     available_path_controls = [
         mode
         for mode in PATH_CONTROL_MODES
         if all(mode in interventions[seed]["metrics"] for seed in normal)
-    ] if normal_is_path_qrgta else []
+    ] if normal_is_path_qrgta or normal_is_persistent_path_qrgta else []
     path_control_deltas = intervention_deltas(
         normal, interventions, tuple(available_path_controls)
     ) if available_path_controls else {}
+    available_persistent_controls = [
+        mode
+        for mode in PERSISTENT_CONTROL_MODES
+        if all(mode in interventions[seed]["metrics"] for seed in normal)
+    ] if normal_is_persistent_path_qrgta else []
+    persistent_control_deltas = intervention_deltas(
+        normal, interventions, tuple(available_persistent_controls)
+    ) if available_persistent_controls else {}
     complete_drops = {
         mode: control_deltas[mode]["complete_coverage@30"]["mean"]
         for mode in CONTROL_MODES
@@ -323,6 +338,18 @@ def main():
         checks["distance_or_zero_path_features_drop_complete_coverage@30_at_least_2_of_3"] = (
             sum(distance_or_zero) >= 2
         )
+    if available_persistent_controls:
+        checks["zero_update_gates_drop_complete_coverage@30_every_seed"] = all(
+            value > 0
+            for value in persistent_control_deltas["zero_update_gates"][
+                "complete_coverage@30"
+            ]["values"].values()
+        )
+    persistent_diagnostics = {
+        str(seed): run.get("persistent_diagnostics", {})
+        for seed, run in sorted(normal.items())
+        if run.get("persistent_diagnostics")
+    }
     output = {
         "seeds": sorted(normal),
         "data_config": data_config,
@@ -331,6 +358,8 @@ def main():
         "qrgta_minus_mlp": qrgta_minus_mlp,
         "checkpoint_interventions_normal_minus_control": control_deltas,
         "path_checkpoint_interventions_normal_minus_control": path_control_deltas,
+        "persistent_checkpoint_interventions_normal_minus_control": persistent_control_deltas,
+        "persistent_diagnostics": persistent_diagnostics,
         "retrained_seed42_controls": retrained,
         "decision_checks": checks,
         "decision_passed": all(checks.values()),

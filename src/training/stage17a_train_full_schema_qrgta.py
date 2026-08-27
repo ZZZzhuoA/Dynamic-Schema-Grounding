@@ -25,6 +25,7 @@ PATH_CONTROL_MODES = {
     "shuffled_path_signatures",
     "zero_path_features",
 }
+PATH_MODEL_TYPES = {"path_qrgta", "persistent_path_qrgta"}
 
 
 def read_jsonl(path, limit=None):
@@ -615,7 +616,7 @@ def example_to_tensors(example, cache, relations, args, runtime, device):
         )
         query_similarity = full_query_similarity
     model_type = getattr(args, "model_type", "qrgta")
-    if model_type == "path_qrgta":
+    if model_type in PATH_MODEL_TYPES:
         edge_index, edge_type, distance_tensor, signature_tensor, _, path_stats = (
             path_aware_schema_edge_tensors(
                 example,
@@ -642,10 +643,10 @@ def example_to_tensors(example, cache, relations, args, runtime, device):
             "path_edge_count": 0,
             "total_attention_edge_count": int(edge_type.shape[0]),
         }
-    if model_type == "path_qrgta" and args.control_mode == "zero_query_edges":
+    if model_type in PATH_MODEL_TYPES and args.control_mode == "zero_query_edges":
         query_distance = torch.empty(0, dtype=torch.long, device=device)
         query_path = torch.empty(0, dtype=torch.long, device=device)
-    elif model_type == "path_qrgta":
+    elif model_type in PATH_MODEL_TYPES:
         query_distance = torch.full(
             (query_destination.shape[0],),
             int(args.distance_buckets[DISTANCE_QUERY]),
@@ -681,6 +682,10 @@ def example_to_tensors(example, cache, relations, args, runtime, device):
         "schema_path_signature": signature_tensor,
         "query_distance_bucket": query_distance,
         "query_path_signature": query_path,
+        "zero_update_gates": args.control_mode == "zero_update_gates",
+        "record_persistent_diagnostics": bool(
+            getattr(args, "record_persistent_diagnostics", False)
+        ),
         "labels": labels,
         "path_stats": path_stats,
     }
@@ -700,6 +705,10 @@ def forward_model(model, tensors):
         tensors.get("schema_path_signature"),
         tensors.get("query_distance_bucket"),
         tensors.get("query_path_signature"),
+        zero_update_gates=bool(tensors.get("zero_update_gates", False)),
+        record_persistent_diagnostics=bool(
+            tensors.get("record_persistent_diagnostics", False)
+        ),
     )
 
 
@@ -777,6 +786,7 @@ def evaluate(model, examples, cache, relations, args, runtime, device, split, pr
     rankings = {}
     rows = []
     path_stats = defaultdict(list)
+    persistent_stats = defaultdict(list)
     with torch.no_grad():
         for example in examples:
             tensors = example_to_tensors(example, cache, relations, args, runtime, device)
@@ -784,6 +794,8 @@ def evaluate(model, examples, cache, relations, args, runtime, device, split, pr
             losses.append(float(training_loss(output, tensors["labels"], args, runtime).cpu()))
             for key, value in tensors.get("path_stats", {}).items():
                 path_stats[key].append(float(value))
+            for key, value in output.get("persistent_diagnostics", {}).items():
+                persistent_stats[key].append(float(value.detach().float().cpu()))
             logits = output["logits"].detach().float().cpu().tolist()
             probabilities = output["probabilities"].detach().float().cpu().tolist()
             order = sorted(range(len(logits)), key=lambda index: (-logits[index], index))
@@ -823,6 +835,10 @@ def evaluate(model, examples, cache, relations, args, runtime, device, split, pr
             "avg_path_edges": _mean(path_stats["path_edge_count"]),
             "avg_total_attention_edges": _mean(path_stats["total_attention_edge_count"]),
             "max_total_attention_edges": max(path_stats["total_attention_edge_count"]),
+        }
+    if persistent_stats:
+        metrics["persistent_diagnostics"] = {
+            key: _mean(values) for key, values in sorted(persistent_stats.items())
         }
     return metrics, rows
 
@@ -923,7 +939,9 @@ def main():
     parser.add_argument("--embedding-cache-dir", required=True)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument(
-        "--model-type", choices=["qrgta", "path_qrgta", "mlp", "mlp_residual"], default="qrgta"
+        "--model-type",
+        choices=["qrgta", "path_qrgta", "persistent_path_qrgta", "mlp", "mlp_residual"],
+        default="qrgta",
     )
     parser.add_argument("--hidden-dim", type=int, default=256)
     parser.add_argument("--num-layers", type=int, default=3)
@@ -946,6 +964,7 @@ def main():
             "shuffled_distance_buckets",
             "shuffled_path_signatures",
             "zero_path_features",
+            "zero_update_gates",
         ],
         default="normal",
     )
@@ -954,11 +973,20 @@ def main():
     parser.add_argument("--coverage-surrogate-weight", type=float, default=0.1)
     parser.add_argument("--coverage-margin", type=float, default=0.1)
     parser.add_argument("--coverage-target-k", type=int, default=30)
+    parser.add_argument(
+        "--record-persistent-diagnostics",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
     parser.add_argument("--train-limit", type=int, default=None)
     parser.add_argument("--dev-limit", type=int, default=None)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
+    if args.control_mode == "zero_update_gates" and args.model_type != "persistent_path_qrgta":
+        raise ValueError("--control-mode zero_update_gates requires --model-type persistent_path_qrgta")
+    if args.control_mode in PATH_CONTROL_MODES and args.model_type not in PATH_MODEL_TYPES:
+        raise ValueError(f"--control-mode {args.control_mode} requires a path-aware model type")
 
     runtime = import_runtime()
     torch = runtime["torch"]
@@ -1007,6 +1035,13 @@ def main():
         "coverage_surrogate_weight": args.coverage_surrogate_weight,
         "coverage_margin": args.coverage_margin,
         "coverage_target_k": args.coverage_target_k,
+        "persistent_update_type": (
+            "gated_delta" if args.model_type == "persistent_path_qrgta" else None
+        ),
+        "persistent_gate_granularity": (
+            "per_dimension" if args.model_type == "persistent_path_qrgta" else None
+        ),
+        "record_persistent_diagnostics": args.record_persistent_diagnostics,
         "control_mode": args.control_mode,
         "control_semantics": {
             "zero_query_edges": "Remove Query-to-Schema graph messages but retain the final query-conditioned scorer.",
@@ -1015,6 +1050,7 @@ def main():
             "shuffled_distance_buckets": "Shuffle non-query schema edge distance buckets while preserving edge index, relation type, and path signature.",
             "shuffled_path_signatures": "Shuffle non-query schema edge path signatures while preserving edge index, relation type, and distance bucket.",
             "zero_path_features": "Keep path-augmented schema edges but neutralize non-query path and distance features.",
+            "zero_update_gates": "Keep path-augmented edges but set persistent message/FFN update gates to zero.",
         },
     }
     output_dir = Path(args.output_dir)
