@@ -37,7 +37,17 @@ PATH_CONTROL_MODES = (
 PERSISTENT_CONTROL_MODES = (
     "zero_update_gates",
 )
-ALL_CONTROL_MODES = CONTROL_MODES + PATH_CONTROL_MODES + PERSISTENT_CONTROL_MODES
+COMPETITION_CONTROL_MODES = (
+    "zero_table_competition",
+    "shuffle_column_parent_table",
+    "zero_competition_gates",
+)
+ALL_CONTROL_MODES = (
+    CONTROL_MODES
+    + PATH_CONTROL_MODES
+    + PERSISTENT_CONTROL_MODES
+    + COMPETITION_CONTROL_MODES
+)
 PRIMARY_METRICS = (
     "complete_coverage@30",
     "schema_recall@30",
@@ -170,9 +180,14 @@ def load_checkpoint_model(checkpoint_path, runtime, device):
     config = checkpoint.get("model_config")
     if not isinstance(config, dict):
         raise ValueError("Checkpoint does not contain model_config")
-    if config.get("model_type") not in {"qrgta", "path_qrgta", "persistent_path_qrgta"}:
+    if config.get("model_type") not in {
+        "qrgta",
+        "path_qrgta",
+        "persistent_path_qrgta",
+        "table_competitive_path_qrgta",
+    }:
         raise ValueError(
-            "Checkpoint intervention requires a normal qrgta/path_qrgta/persistent_path_qrgta checkpoint, got "
+            "Checkpoint intervention requires a normal graph QRGTA checkpoint, got "
             f"{config.get('model_type')!r}"
         )
     if config.get("control_mode", "normal") != "normal":
@@ -191,6 +206,8 @@ def load_checkpoint_model(checkpoint_path, runtime, device):
         distance_bucket_count=int(config.get("distance_bucket_count", 1)),
         path_signature_count=int(config.get("path_signature_count", 1)),
         role_count=int(config.get("role_count", 0)),
+        competition_hidden_dim=int(config.get("competition_hidden_dim", 128)),
+        competition_dropout=float(config.get("competition_dropout", config.get("dropout", 0.1))),
     ).to(device)
     model.load_state_dict(checkpoint["model_state_dict"], strict=True)
     return model, config, checkpoint.get("epoch")
@@ -225,10 +242,16 @@ def main():
     )
     model_type = str(model_config.get("model_type", "qrgta"))
     default_modes = list(CONTROL_MODES)
-    if model_type in {"path_qrgta", "persistent_path_qrgta"}:
+    if model_type in {
+        "path_qrgta",
+        "persistent_path_qrgta",
+        "table_competitive_path_qrgta",
+    }:
         default_modes.extend(PATH_CONTROL_MODES)
     if model_type == "persistent_path_qrgta":
         default_modes.extend(PERSISTENT_CONTROL_MODES)
+    if model_type == "table_competitive_path_qrgta":
+        default_modes.extend(COMPETITION_CONTROL_MODES)
     modes_text = args.control_modes or ",".join(default_modes)
     modes = [value.strip() for value in modes_text.split(",") if value.strip()]
     unknown = sorted(set(modes) - set(ALL_CONTROL_MODES))
@@ -238,6 +261,12 @@ def main():
         raise ValueError("--control-modes must include normal for paired deltas")
     if model_type != "persistent_path_qrgta" and "zero_update_gates" in modes:
         raise ValueError("zero_update_gates requires a persistent_path_qrgta checkpoint")
+    if model_type != "table_competitive_path_qrgta" and (
+        set(modes) & set(COMPETITION_CONTROL_MODES)
+    ):
+        raise ValueError(
+            "table competition controls require a table_competitive_path_qrgta checkpoint"
+        )
     if cache["dense_dim"] != int(model_config["dense_dim"]):
         raise ValueError(
             f"Embedding dimension mismatch: cache={cache['dense_dim']} "
@@ -285,6 +314,10 @@ def main():
             role_loss_weight=float(model_config.get("role_loss_weight", 0.0)),
             record_persistent_diagnostics=bool(
                 model_config.get("record_persistent_diagnostics", True)
+            ),
+            competition_hidden_dim=int(model_config.get("competition_hidden_dim", 128)),
+            competition_dropout=float(
+                model_config.get("competition_dropout", model_config.get("dropout", 0.1))
             ),
         )
         metrics, predictions = evaluate(
@@ -368,6 +401,9 @@ def main():
             "shuffled_path_signatures": "Shuffle non-query schema edge path signatures while preserving edge index, relation type, and distance bucket.",
             "zero_path_features": "Keep path-augmented schema edges but neutralize non-query path and distance features.",
             "zero_update_gates": "Keep path-augmented edges but set persistent message/FFN update gates to zero.",
+            "zero_table_competition": "Keep path-aware graph propagation but skip table-scoped column competition.",
+            "shuffle_column_parent_table": "Shuffle column-to-parent-table assignments while preserving node identity and graph/path edges.",
+            "zero_competition_gates": "Compute table-scoped competition features but set competition write gates to zero.",
         },
     }
     write_json(output_dir / "intervention_summary.json", summary)

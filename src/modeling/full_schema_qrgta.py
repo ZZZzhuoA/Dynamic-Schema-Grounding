@@ -14,6 +14,14 @@ import torch.nn.functional as F
 
 QUERY_TO_TABLE = "query_to_table"
 QUERY_TO_COLUMN = "query_to_column"
+MODEL_TYPES = {
+    "qrgta",
+    "path_qrgta",
+    "persistent_path_qrgta",
+    "table_competitive_path_qrgta",
+    "mlp",
+    "mlp_residual",
+}
 
 
 def _segment_softmax(scores, destination, destination_count):
@@ -478,6 +486,167 @@ class PersistentGatedPathAwareSparseQRGTAEncoderLayer(PathAwareSparseQRGTAEncode
         return next_states, diagnostics
 
 
+class TableScopedCompetitivePathQRGTAEncoderLayer(PathAwareSparseQRGTAEncoderLayer):
+    """Path-aware sparse layer with encoder-internal table-scoped column competition."""
+
+    def __init__(
+        self,
+        hidden_dim,
+        num_heads,
+        relation_count,
+        distance_bucket_count,
+        path_signature_count,
+        dropout,
+        competition_hidden_dim=128,
+        competition_dropout=0.1,
+    ):
+        super().__init__(
+            hidden_dim,
+            num_heads,
+            relation_count,
+            distance_bucket_count,
+            path_signature_count,
+            dropout,
+        )
+        self.competition_logit = nn.Sequential(
+            nn.Linear(hidden_dim * 7, competition_hidden_dim),
+            nn.GELU(),
+            nn.Dropout(competition_dropout),
+            nn.Linear(competition_hidden_dim, 1),
+        )
+        self.competition_delta = nn.Sequential(
+            nn.Linear(hidden_dim * 5 + 1, competition_hidden_dim),
+            nn.GELU(),
+            nn.Dropout(competition_dropout),
+            nn.Linear(competition_hidden_dim, hidden_dim),
+        )
+        self.competition_gate = nn.Sequential(
+            nn.Linear(hidden_dim * 5, competition_hidden_dim),
+            nn.GELU(),
+            nn.Dropout(competition_dropout),
+            nn.Linear(competition_hidden_dim, hidden_dim),
+        )
+        self.competition_norm = nn.LayerNorm(hidden_dim)
+        self.competition_dropout = nn.Dropout(competition_dropout)
+
+    def _competition_gate_input(self, states, delta, query_state):
+        query_matrix = query_state.unsqueeze(0).expand_as(states)
+        return torch.cat(
+            [states, delta, query_matrix, states * query_matrix, torch.abs(states - query_matrix)],
+            dim=-1,
+        )
+
+    def _table_scoped_competition(
+        self,
+        schema_states,
+        query_state,
+        column_parent_table,
+        is_column_node,
+        zero_table_competition=False,
+        zero_competition_gates=False,
+    ):
+        if (
+            zero_table_competition
+            or column_parent_table is None
+            or is_column_node is None
+            or not bool(is_column_node.any())
+        ):
+            return schema_states
+        column_indices = torch.nonzero(is_column_node, as_tuple=False).reshape(-1)
+        parent_indices = column_parent_table[column_indices]
+        valid = parent_indices >= 0
+        if not bool(valid.any()):
+            return schema_states
+        column_indices = column_indices[valid]
+        parent_indices = parent_indices[valid]
+        column_states = schema_states[column_indices]
+        table_states = schema_states[parent_indices]
+        query_matrix = query_state.unsqueeze(0).expand_as(column_states)
+        competition_pair = torch.cat(
+            [
+                column_states,
+                table_states,
+                query_matrix,
+                column_states * query_matrix,
+                torch.abs(column_states - query_matrix),
+                column_states * table_states,
+                torch.abs(column_states - table_states),
+            ],
+            dim=-1,
+        )
+        logits = self.competition_logit(competition_pair)
+        sibling_weight = _segment_softmax(logits, parent_indices, schema_states.shape[0])
+        delta_input = torch.cat(
+            [
+                column_states,
+                table_states,
+                query_matrix,
+                sibling_weight,
+                column_states * query_matrix,
+                torch.abs(column_states - query_matrix),
+            ],
+            dim=-1,
+        )
+        competition_delta = self.competition_delta(delta_input)
+        if zero_competition_gates:
+            gate = torch.zeros_like(competition_delta)
+            refined_columns = column_states
+        else:
+            gate = torch.sigmoid(
+                self.competition_gate(
+                    self._competition_gate_input(column_states, competition_delta, query_state)
+                )
+            )
+            refined_columns = self.competition_norm(
+                column_states + gate * self.competition_dropout(competition_delta)
+            )
+        next_states = schema_states.clone()
+        next_states[column_indices] = refined_columns
+        return next_states
+
+    def forward(
+        self,
+        schema_states,
+        query_state,
+        schema_edge_index,
+        schema_edge_type,
+        schema_edge_scalar,
+        schema_distance_bucket,
+        schema_path_signature,
+        query_edge_destination,
+        query_edge_type,
+        query_edge_similarity,
+        query_distance_bucket,
+        query_path_signature,
+        column_parent_table=None,
+        is_column_node=None,
+        zero_table_competition=False,
+        zero_competition_gates=False,
+    ):
+        schema_states = super().forward(
+            schema_states,
+            query_state,
+            schema_edge_index,
+            schema_edge_type,
+            schema_edge_scalar,
+            schema_distance_bucket,
+            schema_path_signature,
+            query_edge_destination,
+            query_edge_type,
+            query_edge_similarity,
+            query_distance_bucket,
+            query_path_signature,
+        )
+        return self._table_scoped_competition(
+            schema_states,
+            query_state,
+            column_parent_table,
+            is_column_node,
+            zero_table_competition=zero_table_competition,
+            zero_competition_gates=zero_competition_gates,
+        )
+
+
 class ResidualNodeMLPLayer(nn.Module):
     """Depth-matched node-local baseline with no graph message passing."""
 
@@ -511,9 +680,11 @@ class FullSchemaQRGTA(nn.Module):
         distance_bucket_count=1,
         path_signature_count=1,
         role_count=0,
+        competition_hidden_dim=128,
+        competition_dropout=0.1,
     ):
         super().__init__()
-        if model_type not in {"qrgta", "path_qrgta", "persistent_path_qrgta", "mlp", "mlp_residual"}:
+        if model_type not in MODEL_TYPES:
             raise ValueError(f"Unsupported model_type: {model_type}")
         self.model_type = model_type
         self.role_count = int(role_count)
@@ -547,6 +718,17 @@ class FullSchemaQRGTA(nn.Module):
                 distance_bucket_count,
                 path_signature_count,
                 dropout,
+            )
+        elif model_type == "table_competitive_path_qrgta":
+            layer_cls = lambda: TableScopedCompetitivePathQRGTAEncoderLayer(
+                hidden_dim,
+                num_heads,
+                relation_count,
+                distance_bucket_count,
+                path_signature_count,
+                dropout,
+                competition_hidden_dim=competition_hidden_dim,
+                competition_dropout=competition_dropout,
             )
         else:
             layer_cls = None
@@ -589,6 +771,10 @@ class FullSchemaQRGTA(nn.Module):
         query_distance_bucket=None,
         query_path_signature=None,
         zero_update_gates=False,
+        zero_table_competition=False,
+        zero_competition_gates=False,
+        column_parent_table=None,
+        is_column_node=None,
         record_persistent_diagnostics=False,
     ):
         schema_states = self.node_norm(
@@ -601,7 +787,11 @@ class FullSchemaQRGTA(nn.Module):
         schema_edge_scalar = dense_nodes.new_zeros(schema_edge_type.shape[0])
         persistent_diagnostics = []
         for layer in self.layers:
-            if self.model_type in {"path_qrgta", "persistent_path_qrgta"}:
+            if self.model_type in {
+                "path_qrgta",
+                "persistent_path_qrgta",
+                "table_competitive_path_qrgta",
+            }:
                 if (
                     schema_distance_bucket is None
                     or schema_path_signature is None
@@ -626,6 +816,29 @@ class FullSchemaQRGTA(nn.Module):
                         zero_update_gates=zero_update_gates,
                     )
                     persistent_diagnostics.append(layer_diagnostics)
+                elif self.model_type == "table_competitive_path_qrgta":
+                    if column_parent_table is None or is_column_node is None:
+                        raise ValueError(
+                            "table_competitive_path_qrgta requires parent-table tensors"
+                        )
+                    schema_states = layer(
+                        schema_states,
+                        query_state,
+                        schema_edge_index,
+                        schema_edge_type,
+                        schema_edge_scalar,
+                        schema_distance_bucket,
+                        schema_path_signature,
+                        query_edge_destination,
+                        query_edge_type,
+                        query_edge_similarity,
+                        query_distance_bucket,
+                        query_path_signature,
+                        column_parent_table=column_parent_table,
+                        is_column_node=is_column_node,
+                        zero_table_competition=zero_table_competition,
+                        zero_competition_gates=zero_competition_gates,
+                    )
                 else:
                     schema_states = layer(
                         schema_states,

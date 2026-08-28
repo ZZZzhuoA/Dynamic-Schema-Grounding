@@ -28,6 +28,11 @@ PATH_CONTROL_MODES = (
 PERSISTENT_CONTROL_MODES = (
     "zero_update_gates",
 )
+COMPETITION_CONTROL_MODES = (
+    "zero_table_competition",
+    "shuffle_column_parent_table",
+    "zero_competition_gates",
+)
 DATA_KEYS = (
     "train_graph_file",
     "dev_graph_file",
@@ -224,7 +229,12 @@ def load_interventions(paths, normal):
                     metric: float(summary["metrics"][mode][metric])
                     for metric in PRIMARY_METRICS
                 }
-                for mode in CONTROL_MODES + PATH_CONTROL_MODES + PERSISTENT_CONTROL_MODES
+                for mode in (
+                    CONTROL_MODES
+                    + PATH_CONTROL_MODES
+                    + PERSISTENT_CONTROL_MODES
+                    + COMPETITION_CONTROL_MODES
+                )
                 if mode in summary["metrics"]
             },
         }
@@ -283,7 +293,16 @@ def main():
     intervention_paths = assignments(args.intervention_run, "--intervention-run")
     retrained_paths = assignments(args.retrained_run, "--retrained-run")
     normal = {
-        int(seed): trained_run(path, {"qrgta", "path_qrgta", "persistent_path_qrgta"}, "normal")
+        int(seed): trained_run(
+            path,
+            {
+                "qrgta",
+                "path_qrgta",
+                "persistent_path_qrgta",
+                "table_competitive_path_qrgta",
+            },
+            "normal",
+        )
         for seed, path in normal_paths.items()
     }
     mlp = {
@@ -294,7 +313,12 @@ def main():
     interventions = load_interventions(
         {int(seed): path for seed, path in intervention_paths.items()}, normal
     )
-    known_retrained_modes = set(CONTROL_MODES) | set(PATH_CONTROL_MODES) | set(PERSISTENT_CONTROL_MODES)
+    known_retrained_modes = (
+        set(CONTROL_MODES)
+        | set(PATH_CONTROL_MODES)
+        | set(PERSISTENT_CONTROL_MODES)
+        | set(COMPETITION_CONTROL_MODES)
+    )
     unknown_retrained = sorted(set(retrained_paths) - known_retrained_modes)
     if unknown_retrained:
         raise ValueError(f"Unknown retrained controls: {unknown_retrained}")
@@ -316,11 +340,19 @@ def main():
     normal_is_persistent_path_qrgta = all(
         run.get("model_type") == "persistent_path_qrgta" for run in normal.values()
     )
+    normal_is_table_competitive_path_qrgta = all(
+        run.get("model_type") == "table_competitive_path_qrgta"
+        for run in normal.values()
+    )
     available_path_controls = [
         mode
         for mode in PATH_CONTROL_MODES
         if all(mode in interventions[seed]["metrics"] for seed in normal)
-    ] if normal_is_path_qrgta or normal_is_persistent_path_qrgta else []
+    ] if (
+        normal_is_path_qrgta
+        or normal_is_persistent_path_qrgta
+        or normal_is_table_competitive_path_qrgta
+    ) else []
     path_control_deltas = intervention_deltas(
         normal, interventions, tuple(available_path_controls)
     ) if available_path_controls else {}
@@ -332,6 +364,14 @@ def main():
     persistent_control_deltas = intervention_deltas(
         normal, interventions, tuple(available_persistent_controls)
     ) if available_persistent_controls else {}
+    available_competition_controls = [
+        mode
+        for mode in COMPETITION_CONTROL_MODES
+        if all(mode in interventions[seed]["metrics"] for seed in normal)
+    ] if normal_is_table_competitive_path_qrgta else []
+    competition_control_deltas = intervention_deltas(
+        normal, interventions, tuple(available_competition_controls)
+    ) if available_competition_controls else {}
     complete_drops = {
         mode: control_deltas[mode]["complete_coverage@30"]["mean"]
         for mode in CONTROL_MODES
@@ -377,6 +417,25 @@ def main():
                 "complete_coverage@30"
             ]["values"].values()
         )
+    if available_competition_controls:
+        checks["zero_table_competition_drop_complete_coverage@30_every_seed"] = all(
+            value > 0
+            for value in competition_control_deltas["zero_table_competition"][
+                "complete_coverage@30"
+            ]["values"].values()
+        ) if "zero_table_competition" in competition_control_deltas else False
+        checks["shuffle_column_parent_table_drop_complete_coverage@30_at_least_2_of_3"] = (
+            sum(
+                value > 0
+                for value in competition_control_deltas.get(
+                    "shuffle_column_parent_table", {}
+                )
+                .get("complete_coverage@30", {})
+                .get("values", {})
+                .values()
+            )
+            >= 2
+        )
     persistent_diagnostics = {
         str(seed): run.get("persistent_diagnostics", {})
         for seed, run in sorted(normal.items())
@@ -391,6 +450,7 @@ def main():
         "checkpoint_interventions_normal_minus_control": control_deltas,
         "path_checkpoint_interventions_normal_minus_control": path_control_deltas,
         "persistent_checkpoint_interventions_normal_minus_control": persistent_control_deltas,
+        "competition_checkpoint_interventions_normal_minus_control": competition_control_deltas,
         "persistent_diagnostics": persistent_diagnostics,
         "retrained_seed42_controls": retrained,
         "decision_checks": checks,

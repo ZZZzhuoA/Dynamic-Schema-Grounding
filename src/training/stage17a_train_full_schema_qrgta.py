@@ -25,7 +25,17 @@ PATH_CONTROL_MODES = {
     "shuffled_path_signatures",
     "zero_path_features",
 }
-PATH_MODEL_TYPES = {"path_qrgta", "persistent_path_qrgta"}
+COMPETITION_CONTROL_MODES = {
+    "zero_table_competition",
+    "shuffle_column_parent_table",
+    "zero_competition_gates",
+}
+PATH_MODEL_TYPES = {
+    "path_qrgta",
+    "persistent_path_qrgta",
+    "table_competitive_path_qrgta",
+}
+COMPETITION_MODEL_TYPES = {"table_competitive_path_qrgta"}
 DEFAULT_ROLE_ORDER = [
     "OUTPUT_TARGET",
     "PREDICATE_COLUMN",
@@ -519,6 +529,42 @@ def _shuffle_tensor_values(values, groups, seed, runtime, device):
     return output
 
 
+def column_parent_table_tensor(example, control_mode, seed, runtime, device):
+    torch = runtime["torch"]
+    nodes = example["nodes"]
+    table_name_to_local = {
+        str(node.get("name")): index
+        for index, node in enumerate(nodes)
+        if node.get("type") == "table"
+    }
+    parent_ids = []
+    is_column = []
+    for index, node in enumerate(nodes):
+        if node.get("type") == "table":
+            parent_ids.append(index)
+            is_column.append(False)
+        else:
+            parent_ids.append(table_name_to_local.get(str(node.get("table")), -1))
+            is_column.append(True)
+    if control_mode == "shuffle_column_parent_table":
+        column_positions = [
+            index
+            for index, is_column_value in enumerate(is_column)
+            if is_column_value and parent_ids[index] >= 0
+        ]
+        if len(column_positions) > 1:
+            permutation = deterministic_permutation(
+                len(column_positions), seed + example["record_index"] * 173, runtime
+            ).tolist()
+            original_parents = [parent_ids[index] for index in column_positions]
+            for target_position, source_position in enumerate(permutation):
+                parent_ids[column_positions[target_position]] = original_parents[source_position]
+    parent = torch.tensor(parent_ids, dtype=torch.long, device=device)
+    is_column_tensor = torch.tensor(is_column, dtype=torch.bool, device=device)
+    is_table_tensor = ~is_column_tensor
+    return parent, is_column_tensor, is_table_tensor
+
+
 def path_aware_schema_edge_tensors(
     example,
     relations,
@@ -756,7 +802,7 @@ def example_to_tensors(example, cache, relations, args, runtime, device):
             local_id = id_to_local.get(int(item_id))
             if local_id is not None:
                 role_labels[local_id, role_id] = 1.0
-    return {
+    tensors = {
         "dense_nodes": dense,
         "node_types": node_types,
         "query_embedding": query,
@@ -770,6 +816,8 @@ def example_to_tensors(example, cache, relations, args, runtime, device):
         "query_distance_bucket": query_distance,
         "query_path_signature": query_path,
         "zero_update_gates": args.control_mode == "zero_update_gates",
+        "zero_table_competition": args.control_mode == "zero_table_competition",
+        "zero_competition_gates": args.control_mode == "zero_competition_gates",
         "record_persistent_diagnostics": bool(
             getattr(args, "record_persistent_diagnostics", False)
         ),
@@ -777,6 +825,18 @@ def example_to_tensors(example, cache, relations, args, runtime, device):
         "role_labels": role_labels,
         "path_stats": path_stats,
     }
+    if model_type in COMPETITION_MODEL_TYPES:
+        parent_table, is_column, is_table = column_parent_table_tensor(
+            example, args.control_mode, args.seed, runtime, device
+        )
+        tensors.update(
+            {
+                "column_parent_table": parent_table,
+                "is_column_node": is_column,
+                "is_table_node": is_table,
+            }
+        )
+    return tensors
 
 
 def forward_model(model, tensors):
@@ -794,6 +854,10 @@ def forward_model(model, tensors):
         tensors.get("query_distance_bucket"),
         tensors.get("query_path_signature"),
         zero_update_gates=bool(tensors.get("zero_update_gates", False)),
+        zero_table_competition=bool(tensors.get("zero_table_competition", False)),
+        zero_competition_gates=bool(tensors.get("zero_competition_gates", False)),
+        column_parent_table=tensors.get("column_parent_table"),
+        is_column_node=tensors.get("is_column_node"),
         record_persistent_diagnostics=bool(
             tensors.get("record_persistent_diagnostics", False)
         ),
@@ -1097,7 +1161,14 @@ def main():
     parser.add_argument("--output-dir", required=True)
     parser.add_argument(
         "--model-type",
-        choices=["qrgta", "path_qrgta", "persistent_path_qrgta", "mlp", "mlp_residual"],
+        choices=[
+            "qrgta",
+            "path_qrgta",
+            "persistent_path_qrgta",
+            "table_competitive_path_qrgta",
+            "mlp",
+            "mlp_residual",
+        ],
         default="qrgta",
     )
     parser.add_argument("--hidden-dim", type=int, default=256)
@@ -1122,11 +1193,16 @@ def main():
             "shuffled_path_signatures",
             "zero_path_features",
             "zero_update_gates",
+            "zero_table_competition",
+            "shuffle_column_parent_table",
+            "zero_competition_gates",
         ],
         default="normal",
     )
     parser.add_argument("--max-path-distance", type=int, default=3)
     parser.add_argument("--max-path-edges-per-destination", type=int, default=32)
+    parser.add_argument("--competition-hidden-dim", type=int, default=128)
+    parser.add_argument("--competition-dropout", type=float, default=0.1)
     parser.add_argument("--coverage-surrogate-weight", type=float, default=0.1)
     parser.add_argument("--coverage-margin", type=float, default=0.1)
     parser.add_argument("--coverage-target-k", type=int, default=30)
@@ -1143,6 +1219,13 @@ def main():
     args = parser.parse_args()
     if args.control_mode == "zero_update_gates" and args.model_type != "persistent_path_qrgta":
         raise ValueError("--control-mode zero_update_gates requires --model-type persistent_path_qrgta")
+    if (
+        args.control_mode in COMPETITION_CONTROL_MODES
+        and args.model_type not in COMPETITION_MODEL_TYPES
+    ):
+        raise ValueError(
+            f"--control-mode {args.control_mode} requires --model-type table_competitive_path_qrgta"
+        )
     if args.control_mode in PATH_CONTROL_MODES and args.model_type not in PATH_MODEL_TYPES:
         raise ValueError(f"--control-mode {args.control_mode} requires a path-aware model type")
 
@@ -1213,6 +1296,18 @@ def main():
         "coverage_surrogate_weight": args.coverage_surrogate_weight,
         "coverage_margin": args.coverage_margin,
         "coverage_target_k": args.coverage_target_k,
+        "competition_scope": (
+            "column_within_table"
+            if args.model_type == "table_competitive_path_qrgta"
+            else None
+        ),
+        "competition_update_type": (
+            "encoder_inside_gated_delta"
+            if args.model_type == "table_competitive_path_qrgta"
+            else None
+        ),
+        "competition_hidden_dim": args.competition_hidden_dim,
+        "competition_dropout": args.competition_dropout,
         "persistent_update_type": (
             "gated_delta" if args.model_type == "persistent_path_qrgta" else None
         ),
@@ -1229,6 +1324,9 @@ def main():
             "shuffled_path_signatures": "Shuffle non-query schema edge path signatures while preserving edge index, relation type, and distance bucket.",
             "zero_path_features": "Keep path-augmented schema edges but neutralize non-query path and distance features.",
             "zero_update_gates": "Keep path-augmented edges but set persistent message/FFN update gates to zero.",
+            "zero_table_competition": "Keep path-aware graph propagation but skip table-scoped column competition.",
+            "shuffle_column_parent_table": "Shuffle column-to-parent-table assignments while preserving node identity and graph/path edges.",
+            "zero_competition_gates": "Compute table-scoped competition features but set competition write gates to zero.",
         },
     }
     output_dir = Path(args.output_dir)
@@ -1245,6 +1343,8 @@ def main():
         distance_bucket_count=model_config["distance_bucket_count"],
         path_signature_count=model_config["path_signature_count"],
         role_count=model_config["role_count"],
+        competition_hidden_dim=args.competition_hidden_dim,
+        competition_dropout=args.competition_dropout,
     ).to(device)
     model_config["trainable_parameter_count"] = sum(
         int(parameter.numel()) for parameter in model.parameters() if parameter.requires_grad

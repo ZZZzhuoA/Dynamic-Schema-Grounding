@@ -369,6 +369,208 @@ class Stage17AModelTest(unittest.TestCase):
         self.assertTrue(torch.isfinite(loss))
         self.assertGreater(gradient_total, 0.0)
 
+    def test_column_parent_table_tensor_matches_schema_ownership(self):
+        example = self.aligned_example()
+        parent, is_column, is_table = TRAINING.column_parent_table_tensor(
+            example, "normal", 42, self.runtime, "cpu"
+        )
+        self.assertEqual(parent.tolist(), [0, 0, 0, 3, 3])
+        self.assertEqual(is_column.tolist(), [False, True, True, False, True])
+        self.assertEqual(is_table.tolist(), [True, False, False, True, False])
+
+    def test_table_competitive_path_qrgta_forward_backward_supports_variable_full_schema(self):
+        torch = self.runtime["torch"]
+        example = self.aligned_example()
+        relations = TRAINING.relation_mapping([example], [example])
+        args = self.path_args(
+            example, relations, model_type="table_competitive_path_qrgta"
+        )
+        tensors = TRAINING.example_to_tensors(
+            example, self.cache(), relations, args, self.runtime, "cpu"
+        )
+        self.assertEqual(tensors["column_parent_table"].tolist(), [0, 0, 0, 3, 3])
+        model = self.runtime["model"](
+            dense_dim=16,
+            relation_count=len(relations),
+            hidden_dim=16,
+            num_layers=2,
+            num_heads=4,
+            dropout=0.0,
+            model_type="table_competitive_path_qrgta",
+            distance_bucket_count=len(args.distance_buckets),
+            path_signature_count=len(args.path_signatures),
+            competition_hidden_dim=8,
+            competition_dropout=0.0,
+        )
+        output = TRAINING.forward_model(model, tensors)
+        self.assertEqual(output["logits"].shape, (5,))
+        self.assertEqual(output["schema_states"].shape, (5, 16))
+        loss = TRAINING.training_loss(output, tensors["labels"], args, self.runtime)
+        loss.backward()
+        gradient_total = sum(
+            float(parameter.grad.abs().sum())
+            for parameter in model.parameters()
+            if parameter.grad is not None
+        )
+        self.assertTrue(torch.isfinite(loss))
+        self.assertGreater(gradient_total, 0.0)
+
+    def test_table_competitive_path_qrgta_requires_path_and_parent_tensors(self):
+        example = self.aligned_example()
+        relations = TRAINING.relation_mapping([example], [example])
+        args = self.path_args(
+            example, relations, model_type="table_competitive_path_qrgta"
+        )
+        tensors = TRAINING.example_to_tensors(
+            example, self.cache(), relations, args, self.runtime, "cpu"
+        )
+        model = self.runtime["model"](
+            dense_dim=16,
+            relation_count=len(relations),
+            hidden_dim=16,
+            num_layers=1,
+            num_heads=4,
+            dropout=0.0,
+            model_type="table_competitive_path_qrgta",
+            distance_bucket_count=len(args.distance_buckets),
+            path_signature_count=len(args.path_signatures),
+            competition_hidden_dim=8,
+            competition_dropout=0.0,
+        )
+        tensors_without_path = dict(tensors)
+        tensors_without_path["schema_distance_bucket"] = None
+        with self.assertRaisesRegex(ValueError, "requires path and distance tensors"):
+            TRAINING.forward_model(model, tensors_without_path)
+        tensors_without_parent = dict(tensors)
+        tensors_without_parent["column_parent_table"] = None
+        with self.assertRaisesRegex(ValueError, "requires parent-table tensors"):
+            TRAINING.forward_model(model, tensors_without_parent)
+
+    def test_table_competition_only_updates_column_nodes(self):
+        torch = self.runtime["torch"]
+        example = self.aligned_example()
+        relations = TRAINING.relation_mapping([example], [example])
+        args = self.path_args(
+            example, relations, model_type="table_competitive_path_qrgta"
+        )
+        tensors = TRAINING.example_to_tensors(
+            example, self.cache(), relations, args, self.runtime, "cpu"
+        )
+        model = self.runtime["model"](
+            dense_dim=16,
+            relation_count=len(relations),
+            hidden_dim=16,
+            num_layers=1,
+            num_heads=4,
+            dropout=0.0,
+            model_type="table_competitive_path_qrgta",
+            distance_bucket_count=len(args.distance_buckets),
+            path_signature_count=len(args.path_signatures),
+            competition_hidden_dim=8,
+            competition_dropout=0.0,
+        )
+        model.eval()
+        layer = model.layers[0]
+        with torch.no_grad():
+            states = torch.randn(5, 16)
+            query = torch.randn(16)
+            refined = layer._table_scoped_competition(
+                states,
+                query,
+                tensors["column_parent_table"],
+                tensors["is_column_node"],
+            )
+        self.assertTrue(torch.equal(refined[tensors["is_table_node"]], states[tensors["is_table_node"]]))
+        self.assertFalse(torch.equal(refined[tensors["is_column_node"]], states[tensors["is_column_node"]]))
+
+    def test_table_competition_controls_preserve_identity_and_edges(self):
+        torch = self.runtime["torch"]
+        example = self.aligned_example()
+        relations = TRAINING.relation_mapping([example], [example])
+        normal_args = self.path_args(
+            example, relations, model_type="table_competitive_path_qrgta"
+        )
+        normal = TRAINING.example_to_tensors(
+            example, self.cache(), relations, normal_args, self.runtime, "cpu"
+        )
+        for mode in (
+            "zero_table_competition",
+            "shuffle_column_parent_table",
+            "zero_competition_gates",
+        ):
+            control_args = self.path_args(
+                example, relations, mode, model_type="table_competitive_path_qrgta"
+            )
+            control = TRAINING.example_to_tensors(
+                example, self.cache(), relations, control_args, self.runtime, "cpu"
+            )
+            self.assertTrue(torch.equal(normal["schema_edge_index"], control["schema_edge_index"]))
+            self.assertTrue(torch.equal(normal["schema_edge_type"], control["schema_edge_type"]))
+            self.assertTrue(torch.equal(normal["dense_nodes"], control["dense_nodes"]))
+            self.assertEqual(normal["is_column_node"].tolist(), control["is_column_node"].tolist())
+        shuffled = TRAINING.example_to_tensors(
+            example,
+            self.cache(),
+            relations,
+            self.path_args(
+                example,
+                relations,
+                "shuffle_column_parent_table",
+                model_type="table_competitive_path_qrgta",
+            ),
+            self.runtime,
+            "cpu",
+        )
+        self.assertCountEqual(
+            normal["column_parent_table"][normal["is_column_node"]].tolist(),
+            shuffled["column_parent_table"][shuffled["is_column_node"]].tolist(),
+        )
+
+    def test_zero_competition_controls_disable_column_writeback(self):
+        torch = self.runtime["torch"]
+        example = self.aligned_example()
+        relations = TRAINING.relation_mapping([example], [example])
+        args = self.path_args(
+            example, relations, model_type="table_competitive_path_qrgta"
+        )
+        tensors = TRAINING.example_to_tensors(
+            example, self.cache(), relations, args, self.runtime, "cpu"
+        )
+        model = self.runtime["model"](
+            dense_dim=16,
+            relation_count=len(relations),
+            hidden_dim=16,
+            num_layers=1,
+            num_heads=4,
+            dropout=0.0,
+            model_type="table_competitive_path_qrgta",
+            distance_bucket_count=len(args.distance_buckets),
+            path_signature_count=len(args.path_signatures),
+            competition_hidden_dim=8,
+            competition_dropout=0.0,
+        )
+        model.eval()
+        layer = model.layers[0]
+        with torch.no_grad():
+            states = torch.randn(5, 16)
+            query = torch.randn(16)
+            zero_module = layer._table_scoped_competition(
+                states,
+                query,
+                tensors["column_parent_table"],
+                tensors["is_column_node"],
+                zero_table_competition=True,
+            )
+            zero_gates = layer._table_scoped_competition(
+                states,
+                query,
+                tensors["column_parent_table"],
+                tensors["is_column_node"],
+                zero_competition_gates=True,
+            )
+        self.assertTrue(torch.equal(zero_module, states))
+        self.assertTrue(torch.allclose(zero_gates, states, atol=1e-6))
+
     def test_role_head_outputs_logits_and_loss(self):
         torch = self.runtime["torch"]
         example = self.aligned_example()
@@ -944,6 +1146,72 @@ class Stage17ASummaryTest(unittest.TestCase):
             )
             self.assertTrue(
                 result["decision_checks"]["zero_update_gates_drop_complete_coverage@30_every_seed"]
+            )
+            self.assertTrue(result["decision_passed"])
+
+    def test_summary_accepts_table_competitive_path_qrgta_normal_runs(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            argv = ["stage17a_summarize_causal_controls.py"]
+            for seed in (42, 43, 44):
+                normal = root / f"competitive_normal_{seed}"
+                mlp = root / f"mlp_{seed}"
+                intervention = root / f"intervention_{seed}"
+                self.write_training_run(
+                    normal, "table_competitive_path_qrgta", "normal", 0.8
+                )
+                self.write_training_run(mlp, "mlp_residual", "normal", 0.7)
+                intervention.mkdir()
+                controls = {
+                    "zero_query_edges": self.metric_payload(0.78),
+                    "shuffled_schema_edges": self.metric_payload(0.76),
+                    "shuffled_node_identity": self.metric_payload(0.74),
+                    "shuffled_distance_buckets": self.metric_payload(0.79),
+                    "shuffled_path_signatures": self.metric_payload(0.77),
+                    "zero_path_features": self.metric_payload(0.79),
+                    "zero_table_competition": self.metric_payload(0.785),
+                    "shuffle_column_parent_table": self.metric_payload(0.79),
+                    "zero_competition_gates": self.metric_payload(0.786),
+                }
+                (intervention / "intervention_summary.json").write_text(
+                    json.dumps(
+                        {
+                            "parameters_unchanged": True,
+                            "checkpoint_sha256": SUMMARY.file_sha256(normal / "best.pt"),
+                            "reference_normal_reproduced": True,
+                            "data_config": {
+                                "dev_graph_file": "dev_graph.jsonl",
+                                "dev_label_file": "dev_labels.jsonl",
+                                "embedding_cache_dir": "cache",
+                                "dev_limit": None,
+                            },
+                            "metrics": {"normal": self.metric_payload(0.8), **controls},
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                argv.extend(["--normal-run", f"{seed}={normal}"])
+                argv.extend(["--mlp-run", f"{seed}={mlp}"])
+                argv.extend(["--intervention-run", f"{seed}={intervention}"])
+            output = root / "summary.json"
+            argv.extend(["--output-file", str(output)])
+            with mock.patch.object(sys, "argv", argv):
+                with redirect_stdout(StringIO()):
+                    SUMMARY.main()
+            result = json.loads(output.read_text(encoding="utf-8"))
+            self.assertIn(
+                "zero_table_competition",
+                result["competition_checkpoint_interventions_normal_minus_control"],
+            )
+            self.assertTrue(
+                result["decision_checks"][
+                    "zero_table_competition_drop_complete_coverage@30_every_seed"
+                ]
+            )
+            self.assertTrue(
+                result["decision_checks"][
+                    "shuffle_column_parent_table_drop_complete_coverage@30_at_least_2_of_3"
+                ]
             )
             self.assertTrue(result["decision_passed"])
 
