@@ -26,6 +26,25 @@ PATH_CONTROL_MODES = {
     "zero_path_features",
 }
 PATH_MODEL_TYPES = {"path_qrgta", "persistent_path_qrgta"}
+DEFAULT_ROLE_ORDER = [
+    "OUTPUT_TARGET",
+    "PREDICATE_COLUMN",
+    "JOIN_BRIDGE",
+    "GROUP_KEY",
+    "ORDER_KEY",
+    "HAVING_PREDICATE",
+    "METRIC_TARGET",
+    "VALUE_ANCHOR",
+    "TEMPORAL_FILTER",
+]
+CLAUSE_TO_ROLE = {
+    "select": "OUTPUT_TARGET",
+    "where": "PREDICATE_COLUMN",
+    "join": "JOIN_BRIDGE",
+    "group_by": "GROUP_KEY",
+    "order_by": "ORDER_KEY",
+    "having": "HAVING_PREDICATE",
+}
 
 
 def read_jsonl(path, limit=None):
@@ -125,7 +144,44 @@ def _key(db_id, question_id):
     return str(db_id), str(question_id)
 
 
-def align_graphs_and_labels(graph_records, label_records, split):
+def role_labels_from_record(record):
+    labels = defaultdict(set)
+    for role, ids in (record.get("relation_labels") or {}).items():
+        role = str(role)
+        for item_id in ids or []:
+            labels[role].add(int(item_id))
+    for clause, ids in (record.get("clause_labels") or {}).items():
+        role = CLAUSE_TO_ROLE.get(str(clause))
+        if role is None:
+            continue
+        for item_id in ids or []:
+            labels[role].add(int(item_id))
+    return {role: sorted(ids) for role, ids in sorted(labels.items())}
+
+
+def role_labels_by_key(role_label_records, split):
+    by_key = {}
+    by_record = {}
+    for index, record in enumerate(role_label_records or []):
+        role_labels = role_labels_from_record(record)
+        key = _key(record.get("db_id"), record.get("question_id"))
+        if key is not None:
+            if key in by_key:
+                raise ValueError(f"Duplicate role label key in {split}: {key}")
+            by_key[key] = role_labels
+        record_index = record.get("record_index", record.get("metadata", {}).get("record_index"))
+        if record_index is not None:
+            record_index = int(record_index)
+            if record_index in by_record:
+                raise ValueError(f"Duplicate role label record_index in {split}: {record_index}")
+            by_record[record_index] = role_labels
+        elif key is None:
+            by_record[index] = role_labels
+    return by_key, by_record
+
+
+def align_graphs_and_labels(graph_records, label_records, split, role_label_records=None):
+    role_by_key, role_by_record = role_labels_by_key(role_label_records, split)
     labels_by_key = {}
     for label_index, label in enumerate(label_records):
         key = _key(label.get("db_id"), label.get("question_id"))
@@ -183,6 +239,9 @@ def align_graphs_and_labels(graph_records, label_records, split):
                     f"label=({label_node.get('id')}, {label_node.get('name')})"
                 )
         gold_ids = sorted({int(value) for value in label.get("whole_sql_labels", [])})
+        role_labels = role_labels_from_record(label)
+        if role_by_key or role_by_record:
+            role_labels = role_by_key.get(key, role_by_record.get(record_index, role_labels))
         node_ids = {int(node["id"]) for node in nodes}
         unknown = sorted(set(gold_ids) - node_ids)
         if unknown:
@@ -199,6 +258,7 @@ def align_graphs_and_labels(graph_records, label_records, split):
             "nodes": nodes,
             "schema_edges": inputs.get("schema_edges", []),
             "gold_ids": gold_ids,
+            "role_label_ids": role_labels,
         }
         if gold_ids:
             aligned.append(item)
@@ -229,6 +289,21 @@ def relation_mapping(train_examples, dev_examples):
     }
     names.update({QUERY_TO_TABLE, QUERY_TO_COLUMN})
     return {name: index for index, name in enumerate(sorted(names))}
+
+
+def role_mapping(train_examples, dev_examples):
+    names = set(DEFAULT_ROLE_ORDER)
+    for example in train_examples + dev_examples:
+        names.update(str(role) for role in example.get("role_label_ids", {}))
+    return {name: index for index, name in enumerate(DEFAULT_ROLE_ORDER + sorted(names - set(DEFAULT_ROLE_ORDER)))}
+
+
+def role_positive_count(examples):
+    return sum(
+        len(set(int(item_id) for item_id in item_ids))
+        for example in examples
+        for item_ids in example.get("role_label_ids", {}).values()
+    )
 
 
 def distance_bucket_mapping(max_path_distance):
@@ -669,6 +744,18 @@ def example_to_tensors(example, cache, relations, args, runtime, device):
     id_to_local = {int(node["id"]): index for index, node in enumerate(example["nodes"])}
     labels = torch.zeros(len(example["nodes"]), dtype=torch.float32, device=device)
     labels[[id_to_local[value] for value in example["gold_ids"]]] = 1.0
+    role_map = getattr(args, "role_mapping", {})
+    role_labels = torch.zeros(
+        (len(example["nodes"]), len(role_map)), dtype=torch.float32, device=device
+    )
+    for role, item_ids in example.get("role_label_ids", {}).items():
+        role_id = role_map.get(str(role))
+        if role_id is None:
+            continue
+        for item_id in item_ids:
+            local_id = id_to_local.get(int(item_id))
+            if local_id is not None:
+                role_labels[local_id, role_id] = 1.0
     return {
         "dense_nodes": dense,
         "node_types": node_types,
@@ -687,6 +774,7 @@ def example_to_tensors(example, cache, relations, args, runtime, device):
             getattr(args, "record_persistent_diagnostics", False)
         ),
         "labels": labels,
+        "role_labels": role_labels,
         "path_stats": path_stats,
     }
 
@@ -779,6 +867,44 @@ def ranking_metrics(examples, rankings, losses=None, split="dev"):
     return metrics
 
 
+def role_ranking_metrics(examples, rankings, role_mapping, k=30):
+    if not role_mapping:
+        return {}
+    role_to_ids = defaultdict(set)
+    for example in examples:
+        ranked = set(rankings[int(example["record_index"])][:k])
+        for role, item_ids in example.get("role_label_ids", {}).items():
+            role_name = str(role)
+            if role_name not in role_mapping:
+                continue
+            ids = {int(item_id) for item_id in item_ids}
+            if not ids:
+                continue
+            role_to_ids[role_name].add(
+                (
+                    int(example["record_index"]),
+                    len(ranked & ids),
+                    len(ids),
+                    float(ids.issubset(ranked)),
+                )
+            )
+    output = {}
+    recalls = []
+    completes = []
+    for role in sorted(role_to_ids):
+        rows = list(role_to_ids[role])
+        recall = _mean([hit / total for _, hit, total, _ in rows if total])
+        complete = _mean([complete for _, _, _, complete in rows])
+        output[f"role_recall@{k}::{role}"] = recall
+        output[f"role_complete@{k}::{role}"] = complete
+        recalls.append(recall)
+        completes.append(complete)
+    if recalls:
+        output[f"role_macro_recall@{k}"] = _mean(recalls)
+        output[f"role_macro_complete@{k}"] = _mean(completes)
+    return output
+
+
 def evaluate(model, examples, cache, relations, args, runtime, device, split, predictions=False):
     torch = runtime["torch"]
     model.eval()
@@ -791,7 +917,9 @@ def evaluate(model, examples, cache, relations, args, runtime, device, split, pr
         for example in examples:
             tensors = example_to_tensors(example, cache, relations, args, runtime, device)
             output = forward_model(model, tensors)
+            args._current_role_labels = tensors.get("role_labels")
             losses.append(float(training_loss(output, tensors["labels"], args, runtime).cpu()))
+            args._current_role_labels = None
             for key, value in tensors.get("path_stats", {}).items():
                 path_stats[key].append(float(value))
             for key, value in output.get("persistent_diagnostics", {}).items():
@@ -829,6 +957,7 @@ def evaluate(model, examples, cache, relations, args, runtime, device, split, pr
                     }
                 )
     metrics = ranking_metrics(examples, rankings, losses, split)
+    metrics.update(role_ranking_metrics(examples, rankings, getattr(args, "role_mapping", {}), k=30))
     if path_stats:
         metrics["path_edge_statistics"] = {
             "avg_schema_edges": _mean(path_stats["schema_edge_count"]),
@@ -875,8 +1004,32 @@ def complete_coverage_surrogate_gap(logits, labels, target_k=30, margin=0.1):
     return neg_threshold - min_positive + float(margin)
 
 
+def balanced_multilabel_loss(logits, labels, runtime):
+    F = runtime["F"]
+    positive = labels > 0.5
+    negative = ~positive
+    if not positive.any():
+        return logits.new_zeros(())
+    positive_loss = F.softplus(-logits[positive]).mean()
+    if negative.any():
+        negative_loss = F.softplus(logits[negative]).mean()
+        return 0.5 * positive_loss + 0.5 * negative_loss
+    return positive_loss
+
+
 def training_loss(output, labels, args, runtime):
     loss = runtime["loss"](output["logits"], labels)
+    role_weight = float(getattr(args, "role_loss_weight", 0.0))
+    role_labels = getattr(args, "_current_role_labels", None)
+    if (
+        role_weight > 0.0
+        and role_labels is not None
+        and role_labels.numel() > 0
+        and "role_logits" in output
+    ):
+        loss = loss + role_weight * balanced_multilabel_loss(
+            output["role_logits"], role_labels, runtime
+        )
     weight = float(getattr(args, "coverage_surrogate_weight", 0.0))
     if weight <= 0:
         return loss
@@ -899,7 +1052,9 @@ def train_epoch(model, examples, cache, relations, args, runtime, device, optimi
     for position, example in enumerate(shuffled, start=1):
         tensors = example_to_tensors(example, cache, relations, args, runtime, device)
         output = forward_model(model, tensors)
+        args._current_role_labels = tensors.get("role_labels")
         loss = training_loss(output, tensors["labels"], args, runtime)
+        args._current_role_labels = None
         (loss / accumulation).backward()
         losses.append(float(loss.detach().cpu()))
         if position % accumulation == 0 or position == len(shuffled):
@@ -936,6 +1091,8 @@ def main():
     parser.add_argument("--dev-graph-file", required=True)
     parser.add_argument("--train-label-file", required=True)
     parser.add_argument("--dev-label-file", required=True)
+    parser.add_argument("--train-role-label-file", default=None)
+    parser.add_argument("--dev-role-label-file", default=None)
     parser.add_argument("--embedding-cache-dir", required=True)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument(
@@ -973,6 +1130,7 @@ def main():
     parser.add_argument("--coverage-surrogate-weight", type=float, default=0.1)
     parser.add_argument("--coverage-margin", type=float, default=0.1)
     parser.add_argument("--coverage-target-k", type=int, default=30)
+    parser.add_argument("--role-loss-weight", type=float, default=0.0)
     parser.add_argument(
         "--record-persistent-diagnostics",
         action=argparse.BooleanOptionalAction,
@@ -1002,26 +1160,42 @@ def main():
     dev_graphs = read_jsonl(args.dev_graph_file, args.dev_limit)
     train_labels = read_jsonl(args.train_label_file)
     dev_labels = read_jsonl(args.dev_label_file)
-    train_examples, train_alignment = align_graphs_and_labels(
-        train_graphs, train_labels, "train"
+    train_role_labels = (
+        read_jsonl(args.train_role_label_file) if args.train_role_label_file else None
     )
-    dev_examples, dev_alignment = align_graphs_and_labels(dev_graphs, dev_labels, "dev")
+    dev_role_labels = (
+        read_jsonl(args.dev_role_label_file) if args.dev_role_label_file else None
+    )
+    train_examples, train_alignment = align_graphs_and_labels(
+        train_graphs, train_labels, "train", train_role_labels
+    )
+    dev_examples, dev_alignment = align_graphs_and_labels(
+        dev_graphs, dev_labels, "dev", dev_role_labels
+    )
     train_cache = load_embedding_cache(args.embedding_cache_dir, "train", runtime)
     dev_cache = load_embedding_cache(args.embedding_cache_dir, "dev", runtime)
     if train_cache["dense_dim"] != dev_cache["dense_dim"]:
         raise ValueError("Train/dev embedding dimensions differ")
     relations = relation_mapping(train_examples, dev_examples)
+    roles = role_mapping(train_examples, dev_examples) if args.role_loss_weight > 0.0 else {}
+    if args.role_loss_weight > 0.0 and not role_positive_count(train_examples + dev_examples):
+        raise ValueError(
+            "--role-loss-weight > 0 requires relation_labels or clause_labels in the "
+            "main label files or --train/--dev-role-label-file"
+        )
     distance_buckets = distance_bucket_mapping(args.max_path_distance)
     path_signatures = collect_path_signatures(
         train_examples + dev_examples, relations, args.max_path_distance
     )
     args.distance_buckets = distance_buckets
     args.path_signatures = path_signatures
+    args.role_mapping = roles
     model_config = {
         "dense_dim": train_cache["dense_dim"],
         "relation_count": len(relations),
         "distance_bucket_count": len(distance_buckets),
         "path_signature_count": len(path_signatures),
+        "role_count": len(roles),
         "hidden_dim": args.hidden_dim,
         "num_layers": args.num_layers,
         "num_heads": args.num_heads,
@@ -1030,6 +1204,10 @@ def main():
         "relations": relations,
         "distance_bucket_mapping": distance_buckets,
         "path_type_mapping": path_signatures,
+        "role_mapping": roles,
+        "role_loss_weight": args.role_loss_weight,
+        "train_role_label_file": args.train_role_label_file,
+        "dev_role_label_file": args.dev_role_label_file,
         "max_path_distance": args.max_path_distance,
         "max_path_edges_per_destination": args.max_path_edges_per_destination,
         "coverage_surrogate_weight": args.coverage_surrogate_weight,
@@ -1066,6 +1244,7 @@ def main():
         model_type=args.model_type,
         distance_bucket_count=model_config["distance_bucket_count"],
         path_signature_count=model_config["path_signature_count"],
+        role_count=model_config["role_count"],
     ).to(device)
     model_config["trainable_parameter_count"] = sum(
         int(parameter.numel()) for parameter in model.parameters() if parameter.requires_grad

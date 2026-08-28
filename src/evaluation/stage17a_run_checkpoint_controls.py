@@ -190,6 +190,7 @@ def load_checkpoint_model(checkpoint_path, runtime, device):
         model_type=str(config["model_type"]),
         distance_bucket_count=int(config.get("distance_bucket_count", 1)),
         path_signature_count=int(config.get("path_signature_count", 1)),
+        role_count=int(config.get("role_count", 0)),
     ).to(device)
     model.load_state_dict(checkpoint["model_state_dict"], strict=True)
     return model, config, checkpoint.get("epoch")
@@ -200,6 +201,7 @@ def main():
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--dev-graph-file", required=True)
     parser.add_argument("--dev-label-file", required=True)
+    parser.add_argument("--dev-role-label-file", default=None)
     parser.add_argument("--embedding-cache-dir", required=True)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--control-modes", default=None)
@@ -215,7 +217,8 @@ def main():
     device = torch.device(args.device)
     graphs = read_jsonl(args.dev_graph_file, args.dev_limit)
     labels = read_jsonl(args.dev_label_file)
-    examples, alignment = align_graphs_and_labels(graphs, labels, "dev")
+    role_labels = read_jsonl(args.dev_role_label_file) if args.dev_role_label_file else None
+    examples, alignment = align_graphs_and_labels(graphs, labels, "dev", role_labels)
     cache = load_embedding_cache(args.embedding_cache_dir, "dev", runtime)
     model, model_config, checkpoint_epoch = load_checkpoint_model(
         args.checkpoint, runtime, device
@@ -275,6 +278,11 @@ def main():
             ),
             coverage_margin=float(model_config.get("coverage_margin", 0.1)),
             coverage_target_k=int(model_config.get("coverage_target_k", 30)),
+            role_mapping={
+                str(key): int(value)
+                for key, value in model_config.get("role_mapping", {}).items()
+            },
+            role_loss_weight=float(model_config.get("role_loss_weight", 0.0)),
             record_persistent_diagnostics=bool(
                 model_config.get("record_persistent_diagnostics", True)
             ),
@@ -348,6 +356,7 @@ def main():
         "data_config": {
             "dev_graph_file": args.dev_graph_file,
             "dev_label_file": args.dev_label_file,
+            "dev_role_label_file": args.dev_role_label_file,
             "embedding_cache_dir": args.embedding_cache_dir,
             "dev_limit": args.dev_limit,
         },

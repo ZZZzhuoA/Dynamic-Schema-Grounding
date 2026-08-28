@@ -510,11 +510,13 @@ class FullSchemaQRGTA(nn.Module):
         model_type="qrgta",
         distance_bucket_count=1,
         path_signature_count=1,
+        role_count=0,
     ):
         super().__init__()
         if model_type not in {"qrgta", "path_qrgta", "persistent_path_qrgta", "mlp", "mlp_residual"}:
             raise ValueError(f"Unsupported model_type: {model_type}")
         self.model_type = model_type
+        self.role_count = int(role_count)
         self.node_input = nn.Linear(dense_dim, hidden_dim)
         self.query_input = nn.Sequential(
             nn.Linear(dense_dim, hidden_dim),
@@ -563,6 +565,14 @@ class FullSchemaQRGTA(nn.Module):
             nn.Dropout(dropout),
             nn.Linear(hidden_dim, 1),
         )
+        self.role_scorer = None
+        if self.role_count > 0:
+            self.role_scorer = nn.Sequential(
+                nn.Linear(hidden_dim * 4, hidden_dim),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(hidden_dim, self.role_count),
+            )
 
     def forward(
         self,
@@ -660,6 +670,10 @@ class FullSchemaQRGTA(nn.Module):
             "probabilities": torch.sigmoid(logits),
             "schema_states": schema_states,
         }
+        if self.role_scorer is not None:
+            role_logits = self.role_scorer(pair)
+            output["role_logits"] = role_logits
+            output["role_probabilities"] = torch.sigmoid(role_logits)
         if self.model_type == "persistent_path_qrgta" and record_persistent_diagnostics:
             if persistent_diagnostics:
                 message_gates = torch.cat(

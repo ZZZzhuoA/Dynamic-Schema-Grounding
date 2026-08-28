@@ -33,6 +33,8 @@ DATA_KEYS = (
     "dev_graph_file",
     "train_label_file",
     "dev_label_file",
+    "train_role_label_file",
+    "dev_role_label_file",
     "embedding_cache_dir",
     "train_limit",
     "dev_limit",
@@ -169,10 +171,13 @@ def load_interventions(paths, normal):
         expected_dev = {
             "dev_graph_file": normal[seed]["data_config"]["dev_graph_file"],
             "dev_label_file": normal[seed]["data_config"]["dev_label_file"],
+            "dev_role_label_file": normal[seed]["data_config"].get("dev_role_label_file"),
             "embedding_cache_dir": normal[seed]["data_config"]["embedding_cache_dir"],
             "dev_limit": normal[seed]["data_config"]["dev_limit"],
         }
-        if summary.get("data_config") != expected_dev:
+        observed_dev = dict(summary.get("data_config") or {})
+        observed_dev.setdefault("dev_role_label_file", None)
+        if observed_dev != expected_dev:
             raise ValueError(
                 f"Intervention seed={seed} uses a different dev data configuration: "
                 f"expected={expected_dev} observed={summary.get('data_config')}"

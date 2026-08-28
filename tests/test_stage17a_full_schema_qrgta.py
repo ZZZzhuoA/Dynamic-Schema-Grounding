@@ -91,6 +91,23 @@ class Stage17AAlignmentTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Schema identity mismatch"):
             TRAINING.align_graphs_and_labels([graph_record()], [label], "dev")
 
+    def test_alignment_attaches_role_labels_from_clause_file(self):
+        role_record = {
+            "db_id": "demo",
+            "question_id": 7,
+            "clause_labels": {
+                "select": [1],
+                "where": [2],
+                "join": [0],
+            },
+        }
+        examples, _ = TRAINING.align_graphs_and_labels(
+            [graph_record()], [label_record()], "dev", [role_record]
+        )
+        self.assertEqual(examples[0]["role_label_ids"]["OUTPUT_TARGET"], [1])
+        self.assertEqual(examples[0]["role_label_ids"]["PREDICATE_COLUMN"], [2])
+        self.assertEqual(examples[0]["role_label_ids"]["JOIN_BRIDGE"], [0])
+
     def test_prediction_evaluation_requires_complete_identity_preserving_ranking(self):
         label = label_record()
         prediction = {
@@ -351,6 +368,41 @@ class Stage17AModelTest(unittest.TestCase):
         )
         self.assertTrue(torch.isfinite(loss))
         self.assertGreater(gradient_total, 0.0)
+
+    def test_role_head_outputs_logits_and_loss(self):
+        torch = self.runtime["torch"]
+        example = self.aligned_example()
+        example["role_label_ids"] = {
+            "OUTPUT_TARGET": [1],
+            "PREDICATE_COLUMN": [2],
+        }
+        relations = TRAINING.relation_mapping([example], [example])
+        args = self.path_args(example, relations)
+        args.role_loss_weight = 0.2
+        args.role_mapping = TRAINING.role_mapping([example], [example])
+        tensors = TRAINING.example_to_tensors(
+            example, self.cache(), relations, args, self.runtime, "cpu"
+        )
+        model = self.runtime["model"](
+            dense_dim=16,
+            relation_count=len(relations),
+            hidden_dim=16,
+            num_layers=1,
+            num_heads=4,
+            dropout=0.0,
+            model_type="path_qrgta",
+            distance_bucket_count=len(args.distance_buckets),
+            path_signature_count=len(args.path_signatures),
+            role_count=len(args.role_mapping),
+        )
+        output = TRAINING.forward_model(model, tensors)
+        self.assertEqual(tuple(output["role_logits"].shape), (5, len(args.role_mapping)))
+        args._current_role_labels = tensors["role_labels"]
+        loss = TRAINING.training_loss(output, tensors["labels"], args, self.runtime)
+        args._current_role_labels = None
+        loss.backward()
+        self.assertTrue(torch.isfinite(loss))
+        self.assertIsNotNone(model.role_scorer[-1].weight.grad)
 
     def test_persistent_path_qrgta_forward_backward_and_diagnostics(self):
         torch = self.runtime["torch"]
