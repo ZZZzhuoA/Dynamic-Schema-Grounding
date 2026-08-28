@@ -39,6 +39,19 @@ DATA_KEYS = (
     "train_limit",
     "dev_limit",
 )
+CORE_DATA_KEYS = (
+    "train_graph_file",
+    "dev_graph_file",
+    "train_label_file",
+    "dev_label_file",
+    "embedding_cache_dir",
+    "train_limit",
+    "dev_limit",
+)
+ROLE_DATA_KEYS = (
+    "train_role_label_file",
+    "dev_role_label_file",
+)
 
 
 def read_json(path):
@@ -130,7 +143,9 @@ def assert_matched_runs(normal, mlp):
     reference = None
     for family, runs in (("normal", normal), ("mlp", mlp)):
         for seed, run in runs.items():
-            fingerprint = run["data_config"]
+            fingerprint = {
+                key: run["data_config"].get(key) for key in CORE_DATA_KEYS
+            }
             if reference is None:
                 reference = fingerprint
             elif fingerprint != reference:
@@ -138,10 +153,22 @@ def assert_matched_runs(normal, mlp):
                     f"Data configuration mismatch for {family} seed={seed}: "
                     f"expected={reference}, observed={fingerprint}"
                 )
+    role_reference = None
+    for seed, run in normal.items():
+        role_fingerprint = {
+            key: run["data_config"].get(key) for key in ROLE_DATA_KEYS
+        }
+        if role_reference is None:
+            role_reference = role_fingerprint
+        elif role_fingerprint != role_reference:
+            raise ValueError(
+                f"Role label configuration mismatch for normal seed={seed}: "
+                f"expected={role_reference}, observed={role_fingerprint}"
+            )
     sample_counts = {run["sample_count"] for run in list(normal.values()) + list(mlp.values())}
     if len(sample_counts) != 1:
         raise ValueError(f"Sample counts differ across trained runs: {sorted(sample_counts)}")
-    return reference
+    return {**reference, **(role_reference or {})}
 
 
 def load_interventions(paths, normal):
