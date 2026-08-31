@@ -300,6 +300,7 @@ def main():
                 "path_qrgta",
                 "persistent_path_qrgta",
                 "table_competitive_path_qrgta",
+                "enhanced_table_competitive_path_qrgta",
             },
             "normal",
         )
@@ -341,7 +342,11 @@ def main():
         run.get("model_type") == "persistent_path_qrgta" for run in normal.values()
     )
     normal_is_table_competitive_path_qrgta = all(
-        run.get("model_type") == "table_competitive_path_qrgta"
+        run.get("model_type")
+        in {
+            "table_competitive_path_qrgta",
+            "enhanced_table_competitive_path_qrgta",
+        }
         for run in normal.values()
     )
     available_path_controls = [

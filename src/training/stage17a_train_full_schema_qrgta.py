@@ -34,8 +34,12 @@ PATH_MODEL_TYPES = {
     "path_qrgta",
     "persistent_path_qrgta",
     "table_competitive_path_qrgta",
+    "enhanced_table_competitive_path_qrgta",
 }
-COMPETITION_MODEL_TYPES = {"table_competitive_path_qrgta"}
+COMPETITION_MODEL_TYPES = {
+    "table_competitive_path_qrgta",
+    "enhanced_table_competitive_path_qrgta",
+}
 DEFAULT_ROLE_ORDER = [
     "OUTPUT_TARGET",
     "PREDICATE_COLUMN",
@@ -1166,6 +1170,7 @@ def main():
             "path_qrgta",
             "persistent_path_qrgta",
             "table_competitive_path_qrgta",
+            "enhanced_table_competitive_path_qrgta",
             "mlp",
             "mlp_residual",
         ],
@@ -1203,6 +1208,8 @@ def main():
     parser.add_argument("--max-path-edges-per-destination", type=int, default=32)
     parser.add_argument("--competition-hidden-dim", type=int, default=128)
     parser.add_argument("--competition-dropout", type=float, default=0.1)
+    parser.add_argument("--competition-temperature", type=float, default=1.5)
+    parser.add_argument("--competition-residual-scale", type=float, default=0.5)
     parser.add_argument("--coverage-surrogate-weight", type=float, default=0.1)
     parser.add_argument("--coverage-margin", type=float, default=0.1)
     parser.add_argument("--coverage-target-k", type=int, default=30)
@@ -1224,10 +1231,12 @@ def main():
         and args.model_type not in COMPETITION_MODEL_TYPES
     ):
         raise ValueError(
-            f"--control-mode {args.control_mode} requires --model-type table_competitive_path_qrgta"
+            f"--control-mode {args.control_mode} requires a table-competitive model type"
         )
     if args.control_mode in PATH_CONTROL_MODES and args.model_type not in PATH_MODEL_TYPES:
         raise ValueError(f"--control-mode {args.control_mode} requires a path-aware model type")
+    if args.competition_temperature <= 0.0:
+        raise ValueError("--competition-temperature must be > 0")
 
     runtime = import_runtime()
     torch = runtime["torch"]
@@ -1298,16 +1307,24 @@ def main():
         "coverage_target_k": args.coverage_target_k,
         "competition_scope": (
             "column_within_table"
-            if args.model_type == "table_competitive_path_qrgta"
+            if args.model_type in COMPETITION_MODEL_TYPES
             else None
         ),
-        "competition_update_type": (
-            "encoder_inside_gated_delta"
-            if args.model_type == "table_competitive_path_qrgta"
-            else None
-        ),
+        "competition_update_type": {
+            "table_competitive_path_qrgta": "encoder_inside_gated_delta",
+            "enhanced_table_competitive_path_qrgta": (
+                "encoder_inside_temperature_scaled_multi_winner_gated_delta"
+            ),
+        }.get(args.model_type),
         "competition_hidden_dim": args.competition_hidden_dim,
         "competition_dropout": args.competition_dropout,
+        "competition_temperature": args.competition_temperature,
+        "competition_residual_scale": args.competition_residual_scale,
+        "multi_winner_gate_type": (
+            "independent_column_sigmoid"
+            if args.model_type == "enhanced_table_competitive_path_qrgta"
+            else None
+        ),
         "persistent_update_type": (
             "gated_delta" if args.model_type == "persistent_path_qrgta" else None
         ),
@@ -1345,6 +1362,8 @@ def main():
         role_count=model_config["role_count"],
         competition_hidden_dim=args.competition_hidden_dim,
         competition_dropout=args.competition_dropout,
+        competition_temperature=args.competition_temperature,
+        competition_residual_scale=args.competition_residual_scale,
     ).to(device)
     model_config["trainable_parameter_count"] = sum(
         int(parameter.numel()) for parameter in model.parameters() if parameter.requires_grad

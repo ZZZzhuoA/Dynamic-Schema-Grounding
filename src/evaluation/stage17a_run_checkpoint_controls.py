@@ -185,6 +185,7 @@ def load_checkpoint_model(checkpoint_path, runtime, device):
         "path_qrgta",
         "persistent_path_qrgta",
         "table_competitive_path_qrgta",
+        "enhanced_table_competitive_path_qrgta",
     }:
         raise ValueError(
             "Checkpoint intervention requires a normal graph QRGTA checkpoint, got "
@@ -208,6 +209,8 @@ def load_checkpoint_model(checkpoint_path, runtime, device):
         role_count=int(config.get("role_count", 0)),
         competition_hidden_dim=int(config.get("competition_hidden_dim", 128)),
         competition_dropout=float(config.get("competition_dropout", config.get("dropout", 0.1))),
+        competition_temperature=float(config.get("competition_temperature", 1.5)),
+        competition_residual_scale=float(config.get("competition_residual_scale", 0.5)),
     ).to(device)
     model.load_state_dict(checkpoint["model_state_dict"], strict=True)
     return model, config, checkpoint.get("epoch")
@@ -246,11 +249,15 @@ def main():
         "path_qrgta",
         "persistent_path_qrgta",
         "table_competitive_path_qrgta",
+        "enhanced_table_competitive_path_qrgta",
     }:
         default_modes.extend(PATH_CONTROL_MODES)
     if model_type == "persistent_path_qrgta":
         default_modes.extend(PERSISTENT_CONTROL_MODES)
-    if model_type == "table_competitive_path_qrgta":
+    if model_type in {
+        "table_competitive_path_qrgta",
+        "enhanced_table_competitive_path_qrgta",
+    }:
         default_modes.extend(COMPETITION_CONTROL_MODES)
     modes_text = args.control_modes or ",".join(default_modes)
     modes = [value.strip() for value in modes_text.split(",") if value.strip()]
@@ -261,11 +268,14 @@ def main():
         raise ValueError("--control-modes must include normal for paired deltas")
     if model_type != "persistent_path_qrgta" and "zero_update_gates" in modes:
         raise ValueError("zero_update_gates requires a persistent_path_qrgta checkpoint")
-    if model_type != "table_competitive_path_qrgta" and (
+    if model_type not in {
+        "table_competitive_path_qrgta",
+        "enhanced_table_competitive_path_qrgta",
+    } and (
         set(modes) & set(COMPETITION_CONTROL_MODES)
     ):
         raise ValueError(
-            "table competition controls require a table_competitive_path_qrgta checkpoint"
+            "table competition controls require a table-competitive checkpoint"
         )
     if cache["dense_dim"] != int(model_config["dense_dim"]):
         raise ValueError(
@@ -318,6 +328,10 @@ def main():
             competition_hidden_dim=int(model_config.get("competition_hidden_dim", 128)),
             competition_dropout=float(
                 model_config.get("competition_dropout", model_config.get("dropout", 0.1))
+            ),
+            competition_temperature=float(model_config.get("competition_temperature", 1.5)),
+            competition_residual_scale=float(
+                model_config.get("competition_residual_scale", 0.5)
             ),
         )
         metrics, predictions = evaluate(
