@@ -217,6 +217,15 @@ def node_summary(node, row=None):
         "name": node.get("name"),
         "type": node.get("type"),
         "table": node.get("table") if node.get("type") == "column" else node.get("name"),
+        "is_primary_key": bool(node.get("is_primary_key")),
+        "is_foreign_key_endpoint": bool(node.get("is_foreign_key_endpoint")),
+        "is_identifier_column": is_identifier_column(node),
+        "has_official_description": bool(
+            str(node.get("official_column_description") or "").strip()
+        ),
+        "has_official_value_description": bool(
+            str(node.get("official_value_description") or "").strip()
+        ),
     }
     if row:
         payload.update(
@@ -227,6 +236,15 @@ def node_summary(node, row=None):
             }
         )
     return payload
+
+
+def is_identifier_column(node):
+    if node.get("type") != "column":
+        return False
+    name = str(node.get("column") or node.get("name") or "")
+    expanded = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", name)
+    pieces = [piece for piece in re.split(r"[^a-z0-9]+", expanded.casefold()) if piece]
+    return bool(pieces and (pieces[-1] in {"id", "identifier"} or name.casefold() == "id"))
 
 
 def table_context(item_id, node_by_id, parent_table_id):
@@ -351,7 +369,7 @@ def percentile(values, pct):
 
 def summarize_group(rows):
     failures = [row for row in rows if not row["complete_coverage"]]
-    return {
+    summary = {
         "sample_count": len(rows),
         "complete_coverage@30": mean(row["complete_coverage"] for row in rows),
         "schema_recall@30": mean(row["recall"] for row in rows),
@@ -365,6 +383,78 @@ def summarize_group(rows):
         "avg_worst_gold_rank": mean(row["worst_gold_rank"] for row in rows),
         "p90_worst_gold_rank": percentile([row["worst_gold_rank"] for row in rows], 0.9),
         "gold_count_gt_30_count": sum(1 for row in rows if row["gold_count"] > 30),
+    }
+    categories = {
+        "primary_key": "is_primary_key",
+        "foreign_key_endpoint": "is_foreign_key_endpoint",
+        "identifier_column": "is_identifier_column",
+        "official_description_column": "has_official_description",
+        "official_value_description_column": "has_official_value_description",
+    }
+    for category, field in categories.items():
+        gold_items = [item for row in rows for item in row["gold_schema"] if item.get(field)]
+        selected = sum(1 for item in gold_items if int(item.get("rank", 10**9)) <= 30)
+        missing = [item for item in gold_items if int(item.get("rank", 10**9)) > 30]
+        summary[f"{category}_recall@30"] = selected / len(gold_items) if gold_items else None
+        summary[f"{category}_gold_count"] = len(gold_items)
+        summary[f"{category}_missing_count"] = len(missing)
+        summary[f"{category}_rank_31_40_missing_count"] = sum(
+            31 <= int(item.get("rank", 10**9)) <= 40 for item in missing
+        )
+        summary[f"{category}_rank_41_50_missing_count"] = sum(
+            41 <= int(item.get("rank", 10**9)) <= 50 for item in missing
+        )
+    return summary
+
+
+def row_identity(row):
+    question_id = row.get("question_id")
+    if question_id is not None:
+        return str(row.get("db_id")), str(question_id)
+    return "record_index", int(row["record_index"])
+
+
+def compare_runs(baseline_rows, candidate_rows):
+    baseline = {row_identity(row): row for row in baseline_rows}
+    candidate = {row_identity(row): row for row in candidate_rows}
+    if set(baseline) != set(candidate):
+        missing_candidate = sorted(set(baseline) - set(candidate), key=str)
+        missing_baseline = sorted(set(candidate) - set(baseline), key=str)
+        raise ValueError(
+            "Comparison sample mismatch: "
+            f"missing_candidate={missing_candidate[:5]} missing_baseline={missing_baseline[:5]}"
+        )
+    recovered = []
+    regressed = []
+    unchanged_complete = 0
+    unchanged_incomplete = 0
+    for key in sorted(baseline, key=str):
+        before = baseline[key]
+        after = candidate[key]
+        payload = {
+            "db_id": after.get("db_id"),
+            "question_id": after.get("question_id"),
+            "record_index": after.get("record_index"),
+            "baseline_worst_gold_rank": before.get("worst_gold_rank"),
+            "candidate_worst_gold_rank": after.get("worst_gold_rank"),
+        }
+        if not before["complete_coverage"] and after["complete_coverage"]:
+            recovered.append(payload)
+        elif before["complete_coverage"] and not after["complete_coverage"]:
+            regressed.append(payload)
+        elif after["complete_coverage"]:
+            unchanged_complete += 1
+        else:
+            unchanged_incomplete += 1
+    return {
+        "sample_count": len(baseline),
+        "recovered_complete_count": len(recovered),
+        "regressed_complete_count": len(regressed),
+        "net_recovered_complete_count": len(recovered) - len(regressed),
+        "unchanged_complete_count": unchanged_complete,
+        "unchanged_incomplete_count": unchanged_incomplete,
+        "recovered_samples": recovered,
+        "regressed_samples": regressed,
     }
 
 
@@ -437,6 +527,11 @@ def main():
     parser.add_argument("--top-k", type=int, default=30)
     parser.add_argument("--case-limit", type=int, default=200)
     parser.add_argument("--dev-limit", type=int, default=None)
+    parser.add_argument(
+        "--comparison",
+        action="append",
+        help="BASELINE=CANDIDATE run names for paired recovered/regressed analysis.",
+    )
     args = parser.parse_args()
 
     if not args.run and not args.prediction_file:
@@ -447,6 +542,7 @@ def main():
     output_dir = Path(args.output_dir)
     all_rows = []
     per_run = {}
+    per_run_rows = {}
 
     run_specs = []
     for value in args.run or []:
@@ -467,7 +563,20 @@ def main():
             row["run"] = str(run_name)
             rows.append(row)
         per_run[str(run_name)] = summarize_group(rows)
+        per_run_rows[str(run_name)] = rows
         all_rows.extend(rows)
+
+    comparisons = {}
+    for value in args.comparison or []:
+        baseline_name, candidate_path = assignment(value)
+        candidate_name = str(candidate_path)
+        if baseline_name not in per_run_rows or candidate_name not in per_run_rows:
+            raise ValueError(
+                f"Unknown comparison {value!r}; available runs={sorted(per_run_rows)}"
+            )
+        comparisons[f"{baseline_name}->{candidate_name}"] = compare_runs(
+            per_run_rows[baseline_name], per_run_rows[candidate_name]
+        )
 
     by_database_rows = defaultdict(list)
     by_size_rows = defaultdict(list)
@@ -519,6 +628,7 @@ def main():
         "run_count": len(run_specs),
         "runs": {str(name): {"prediction_file": str(path), "run_path": run_path} for name, path, run_path in run_specs},
         "per_run": per_run,
+        "paired_comparisons": comparisons,
         "overall": summarize_group(all_rows),
         "by_database": by_database,
         "by_schema_size": by_schema_size,

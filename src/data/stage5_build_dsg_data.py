@@ -1,5 +1,8 @@
 import argparse
+import csv
+import io
 import json
+import unicodedata
 from collections import Counter, defaultdict
 from pathlib import Path
 
@@ -45,6 +48,187 @@ def write_jsonl(path: Path, records):
 
 def load_table_entries(path: Path):
     return {entry["db_id"]: entry for entry in read_json(path)}
+
+
+def normalize_metadata_name(value):
+    text = unicodedata.normalize("NFKC", str(value or "")).replace("\ufeff", "")
+    return text.strip().casefold()
+
+
+def clean_metadata_value(value):
+    return unicodedata.normalize("NFKC", str(value or "")).replace("\ufeff", "").strip()
+
+
+def read_database_description_csv(path: Path):
+    payload = path.read_bytes()
+    for encoding in ("utf-8-sig", "cp1252"):
+        try:
+            return csv.DictReader(io.StringIO(payload.decode(encoding))), encoding
+        except UnicodeDecodeError:
+            continue
+    raise UnicodeDecodeError(
+        "utf-8/cp1252", payload, 0, len(payload), f"Could not decode {path}"
+    )
+
+
+def flatten_primary_keys(values):
+    flattened = set()
+    for value in values or []:
+        if isinstance(value, list):
+            flattened.update(int(item) for item in value)
+        else:
+            flattened.add(int(value))
+    return flattened
+
+
+def authoritative_schema_metadata(table_entry):
+    tables = table_entry.get("table_names_original", [])
+    columns = table_entry.get("column_names_original", [])
+    primary_keys = flatten_primary_keys(table_entry.get("primary_keys", []))
+    outgoing = defaultdict(list)
+    incoming = defaultdict(list)
+    fk_endpoints = set()
+    for left, right in table_entry.get("foreign_keys", []):
+        if left >= len(columns) or right >= len(columns):
+            raise ValueError(f"Foreign key index out of range for db={table_entry.get('db_id')}")
+        left_table, left_column = columns[left]
+        right_table, right_column = columns[right]
+        if left_table < 0 or right_table < 0:
+            continue
+        left_name = f"{tables[left_table]}.{left_column}"
+        right_name = f"{tables[right_table]}.{right_column}"
+        outgoing[left].append(right_name)
+        incoming[right].append(left_name)
+        fk_endpoints.update((left, right))
+
+    result = {}
+    for column_index, (table_index, column_name) in enumerate(columns):
+        if table_index < 0 or column_name == "*":
+            continue
+        key = (
+            normalize_metadata_name(tables[table_index]),
+            normalize_metadata_name(column_name),
+        )
+        if key in result:
+            raise ValueError(
+                f"Ambiguous normalized schema column for db={table_entry.get('db_id')}: {key}"
+            )
+        result[key] = {
+            "is_primary_key": column_index in primary_keys,
+            "is_foreign_key_endpoint": column_index in fk_endpoints,
+            "foreign_key_outgoing_targets": sorted(set(outgoing[column_index]))[:8],
+            "foreign_key_incoming_sources": sorted(set(incoming[column_index]))[:8],
+        }
+    return result
+
+
+def load_database_description(database_root: Path, table_entries):
+    metadata_by_db = {}
+    summary = {
+        "database_root": str(database_root),
+        "database_count": 0,
+        "matched_table_count": 0,
+        "unmatched_tables": [],
+        "matched_column_count": 0,
+        "unmatched_columns": [],
+        "extra_csv_columns": [],
+        "csv_encoding_counts": Counter(),
+    }
+    for db_id, table_entry in sorted(table_entries.items()):
+        description_dir = database_root / db_id / "database_description"
+        table_map = {}
+        for table_name in table_entry.get("table_names_original", []):
+            key = normalize_metadata_name(table_name)
+            if key in table_map:
+                raise ValueError(f"Ambiguous normalized table name for db={db_id}: {key!r}")
+            table_map[key] = table_name
+
+        csv_map = {}
+        if description_dir.exists():
+            for csv_path in sorted(description_dir.glob("*.csv"), key=lambda path: path.name.casefold()):
+                key = normalize_metadata_name(csv_path.stem)
+                if key in csv_map:
+                    raise ValueError(f"Ambiguous database-description CSV for db={db_id}: {key!r}")
+                csv_map[key] = csv_path
+        db_metadata = {}
+        summary["database_count"] += 1
+        schema_columns = authoritative_schema_metadata(table_entry)
+        for key, structural in schema_columns.items():
+            db_metadata[key] = {
+                **structural,
+                "official_column_name": "",
+                "official_column_description": "",
+                "official_data_format": "",
+                "official_value_description": "",
+                "metadata_source": "bird_database_description",
+            }
+        for table_key, table_name in table_map.items():
+            csv_path = csv_map.get(table_key)
+            expected_columns = {
+                column_key
+                for current_table, column_key in schema_columns
+                if current_table == table_key
+            }
+            if csv_path is None:
+                summary["unmatched_tables"].append({"db_id": db_id, "table": table_name})
+                for column_key in sorted(expected_columns):
+                    summary["unmatched_columns"].append(
+                        {"db_id": db_id, "table": table_name, "column": column_key}
+                    )
+                continue
+            summary["matched_table_count"] += 1
+            reader, encoding = read_database_description_csv(csv_path)
+            summary["csv_encoding_counts"][encoding] += 1
+            try:
+                normalized_headers = {
+                    normalize_metadata_name(header): header for header in (reader.fieldnames or [])
+                }
+                original_header = normalized_headers.get("original_column_name")
+                if original_header is None:
+                    raise ValueError(f"Missing original_column_name header: {csv_path}")
+                seen_columns = set()
+                for row_number, row in enumerate(reader, start=2):
+                    column_original = clean_metadata_value(row.get(original_header))
+                    column_key = normalize_metadata_name(column_original)
+                    if not column_key:
+                        continue
+                    if column_key in seen_columns:
+                        raise ValueError(
+                            f"Ambiguous duplicate column in {csv_path}:{row_number}: {column_original!r}"
+                        )
+                    seen_columns.add(column_key)
+                    key = (table_key, column_key)
+                    if key not in schema_columns:
+                        summary["extra_csv_columns"].append(
+                            {"db_id": db_id, "table": table_name, "column": column_original}
+                        )
+                        continue
+
+                    def field(name):
+                        header = normalized_headers.get(name)
+                        return clean_metadata_value(row.get(header)) if header else ""
+
+                    db_metadata[key] = {
+                        **schema_columns[key],
+                        "official_column_name": field("column_name"),
+                        "official_column_description": field("column_description"),
+                        "official_data_format": field("data_format"),
+                        "official_value_description": field("value_description"),
+                        "metadata_source": "bird_database_description",
+                    }
+                    summary["matched_column_count"] += 1
+                for column_key in sorted(expected_columns - seen_columns):
+                    summary["unmatched_columns"].append(
+                        {"db_id": db_id, "table": table_name, "column": column_key}
+                    )
+            finally:
+                del reader
+        metadata_by_db[db_id] = db_metadata
+    summary["unmatched_table_count"] = len(summary["unmatched_tables"])
+    summary["unmatched_column_count"] = len(summary["unmatched_columns"])
+    summary["extra_csv_column_count"] = len(summary["extra_csv_columns"])
+    summary["csv_encoding_counts"] = dict(sorted(summary["csv_encoding_counts"].items()))
+    return metadata_by_db, summary
 
 
 def load_schema_semantic_cards(path: Path | None):
@@ -173,8 +357,9 @@ def attach_semantic_card(node, card):
     return node
 
 
-def schema_nodes(schema_items, semantic_cards=None):
+def schema_nodes(schema_items, semantic_cards=None, official_metadata=None):
     semantic_cards = semantic_cards or {}
+    official_metadata = official_metadata or {}
     nodes = []
     for item in schema_items:
         node = {
@@ -193,6 +378,12 @@ def schema_nodes(schema_items, semantic_cards=None):
                     "data_type": item.get("data_type"),
                 }
             )
+            metadata_key = (
+                normalize_metadata_name(item.get("table")),
+                normalize_metadata_name(item.get("column")),
+            )
+            if metadata_key in official_metadata:
+                node.update(official_metadata[metadata_key])
         nodes.append(attach_semantic_card(node, semantic_cards.get(item["id"])))
     return nodes
 
@@ -294,8 +485,9 @@ def make_example(
     include_same_table_edges=False,
     semantic_cards_by_id=None,
     question_card=None,
+    official_metadata=None,
 ):
-    nodes = schema_nodes(record["schema_items"], semantic_cards_by_id)
+    nodes = schema_nodes(record["schema_items"], semantic_cards_by_id, official_metadata)
     edges = schema_edges(record["schema_items"], table_entry, include_same_table_edges)
     label_vector = grounding_vector(record)
     table_label_ids, column_label_ids = table_column_label_splits(record)
@@ -330,6 +522,7 @@ def make_example(
         "hit_unmapped": record.get("hit_unmapped", []),
         "schema_semantic_cards_attached": bool(semantic_cards_by_id),
         "question_card_attached": bool(question_card),
+        "official_metadata_attached": bool(official_metadata),
     }
     stable_id = record.get("question_id")
     if stable_id is None:
@@ -348,6 +541,7 @@ def build_split(
     include_same_table_edges=False,
     semantic_cards_by_db=None,
     question_cards=None,
+    official_metadata_by_db=None,
 ):
     semantic_cards_by_db = semantic_cards_by_db or {}
     examples = []
@@ -361,6 +555,7 @@ def build_split(
                 include_same_table_edges,
                 semantic_cards_by_db.get(record["db_id"], {}),
                 (question_cards or {}).get(question_card_key(record, index)) or (question_cards or {}).get(("idx", index)),
+                (official_metadata_by_db or {}).get(record["db_id"]),
             )
         )
     return examples
@@ -514,6 +709,16 @@ def main():
         dest="dev_question_cards",
         default=None,
     )
+    parser.add_argument(
+        "--train-database-root",
+        default=None,
+        help="Optional BIRD train_databases root containing <db>/database_description/*.csv.",
+    )
+    parser.add_argument(
+        "--dev-database-root",
+        default=None,
+        help="Optional BIRD dev_databases root containing <db>/database_description/*.csv.",
+    )
     parser.add_argument("--output-dir", default="experiments/stage5_dsg_data")
     parser.add_argument("--train-limit", type=int, default=None)
     parser.add_argument("--dev-limit", type=int, default=None)
@@ -533,6 +738,16 @@ def main():
     )
     train_question_cards = load_question_cards(Path(args.train_question_cards) if args.train_question_cards else None)
     dev_question_cards = load_question_cards(Path(args.dev_question_cards) if args.dev_question_cards else None)
+    train_official_metadata, train_metadata_summary = ({}, None)
+    dev_official_metadata, dev_metadata_summary = ({}, None)
+    if args.train_database_root:
+        train_official_metadata, train_metadata_summary = load_database_description(
+            Path(args.train_database_root), train_tables
+        )
+    if args.dev_database_root:
+        dev_official_metadata, dev_metadata_summary = load_database_description(
+            Path(args.dev_database_root), dev_tables
+        )
 
     train_examples = build_split(
         train_records,
@@ -540,6 +755,7 @@ def main():
         args.include_same_table_edges,
         train_semantic_cards,
         train_question_cards,
+        train_official_metadata,
     )
     dev_examples = build_split(
         dev_records,
@@ -547,6 +763,7 @@ def main():
         args.include_same_table_edges,
         dev_semantic_cards,
         dev_question_cards,
+        dev_official_metadata,
     )
 
     write_jsonl(output_dir / "train_examples.jsonl", train_examples)
@@ -556,6 +773,10 @@ def main():
         "config": vars(args),
         "train": summarize_examples(train_examples),
         "dev": summarize_examples(dev_examples),
+        "official_metadata": {
+            "train": train_metadata_summary,
+            "dev": dev_metadata_summary,
+        },
         "generalization_note": (
             "Gold SQL and gold schema labels are stored only in training_targets. "
             "Test-time inference should consume inference_inputs only."

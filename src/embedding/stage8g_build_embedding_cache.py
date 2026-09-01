@@ -43,6 +43,10 @@ def compact_list(values, limit=12):
     return [str(value).strip() for value in values if str(value).strip()][:limit]
 
 
+def truncated_text(value, char_limit):
+    return str(value or "").strip()[:char_limit]
+
+
 def node_embedding_text(node):
     """Build the text actually sent to the dense embedding model.
 
@@ -62,6 +66,34 @@ def node_embedding_text(node):
                 f"data type: {node.get('data_type', '')}",
             ]
         )
+        if node.get("is_primary_key"):
+            parts.append("primary key: yes")
+        if node.get("is_foreign_key_endpoint"):
+            parts.append("foreign key endpoint: yes")
+        outgoing = compact_list(node.get("foreign_key_outgoing_targets"), 8)
+        if outgoing:
+            parts.append("foreign key outgoing targets: " + "; ".join(outgoing))
+        incoming = compact_list(node.get("foreign_key_incoming_sources"), 8)
+        if incoming:
+            parts.append("foreign key incoming sources: " + "; ".join(incoming))
+        official_name = truncated_text(node.get("official_column_name"), 160)
+        if official_name:
+            parts.append(f"official column name: {official_name}")
+        official_description = truncated_text(
+            node.get("official_column_description"), 320
+        )
+        if official_description:
+            parts.append(f"official description: {official_description}")
+        official_format = str(node.get("official_data_format") or "").strip()
+        if official_format:
+            parts.append(f"official data format: {official_format}")
+        official_value_description = truncated_text(
+            node.get("official_value_description"), 384
+        )
+        if official_value_description:
+            parts.append(
+                f"official value description: {official_value_description}"
+            )
     for key, label in [
         ("semantic_name", "semantic name"),
         ("semantic_description", "description"),
