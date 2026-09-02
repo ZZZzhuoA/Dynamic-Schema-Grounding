@@ -36,16 +36,23 @@ COMPETITION_CONTROL_MODES = {
     "shuffle_column_parent_table",
     "zero_competition_gates",
 }
+PRIMARY_KEY_MODIFIER_CONTROL_MODES = {"zero_pk_modifier"}
 PATH_MODEL_TYPES = {
     "path_qrgta",
     "persistent_path_qrgta",
     "table_competitive_path_qrgta",
     "enhanced_table_competitive_path_qrgta",
+    "pk_residual_table_competitive_path_qrgta",
 }
 COMPETITION_MODEL_TYPES = {
     "table_competitive_path_qrgta",
     "enhanced_table_competitive_path_qrgta",
+    "pk_residual_table_competitive_path_qrgta",
 }
+PRIMARY_KEY_MODIFIER_MODEL_TYPES = {"pk_residual_table_competitive_path_qrgta"}
+PK_EDGE_NONE = 0
+PK_EDGE_TABLE_TO_PRIMARY_KEY = 1
+PK_EDGE_PRIMARY_KEY_TO_TABLE = 2
 DEFAULT_ROLE_ORDER = [
     "OUTPUT_TARGET",
     "PREDICATE_COLUMN",
@@ -363,6 +370,7 @@ def _local_edges_for_paths(example, relations):
                 "dst": id_to_local[dst],
                 "relation_id": relation_id,
                 "relation_name": relation_names[relation_id],
+                "is_primary_key_edge": bool(edge.get("is_primary_key_edge", False)),
             }
         )
     return rows
@@ -411,6 +419,7 @@ def build_path_rows(
                 "distance": distance,
                 "path_signature": path_signature_name([edge["relation_name"]]),
                 "is_direct": True,
+                "is_primary_key_edge": edge["is_primary_key_edge"],
             }
         )
         direct_pairs.add((edge["src"], edge["dst"]))
@@ -450,6 +459,7 @@ def build_path_rows(
                             "distance": distance,
                             "path_signature": signature,
                             "is_direct": False,
+                            "is_primary_key_edge": False,
                         }
                     if distance < max_path_distance:
                         next_frontier.append((dst, candidate_path))
@@ -638,6 +648,18 @@ def path_aware_schema_edge_tensors(
         for row in rows
     ]
     is_direct = [row["is_direct"] for row in rows]
+    primary_key_directions = []
+    for row in rows:
+        if not row["is_primary_key_edge"]:
+            primary_key_directions.append(PK_EDGE_NONE)
+        elif row["path_signature"] == "DIRECT:table_to_column":
+            primary_key_directions.append(PK_EDGE_TABLE_TO_PRIMARY_KEY)
+        elif row["path_signature"] == "DIRECT:column_to_table":
+            primary_key_directions.append(PK_EDGE_PRIMARY_KEY_TO_TABLE)
+        else:
+            raise ValueError(
+                "Primary-key edge attributes are only valid on direct generic ownership edges"
+            )
 
     edge_index = torch.tensor(
         [sources, destinations], dtype=torch.long, device=device
@@ -648,6 +670,9 @@ def path_aware_schema_edge_tensors(
     distance_tensor = torch.tensor(distances, dtype=torch.long, device=device)
     signature_tensor = torch.tensor(signatures, dtype=torch.long, device=device)
     direct_mask = torch.tensor(is_direct, dtype=torch.bool, device=device)
+    primary_key_direction_tensor = torch.tensor(
+        primary_key_directions, dtype=torch.long, device=device
+    )
 
     if control_mode == "zero_path_features" and sources:
         non_query_neutral_distance = distance_buckets[DISTANCE_SELF]
@@ -682,7 +707,15 @@ def path_aware_schema_edge_tensors(
         "path_edge_count": int(sum(1 for value in is_direct if not value)),
         "total_attention_edge_count": len(rows),
     }
-    return edge_index, edge_type, distance_tensor, signature_tensor, direct_mask, stats
+    return (
+        edge_index,
+        edge_type,
+        distance_tensor,
+        signature_tensor,
+        direct_mask,
+        primary_key_direction_tensor,
+        stats,
+    )
 
 
 def shuffled_schema_edges_for_control(example, relations, seed, runtime):
@@ -769,7 +802,15 @@ def example_to_tensors(example, cache, relations, args, runtime, device):
         query_similarity = full_query_similarity
     model_type = getattr(args, "model_type", "qrgta")
     if model_type in PATH_MODEL_TYPES:
-        edge_index, edge_type, distance_tensor, signature_tensor, _, path_stats = (
+        (
+            edge_index,
+            edge_type,
+            distance_tensor,
+            signature_tensor,
+            _,
+            primary_key_direction_tensor,
+            path_stats,
+        ) = (
             path_aware_schema_edge_tensors(
                 example,
                 relations,
@@ -795,6 +836,7 @@ def example_to_tensors(example, cache, relations, args, runtime, device):
             "path_edge_count": 0,
             "total_attention_edge_count": int(edge_type.shape[0]),
         }
+        primary_key_direction_tensor = torch.zeros_like(edge_type)
     if model_type in PATH_MODEL_TYPES and args.control_mode == "zero_query_edges":
         query_distance = torch.empty(0, dtype=torch.long, device=device)
         query_path = torch.empty(0, dtype=torch.long, device=device)
@@ -844,11 +886,13 @@ def example_to_tensors(example, cache, relations, args, runtime, device):
         "query_edge_similarity": query_similarity,
         "schema_distance_bucket": distance_tensor,
         "schema_path_signature": signature_tensor,
+        "schema_primary_key_direction": primary_key_direction_tensor,
         "query_distance_bucket": query_distance,
         "query_path_signature": query_path,
         "zero_update_gates": args.control_mode == "zero_update_gates",
         "zero_table_competition": args.control_mode == "zero_table_competition",
         "zero_competition_gates": args.control_mode == "zero_competition_gates",
+        "zero_pk_modifier": args.control_mode == "zero_pk_modifier",
         "record_persistent_diagnostics": bool(
             getattr(args, "record_persistent_diagnostics", False)
         ),
@@ -884,9 +928,11 @@ def forward_model(model, tensors):
         tensors.get("schema_path_signature"),
         tensors.get("query_distance_bucket"),
         tensors.get("query_path_signature"),
+        schema_primary_key_direction=tensors.get("schema_primary_key_direction"),
         zero_update_gates=bool(tensors.get("zero_update_gates", False)),
         zero_table_competition=bool(tensors.get("zero_table_competition", False)),
         zero_competition_gates=bool(tensors.get("zero_competition_gates", False)),
+        zero_pk_modifier=bool(tensors.get("zero_pk_modifier", False)),
         column_parent_table=tensors.get("column_parent_table"),
         is_column_node=tensors.get("is_column_node"),
         record_persistent_diagnostics=bool(
@@ -1198,6 +1244,7 @@ def main():
             "persistent_path_qrgta",
             "table_competitive_path_qrgta",
             "enhanced_table_competitive_path_qrgta",
+            "pk_residual_table_competitive_path_qrgta",
             "mlp",
             "mlp_residual",
         ],
@@ -1229,6 +1276,7 @@ def main():
             "shuffle_column_parent_table",
             "zero_competition_gates",
             "downgrade_primary_key_edges",
+            "zero_pk_modifier",
         ],
         default="normal",
     )
@@ -1263,6 +1311,13 @@ def main():
         )
     if args.control_mode in PATH_CONTROL_MODES and args.model_type not in PATH_MODEL_TYPES:
         raise ValueError(f"--control-mode {args.control_mode} requires a path-aware model type")
+    if (
+        args.control_mode in PRIMARY_KEY_MODIFIER_CONTROL_MODES
+        and args.model_type not in PRIMARY_KEY_MODIFIER_MODEL_TYPES
+    ):
+        raise ValueError(
+            f"--control-mode {args.control_mode} requires a PK-residual model type"
+        )
     if args.competition_temperature <= 0.0:
         raise ValueError("--competition-temperature must be > 0")
 
@@ -1297,6 +1352,26 @@ def main():
     if train_cache["dense_dim"] != dev_cache["dense_dim"]:
         raise ValueError("Train/dev embedding dimensions differ")
     relations = relation_mapping(train_examples, dev_examples)
+    if args.model_type in PRIMARY_KEY_MODIFIER_MODEL_TYPES:
+        marked_pk_edges = sum(
+            1
+            for example in train_examples + dev_examples
+            for edge in example.get("schema_edges", [])
+            if edge.get("is_primary_key_edge") is True
+        )
+        typed_pk_relations = {
+            REL_TABLE_TO_PRIMARY_KEY,
+            REL_PRIMARY_KEY_TO_TABLE,
+        } & set(relations)
+        if typed_pk_relations:
+            raise ValueError(
+                "PK-residual models require generic ownership relations with "
+                "is_primary_key_edge attributes, not replacement PK relations"
+            )
+        if marked_pk_edges == 0:
+            raise ValueError(
+                "PK-residual models require graph edges marked with is_primary_key_edge"
+            )
     roles = role_mapping(train_examples, dev_examples) if args.role_loss_weight > 0.0 else {}
     if args.role_loss_weight > 0.0 and not role_positive_count(train_examples + dev_examples):
         raise ValueError(
@@ -1338,6 +1413,31 @@ def main():
             }.issubset(relations)
             else []
         ),
+        "primary_key_modifier_type": (
+            "query_conditioned_scalar_gated_key_value_bias_delta"
+            if args.model_type in PRIMARY_KEY_MODIFIER_MODEL_TYPES
+            else None
+        ),
+        "primary_key_modifier_gate_type": (
+            "query_conditioned_scalar"
+            if args.model_type in PRIMARY_KEY_MODIFIER_MODEL_TYPES
+            else None
+        ),
+        "primary_key_modifier_directions": (
+            ["table_to_primary_key", "primary_key_to_table"]
+            if args.model_type in PRIMARY_KEY_MODIFIER_MODEL_TYPES
+            else []
+        ),
+        "primary_key_modifier_initialization": (
+            "zero_delta"
+            if args.model_type in PRIMARY_KEY_MODIFIER_MODEL_TYPES
+            else None
+        ),
+        "primary_key_marked_edge_count": (
+            marked_pk_edges
+            if args.model_type in PRIMARY_KEY_MODIFIER_MODEL_TYPES
+            else 0
+        ),
         "distance_bucket_mapping": distance_buckets,
         "path_type_mapping": path_signatures,
         "role_mapping": roles,
@@ -1359,6 +1459,7 @@ def main():
             "enhanced_table_competitive_path_qrgta": (
                 "encoder_inside_temperature_scaled_multi_winner_gated_delta"
             ),
+            "pk_residual_table_competitive_path_qrgta": "encoder_inside_gated_delta",
         }.get(args.model_type),
         "competition_hidden_dim": args.competition_hidden_dim,
         "competition_dropout": args.competition_dropout,
@@ -1389,6 +1490,7 @@ def main():
             "shuffle_column_parent_table": "Shuffle column-to-parent-table assignments while preserving node identity and graph/path edges.",
             "zero_competition_gates": "Compute table-scoped competition features but set competition write gates to zero.",
             "downgrade_primary_key_edges": "Replace primary-key ownership relations with generic table-column ownership relations while preserving edge indices and node identity.",
+            "zero_pk_modifier": "Keep generic ownership edges and PK edge markers but disable the learned PK key/value/bias residual.",
         },
     }
     output_dir = Path(args.output_dir)

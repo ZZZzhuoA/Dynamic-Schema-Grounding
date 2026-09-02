@@ -42,6 +42,71 @@ def table_entry():
 
 
 class Stage17FOfficialMetadataTest(unittest.TestCase):
+    def test_primary_key_edge_attributes_preserve_generic_relations(self):
+        schema_items = [
+            {"id": 0, "type": "table", "name": "Schools"},
+            {"id": 1, "type": "table", "name": "Districts"},
+            {
+                "id": 2,
+                "type": "column",
+                "name": "Schools.School_ID",
+                "table": "Schools",
+                "column": "School_ID",
+            },
+            {
+                "id": 3,
+                "type": "column",
+                "name": "Schools.Name",
+                "table": "Schools",
+                "column": "Name",
+            },
+            {
+                "id": 4,
+                "type": "column",
+                "name": "Districts.District_ID",
+                "table": "Districts",
+                "column": "District_ID",
+            },
+        ]
+        generic = GRAPH.schema_edges(schema_items, table_entry())
+        attributed = GRAPH.schema_edges(
+            schema_items,
+            table_entry(),
+            encode_primary_keys_as_edge_attributes=True,
+        )
+        self.assertEqual(
+            [(row["src"], row["dst"], row["type"]) for row in generic],
+            [(row["src"], row["dst"], row["type"]) for row in attributed],
+        )
+        self.assertTrue(all("is_primary_key_edge" not in row for row in generic))
+        self.assertTrue(all("is_primary_key_edge" in row for row in attributed))
+        marked = {
+            (row["src"], row["dst"], row["type"])
+            for row in attributed
+            if row.get("is_primary_key_edge") is True
+        }
+        self.assertEqual(
+            marked,
+            {
+                (0, 2, "table_to_column"),
+                (2, 0, "column_to_table"),
+                (1, 4, "table_to_column"),
+                (4, 1, "column_to_table"),
+            },
+        )
+        self.assertFalse(
+            any(row.get("is_primary_key_edge") for row in attributed if row["src"] == 3)
+        )
+
+    def test_primary_key_encodings_are_mutually_exclusive(self):
+        with self.assertRaisesRegex(ValueError, "cannot be encoded as both"):
+            GRAPH.schema_edges(
+                [],
+                table_entry(),
+                encode_primary_keys_as_relations=True,
+                encode_primary_keys_as_edge_attributes=True,
+            )
+
     def test_primary_keys_replace_generic_ownership_relations_without_node_text_changes(self):
         schema_items = [
             {"id": 0, "type": "table", "name": "Schools"},

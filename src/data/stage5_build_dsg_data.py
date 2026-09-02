@@ -404,12 +404,14 @@ def schema_indexes(schema_items):
     return table_to_id, column_pair_to_id, columns_by_table
 
 
-def add_edge(edges, seen, src, dst, edge_type):
+def add_edge(edges, seen, src, dst, edge_type, **attributes):
     key = (int(src), int(dst), edge_type)
     if key in seen:
         return
     seen.add(key)
-    edges.append({"src": int(src), "dst": int(dst), "type": edge_type})
+    edges.append(
+        {"src": int(src), "dst": int(dst), "type": edge_type, **attributes}
+    )
 
 
 def primary_key_item_ids(table_entry, column_pair_to_id):
@@ -446,15 +448,22 @@ def schema_edges(
     table_entry,
     include_same_table_edges=False,
     encode_primary_keys_as_relations=False,
+    encode_primary_keys_as_edge_attributes=False,
 ):
-    if encode_primary_keys_as_relations and table_entry is None:
+    if encode_primary_keys_as_relations and encode_primary_keys_as_edge_attributes:
+        raise ValueError(
+            "Primary keys cannot be encoded as both replacement relations and edge attributes"
+        )
+    if (
+        encode_primary_keys_as_relations or encode_primary_keys_as_edge_attributes
+    ) and table_entry is None:
         raise ValueError(
             "Primary-key relation encoding requires the matching BIRD tables entry"
         )
     table_to_id, column_pair_to_id, columns_by_table = schema_indexes(schema_items)
     primary_key_ids = (
         primary_key_item_ids(table_entry, column_pair_to_id)
-        if encode_primary_keys_as_relations
+        if encode_primary_keys_as_relations or encode_primary_keys_as_edge_attributes
         else set()
     )
     edges = []
@@ -467,12 +476,32 @@ def schema_edges(
         table = item.get("table")
         table_id = table_to_id.get(table)
         if table_id is not None:
-            if int(item["id"]) in primary_key_ids:
+            is_primary_key = int(item["id"]) in primary_key_ids
+            if is_primary_key and encode_primary_keys_as_relations:
                 add_edge(edges, seen, table_id, item["id"], REL_TABLE_TO_PRIMARY_KEY)
                 add_edge(edges, seen, item["id"], table_id, REL_PRIMARY_KEY_TO_TABLE)
             else:
-                add_edge(edges, seen, table_id, item["id"], REL_TABLE_TO_COLUMN)
-                add_edge(edges, seen, item["id"], table_id, REL_COLUMN_TO_TABLE)
+                attributes = (
+                    {"is_primary_key_edge": True}
+                    if is_primary_key and encode_primary_keys_as_edge_attributes
+                    else {}
+                )
+                add_edge(
+                    edges,
+                    seen,
+                    table_id,
+                    item["id"],
+                    REL_TABLE_TO_COLUMN,
+                    **attributes,
+                )
+                add_edge(
+                    edges,
+                    seen,
+                    item["id"],
+                    table_id,
+                    REL_COLUMN_TO_TABLE,
+                    **attributes,
+                )
 
     if include_same_table_edges:
         for _, column_ids in columns_by_table.items():
@@ -499,6 +528,12 @@ def schema_edges(
                 continue
             add_edge(edges, seen, left_id, right_id, REL_FK_FORWARD)
             add_edge(edges, seen, right_id, left_id, REL_FK_BACKWARD)
+
+    if encode_primary_keys_as_edge_attributes:
+        for edge in edges:
+            edge["is_primary_key_edge"] = bool(
+                edge.get("is_primary_key_edge", False)
+            )
 
     return edges
 
@@ -536,6 +571,7 @@ def make_example(
     question_card=None,
     official_metadata=None,
     encode_primary_keys_as_relations=False,
+    encode_primary_keys_as_edge_attributes=False,
 ):
     nodes = schema_nodes(record["schema_items"], semantic_cards_by_id, official_metadata)
     edges = schema_edges(
@@ -543,6 +579,7 @@ def make_example(
         table_entry,
         include_same_table_edges,
         encode_primary_keys_as_relations,
+        encode_primary_keys_as_edge_attributes,
     )
     label_vector = grounding_vector(record)
     table_label_ids, column_label_ids = table_column_label_splits(record)
@@ -579,6 +616,9 @@ def make_example(
         "question_card_attached": bool(question_card),
         "official_metadata_attached": bool(official_metadata),
         "primary_key_relations_enabled": bool(encode_primary_keys_as_relations),
+        "primary_key_edge_attributes_enabled": bool(
+            encode_primary_keys_as_edge_attributes
+        ),
     }
     stable_id = record.get("question_id")
     if stable_id is None:
@@ -599,6 +639,7 @@ def build_split(
     question_cards=None,
     official_metadata_by_db=None,
     encode_primary_keys_as_relations=False,
+    encode_primary_keys_as_edge_attributes=False,
 ):
     semantic_cards_by_db = semantic_cards_by_db or {}
     examples = []
@@ -614,6 +655,7 @@ def build_split(
                 (question_cards or {}).get(question_card_key(record, index)) or (question_cards or {}).get(("idx", index)),
                 (official_metadata_by_db or {}).get(record["db_id"]),
                 encode_primary_keys_as_relations,
+                encode_primary_keys_as_edge_attributes,
             )
         )
     return examples
@@ -631,6 +673,7 @@ def summarize_examples(examples):
     leakage_violations = []
     semantic_node_counts = []
     question_card_count = 0
+    primary_key_edge_count = 0
 
     forbidden_inference_keys = {
         "sql",
@@ -661,6 +704,9 @@ def summarize_examples(examples):
             missing_question_ids += 1
         for edge in edges:
             relation_counter[edge["type"]] += 1
+            primary_key_edge_count += int(
+                edge.get("is_primary_key_edge") is True
+            )
         leaked = sorted(forbidden_inference_keys & set(inputs.keys()))
         if leaked:
             leakage_violations.append({"index": index, "keys": leaked})
@@ -686,6 +732,7 @@ def summarize_examples(examples):
         ),
         "question_card_attachment_rate": question_card_count / len(examples) if examples else 0,
         "edge_type_counts": dict(sorted(relation_counter.items())),
+        "primary_key_edge_count": primary_key_edge_count,
         "inference_target_leakage_violation_count": len(leakage_violations),
         "inference_target_leakage_examples": leakage_violations[:5],
     }
@@ -789,7 +836,23 @@ def main():
             "with table_to_primary_key/primary_key_to_table relations."
         ),
     )
+    parser.add_argument(
+        "--encode-primary-keys-as-edge-attributes",
+        action="store_true",
+        help=(
+            "Keep generic table-column ownership relations and mark direct primary-key "
+            "ownership edges for a learned residual modifier."
+        ),
+    )
     args = parser.parse_args()
+    if (
+        args.encode_primary_keys_as_relations
+        and args.encode_primary_keys_as_edge_attributes
+    ):
+        parser.error(
+            "--encode-primary-keys-as-relations and "
+            "--encode-primary-keys-as-edge-attributes are mutually exclusive"
+        )
 
     output_dir = Path(args.output_dir)
     train_records = read_jsonl(Path(args.train_labels), args.train_limit)
@@ -823,6 +886,7 @@ def main():
         train_question_cards,
         train_official_metadata,
         args.encode_primary_keys_as_relations,
+        args.encode_primary_keys_as_edge_attributes,
     )
     dev_examples = build_split(
         dev_records,
@@ -832,6 +896,7 @@ def main():
         dev_question_cards,
         dev_official_metadata,
         args.encode_primary_keys_as_relations,
+        args.encode_primary_keys_as_edge_attributes,
     )
 
     write_jsonl(output_dir / "train_examples.jsonl", train_examples)

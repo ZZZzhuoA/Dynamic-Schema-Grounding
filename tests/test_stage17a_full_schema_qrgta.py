@@ -497,6 +497,182 @@ class Stage17AModelTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "requires parent-table tensors"):
             TRAINING.forward_model(model, tensors_without_parent)
 
+    def test_pk_residual_model_preserves_generic_edges_and_uses_gated_delta(self):
+        torch = self.runtime["torch"]
+        example = self.aligned_example()
+        marked_edges = []
+        for edge in example["schema_edges"]:
+            row = dict(edge)
+            if (int(row["src"]), int(row["dst"])) in {(0, 1), (1, 0)}:
+                row["is_primary_key_edge"] = True
+            marked_edges.append(row)
+        example = {**example, "schema_edges": marked_edges}
+        relations = TRAINING.relation_mapping([example], [example])
+        args = self.path_args(
+            example,
+            relations,
+            model_type="pk_residual_table_competitive_path_qrgta",
+        )
+        tensors = TRAINING.example_to_tensors(
+            example, self.cache(), relations, args, self.runtime, "cpu"
+        )
+        self.assertNotIn("table_to_primary_key", relations)
+        self.assertNotIn("primary_key_to_table", relations)
+        directions = tensors["schema_primary_key_direction"]
+        self.assertEqual(int(directions.eq(TRAINING.PK_EDGE_TABLE_TO_PRIMARY_KEY).sum()), 1)
+        self.assertEqual(int(directions.eq(TRAINING.PK_EDGE_PRIMARY_KEY_TO_TABLE).sum()), 1)
+        self.assertTrue(torch.all(directions[6:] == TRAINING.PK_EDGE_NONE))
+
+        model = self.runtime["model"](
+            dense_dim=16,
+            relation_count=len(relations),
+            hidden_dim=16,
+            num_layers=1,
+            num_heads=4,
+            dropout=0.0,
+            model_type="pk_residual_table_competitive_path_qrgta",
+            distance_bucket_count=len(args.distance_buckets),
+            path_signature_count=len(args.path_signatures),
+            competition_hidden_dim=8,
+            competition_dropout=0.0,
+        )
+        model.eval()
+        with torch.no_grad():
+            initial = TRAINING.forward_model(model, tensors)["logits"]
+            zero_tensors = {**tensors, "zero_pk_modifier": True}
+            initial_zero = TRAINING.forward_model(model, zero_tensors)["logits"]
+        self.assertTrue(torch.equal(initial, initial_zero))
+
+        with torch.no_grad():
+            for layer in model.layers:
+                layer.primary_key_delta_key.weight[1:].fill_(0.2)
+                layer.primary_key_delta_value.weight[1:].fill_(0.3)
+                layer.primary_key_delta_bias.weight[1:].fill_(0.1)
+            modified = TRAINING.forward_model(model, tensors)["logits"]
+            disabled = TRAINING.forward_model(model, zero_tensors)["logits"]
+        self.assertFalse(torch.allclose(modified, disabled))
+
+        model.train()
+        output = TRAINING.forward_model(model, tensors)
+        loss = TRAINING.training_loss(output, tensors["labels"], args, self.runtime)
+        loss.backward()
+        delta_gradient = sum(
+            float(layer.primary_key_delta_value.weight.grad.abs().sum())
+            for layer in model.layers
+        )
+        self.assertGreater(delta_gradient, 0.0)
+
+    def test_zero_pk_modifier_preserves_all_structural_tensors(self):
+        torch = self.runtime["torch"]
+        example = self.aligned_example()
+        example = {
+            **example,
+            "schema_edges": [
+                {
+                    **edge,
+                    **(
+                        {"is_primary_key_edge": True}
+                        if (int(edge["src"]), int(edge["dst"])) in {(0, 1), (1, 0)}
+                        else {}
+                    ),
+                }
+                for edge in example["schema_edges"]
+            ],
+        }
+        relations = TRAINING.relation_mapping([example], [example])
+        normal = TRAINING.example_to_tensors(
+            example,
+            self.cache(),
+            relations,
+            self.path_args(
+                example,
+                relations,
+                model_type="pk_residual_table_competitive_path_qrgta",
+            ),
+            self.runtime,
+            "cpu",
+        )
+        zero = TRAINING.example_to_tensors(
+            example,
+            self.cache(),
+            relations,
+            self.path_args(
+                example,
+                relations,
+                control="zero_pk_modifier",
+                model_type="pk_residual_table_competitive_path_qrgta",
+            ),
+            self.runtime,
+            "cpu",
+        )
+        for key in (
+            "schema_edge_index",
+            "schema_edge_type",
+            "schema_distance_bucket",
+            "schema_path_signature",
+            "schema_primary_key_direction",
+            "dense_nodes",
+        ):
+            self.assertTrue(torch.equal(normal[key], zero[key]), key)
+        self.assertFalse(normal["zero_pk_modifier"])
+        self.assertTrue(zero["zero_pk_modifier"])
+
+    def test_zero_initialized_pk_residual_is_stage17e_equivalent_at_same_seed(self):
+        torch = self.runtime["torch"]
+        example = self.aligned_example()
+        example = {
+            **example,
+            "schema_edges": [
+                {
+                    **edge,
+                    **(
+                        {"is_primary_key_edge": True}
+                        if (int(edge["src"]), int(edge["dst"])) in {(0, 1), (1, 0)}
+                        else {"is_primary_key_edge": False}
+                    ),
+                }
+                for edge in example["schema_edges"]
+            ],
+        }
+        relations = TRAINING.relation_mapping([example], [example])
+        args = self.path_args(
+            example,
+            relations,
+            model_type="pk_residual_table_competitive_path_qrgta",
+        )
+        tensors = TRAINING.example_to_tensors(
+            example, self.cache(), relations, args, self.runtime, "cpu"
+        )
+        common = dict(
+            dense_dim=16,
+            relation_count=len(relations),
+            hidden_dim=16,
+            num_layers=3,
+            num_heads=4,
+            dropout=0.0,
+            distance_bucket_count=len(args.distance_buckets),
+            path_signature_count=len(args.path_signatures),
+            competition_hidden_dim=8,
+            competition_dropout=0.0,
+        )
+        torch.manual_seed(123)
+        baseline = self.runtime["model"](
+            **common, model_type="table_competitive_path_qrgta"
+        )
+        torch.manual_seed(123)
+        residual = self.runtime["model"](
+            **common, model_type="pk_residual_table_competitive_path_qrgta"
+        )
+        baseline.eval()
+        residual.eval()
+        residual_state = residual.state_dict()
+        for name, value in baseline.state_dict().items():
+            self.assertTrue(torch.equal(value, residual_state[name]), name)
+        with torch.no_grad():
+            baseline_logits = TRAINING.forward_model(baseline, tensors)["logits"]
+            residual_logits = TRAINING.forward_model(residual, tensors)["logits"]
+        self.assertTrue(torch.equal(baseline_logits, residual_logits))
+
     def test_table_competition_only_updates_column_nodes(self):
         torch = self.runtime["torch"]
         example = self.aligned_example()

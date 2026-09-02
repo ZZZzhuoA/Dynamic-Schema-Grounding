@@ -45,12 +45,16 @@ COMPETITION_CONTROL_MODES = (
 PRIMARY_KEY_CONTROL_MODES = (
     "downgrade_primary_key_edges",
 )
+PRIMARY_KEY_MODIFIER_CONTROL_MODES = (
+    "zero_pk_modifier",
+)
 ALL_CONTROL_MODES = (
     CONTROL_MODES
     + PATH_CONTROL_MODES
     + PERSISTENT_CONTROL_MODES
     + COMPETITION_CONTROL_MODES
     + PRIMARY_KEY_CONTROL_MODES
+    + PRIMARY_KEY_MODIFIER_CONTROL_MODES
 )
 PRIMARY_METRICS = (
     "complete_coverage@30",
@@ -190,6 +194,7 @@ def load_checkpoint_model(checkpoint_path, runtime, device):
         "persistent_path_qrgta",
         "table_competitive_path_qrgta",
         "enhanced_table_competitive_path_qrgta",
+        "pk_residual_table_competitive_path_qrgta",
     }:
         raise ValueError(
             "Checkpoint intervention requires a normal graph QRGTA checkpoint, got "
@@ -254,6 +259,7 @@ def main():
         "persistent_path_qrgta",
         "table_competitive_path_qrgta",
         "enhanced_table_competitive_path_qrgta",
+        "pk_residual_table_competitive_path_qrgta",
     }:
         default_modes.extend(PATH_CONTROL_MODES)
     if model_type == "persistent_path_qrgta":
@@ -261,6 +267,7 @@ def main():
     if model_type in {
         "table_competitive_path_qrgta",
         "enhanced_table_competitive_path_qrgta",
+        "pk_residual_table_competitive_path_qrgta",
     }:
         default_modes.extend(COMPETITION_CONTROL_MODES)
     graph_relations = {
@@ -272,6 +279,17 @@ def main():
     }.issubset(graph_relations)
     if has_primary_key_relations:
         default_modes.extend(PRIMARY_KEY_CONTROL_MODES)
+    has_primary_key_attributes = any(
+        edge.get("is_primary_key_edge") is True
+        for example in examples
+        for edge in example.get("schema_edges", [])
+    )
+    if model_type == "pk_residual_table_competitive_path_qrgta":
+        if not has_primary_key_attributes:
+            raise ValueError(
+                "PK-residual checkpoint evaluation requires is_primary_key_edge graph attributes"
+            )
+        default_modes.extend(PRIMARY_KEY_MODIFIER_CONTROL_MODES)
     modes_text = args.control_modes or ",".join(default_modes)
     modes = [value.strip() for value in modes_text.split(",") if value.strip()]
     unknown = sorted(set(modes) - set(ALL_CONTROL_MODES))
@@ -284,6 +302,7 @@ def main():
     if model_type not in {
         "table_competitive_path_qrgta",
         "enhanced_table_competitive_path_qrgta",
+        "pk_residual_table_competitive_path_qrgta",
     } and (
         set(modes) & set(COMPETITION_CONTROL_MODES)
     ):
@@ -300,6 +319,10 @@ def main():
         raise ValueError(
             "downgrade_primary_key_edges requires a graph with primary-key relations"
         )
+    if set(modes) & set(PRIMARY_KEY_MODIFIER_CONTROL_MODES) and model_type != (
+        "pk_residual_table_competitive_path_qrgta"
+    ):
+        raise ValueError("zero_pk_modifier requires a PK-residual checkpoint")
     missing_relations = sorted(graph_relations - set(relations))
     if missing_relations:
         raise ValueError(f"Checkpoint relation map misses graph relations: {missing_relations}")
@@ -432,6 +455,7 @@ def main():
             "zero_table_competition": "Keep path-aware graph propagation but skip table-scoped column competition.",
             "shuffle_column_parent_table": "Shuffle column-to-parent-table assignments while preserving node identity and graph/path edges.",
             "zero_competition_gates": "Compute table-scoped competition features but set competition write gates to zero.",
+            "zero_pk_modifier": "Keep generic ownership relations and PK edge markers but disable the learned PK key/value/bias residual.",
         },
     }
     write_json(output_dir / "intervention_summary.json", summary)

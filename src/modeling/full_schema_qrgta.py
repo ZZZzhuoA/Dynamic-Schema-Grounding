@@ -20,6 +20,7 @@ MODEL_TYPES = {
     "persistent_path_qrgta",
     "table_competitive_path_qrgta",
     "enhanced_table_competitive_path_qrgta",
+    "pk_residual_table_competitive_path_qrgta",
     "mlp",
     "mlp_residual",
 }
@@ -213,6 +214,8 @@ class PathAwareSparseQRGTAEncoderLayer(nn.Module):
         query_edge_similarity,
         query_distance_bucket,
         query_path_signature,
+        schema_primary_key_direction=None,
+        zero_pk_modifier=False,
     ):
         node_count = schema_states.shape[0]
         device = schema_states.device
@@ -259,6 +262,19 @@ class PathAwareSparseQRGTAEncoderLayer(nn.Module):
             relation_value = self.relation_value(relation).view(
                 -1, self.num_heads, self.head_dim
             )
+            modifier = self._primary_key_modifier(
+                source_states,
+                query_state,
+                source,
+                destination,
+                schema_primary_key_direction,
+                query_edge_destination,
+                zero_pk_modifier,
+            )
+            if modifier is not None:
+                key_delta, value_delta, bias_delta = modifier
+                relation_key = relation_key + key_delta
+                relation_value = relation_value + value_delta
             distance_key = self.distance_key(distance_bucket).view(
                 -1, self.num_heads, self.head_dim
             )
@@ -285,6 +301,8 @@ class PathAwareSparseQRGTAEncoderLayer(nn.Module):
 
             scores = ((query * (key + gated_key)).sum(dim=-1) / math.sqrt(self.head_dim))
             scores = scores + self.relation_bias(relation)
+            if modifier is not None:
+                scores = scores + bias_delta
             scores = scores + path_gate * (
                 self.distance_bias(distance_bucket) + self.path_bias(path_signature)
             )
@@ -310,6 +328,18 @@ class PathAwareSparseQRGTAEncoderLayer(nn.Module):
             schema_states + self.dropout(self.ffn(schema_states))
         )
         return schema_states
+
+    def _primary_key_modifier(
+        self,
+        source_states,
+        query_state,
+        source,
+        destination,
+        schema_primary_key_direction,
+        query_edge_destination,
+        zero_pk_modifier,
+    ):
+        return None
 
 
 class PersistentGatedPathAwareSparseQRGTAEncoderLayer(PathAwareSparseQRGTAEncoderLayer):
@@ -623,6 +653,8 @@ class TableScopedCompetitivePathQRGTAEncoderLayer(PathAwareSparseQRGTAEncoderLay
         is_column_node=None,
         zero_table_competition=False,
         zero_competition_gates=False,
+        schema_primary_key_direction=None,
+        zero_pk_modifier=False,
     ):
         schema_states = super().forward(
             schema_states,
@@ -637,6 +669,8 @@ class TableScopedCompetitivePathQRGTAEncoderLayer(PathAwareSparseQRGTAEncoderLay
             query_edge_similarity,
             query_distance_bucket,
             query_path_signature,
+            schema_primary_key_direction=schema_primary_key_direction,
+            zero_pk_modifier=zero_pk_modifier,
         )
         return self._table_scoped_competition(
             schema_states,
@@ -645,6 +679,123 @@ class TableScopedCompetitivePathQRGTAEncoderLayer(PathAwareSparseQRGTAEncoderLay
             is_column_node,
             zero_table_competition=zero_table_competition,
             zero_competition_gates=zero_competition_gates,
+        )
+
+
+class PrimaryKeyResidualTableScopedCompetitivePathQRGTAEncoderLayer(
+    TableScopedCompetitivePathQRGTAEncoderLayer
+):
+    """Table-competitive layer with query-gated residuals on direct PK ownership."""
+
+    PRIMARY_KEY_DIRECTION_COUNT = 3
+
+    def __init__(
+        self,
+        hidden_dim,
+        num_heads,
+        relation_count,
+        distance_bucket_count,
+        path_signature_count,
+        dropout,
+        competition_hidden_dim=128,
+        competition_dropout=0.1,
+    ):
+        super().__init__(
+            hidden_dim,
+            num_heads,
+            relation_count,
+            distance_bucket_count,
+            path_signature_count,
+            dropout,
+            competition_hidden_dim=competition_hidden_dim,
+            competition_dropout=competition_dropout,
+        )
+        # Keep the common Stage 17-E parameters identical under the same seed.
+        with torch.random.fork_rng(devices=[]):
+            self.primary_key_delta_key = nn.Embedding(
+                self.PRIMARY_KEY_DIRECTION_COUNT, hidden_dim
+            )
+            self.primary_key_delta_value = nn.Embedding(
+                self.PRIMARY_KEY_DIRECTION_COUNT, hidden_dim
+            )
+            self.primary_key_delta_bias = nn.Embedding(
+                self.PRIMARY_KEY_DIRECTION_COUNT, num_heads
+            )
+            self.primary_key_gate = nn.Sequential(
+                nn.Linear(hidden_dim * 5, hidden_dim),
+                nn.GELU(),
+                nn.Linear(hidden_dim, 1),
+            )
+        nn.init.zeros_(self.primary_key_delta_key.weight)
+        nn.init.zeros_(self.primary_key_delta_value.weight)
+        nn.init.zeros_(self.primary_key_delta_bias.weight)
+
+    def _primary_key_modifier(
+        self,
+        source_states,
+        query_state,
+        source,
+        destination,
+        schema_primary_key_direction,
+        query_edge_destination,
+        zero_pk_modifier,
+    ):
+        if schema_primary_key_direction is None:
+            raise ValueError(
+                "pk_residual_table_competitive_path_qrgta requires PK edge tensors"
+            )
+        query_directions = torch.zeros_like(query_edge_destination)
+        direction = torch.cat(
+            [schema_primary_key_direction, query_directions], dim=0
+        )
+        if direction.shape[0] != source.shape[0]:
+            raise ValueError("PK edge tensor must align with schema attention edges")
+        is_primary_key = direction.ne(0)
+        primary_key_indices = torch.nonzero(
+            is_primary_key, as_tuple=False
+        ).reshape(-1)
+        if primary_key_indices.numel() == 0:
+            return None
+        primary_key_source = source[primary_key_indices]
+        primary_key_destination = destination[primary_key_indices]
+        primary_key_direction = direction[primary_key_indices]
+        source_edge_states = source_states[primary_key_source]
+        destination_states = source_states[1:][primary_key_destination]
+        query_matrix = query_state.unsqueeze(0).expand_as(source_edge_states)
+        gate_input = torch.cat(
+            [
+                query_matrix,
+                source_edge_states,
+                destination_states,
+                source_edge_states * query_matrix,
+                destination_states * query_matrix,
+            ],
+            dim=-1,
+        )
+        gate = torch.sigmoid(self.primary_key_gate(gate_input))
+        if zero_pk_modifier:
+            gate = torch.zeros_like(gate)
+        gate_heads = gate.unsqueeze(-1)
+        key_delta = self.primary_key_delta_key(primary_key_direction).view(
+            -1, self.num_heads, self.head_dim
+        )
+        value_delta = self.primary_key_delta_value(primary_key_direction).view(
+            -1, self.num_heads, self.head_dim
+        )
+        bias_delta = self.primary_key_delta_bias(primary_key_direction)
+        full_key_delta = key_delta.new_zeros(
+            source.shape[0], self.num_heads, self.head_dim
+        ).index_copy_(0, primary_key_indices, gate_heads * key_delta)
+        full_value_delta = value_delta.new_zeros(
+            source.shape[0], self.num_heads, self.head_dim
+        ).index_copy_(0, primary_key_indices, gate_heads * value_delta)
+        full_bias_delta = bias_delta.new_zeros(
+            source.shape[0], self.num_heads
+        ).index_copy_(0, primary_key_indices, gate * bias_delta)
+        return (
+            full_key_delta,
+            full_value_delta,
+            full_bias_delta,
         )
 
 
@@ -908,6 +1059,17 @@ class FullSchemaQRGTA(nn.Module):
                 competition_temperature=competition_temperature,
                 competition_residual_scale=competition_residual_scale,
             )
+        elif model_type == "pk_residual_table_competitive_path_qrgta":
+            layer_cls = lambda: PrimaryKeyResidualTableScopedCompetitivePathQRGTAEncoderLayer(
+                hidden_dim,
+                num_heads,
+                relation_count,
+                distance_bucket_count,
+                path_signature_count,
+                dropout,
+                competition_hidden_dim=competition_hidden_dim,
+                competition_dropout=competition_dropout,
+            )
         else:
             layer_cls = None
         self.layers = nn.ModuleList(
@@ -948,9 +1110,11 @@ class FullSchemaQRGTA(nn.Module):
         schema_path_signature=None,
         query_distance_bucket=None,
         query_path_signature=None,
+        schema_primary_key_direction=None,
         zero_update_gates=False,
         zero_table_competition=False,
         zero_competition_gates=False,
+        zero_pk_modifier=False,
         column_parent_table=None,
         is_column_node=None,
         record_persistent_diagnostics=False,
@@ -970,6 +1134,7 @@ class FullSchemaQRGTA(nn.Module):
                 "persistent_path_qrgta",
                 "table_competitive_path_qrgta",
                 "enhanced_table_competitive_path_qrgta",
+                "pk_residual_table_competitive_path_qrgta",
             }:
                 if (
                     schema_distance_bucket is None
@@ -978,6 +1143,11 @@ class FullSchemaQRGTA(nn.Module):
                     or query_path_signature is None
                 ):
                     raise ValueError(f"{self.model_type} requires path and distance tensors")
+                if (
+                    self.model_type == "pk_residual_table_competitive_path_qrgta"
+                    and schema_primary_key_direction is None
+                ):
+                    raise ValueError(f"{self.model_type} requires PK edge tensors")
                 if self.model_type == "persistent_path_qrgta":
                     schema_states, layer_diagnostics = layer(
                         schema_states,
@@ -998,6 +1168,7 @@ class FullSchemaQRGTA(nn.Module):
                 elif self.model_type in {
                     "table_competitive_path_qrgta",
                     "enhanced_table_competitive_path_qrgta",
+                    "pk_residual_table_competitive_path_qrgta",
                 }:
                     if column_parent_table is None or is_column_node is None:
                         raise ValueError(
@@ -1016,6 +1187,8 @@ class FullSchemaQRGTA(nn.Module):
                         query_edge_similarity,
                         query_distance_bucket,
                         query_path_signature,
+                        schema_primary_key_direction=schema_primary_key_direction,
+                        zero_pk_modifier=zero_pk_modifier,
                         column_parent_table=column_parent_table,
                         is_column_node=is_column_node,
                         zero_table_competition=zero_table_competition,

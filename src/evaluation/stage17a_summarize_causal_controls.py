@@ -35,6 +35,7 @@ COMPETITION_CONTROL_MODES = (
 )
 PRIMARY_KEY_CONTROL_MODES = (
     "downgrade_primary_key_edges",
+    "zero_pk_modifier",
 )
 DATA_KEYS = (
     "train_graph_file",
@@ -305,6 +306,7 @@ def main():
                 "persistent_path_qrgta",
                 "table_competitive_path_qrgta",
                 "enhanced_table_competitive_path_qrgta",
+                "pk_residual_table_competitive_path_qrgta",
             },
             "normal",
         )
@@ -351,6 +353,7 @@ def main():
         in {
             "table_competitive_path_qrgta",
             "enhanced_table_competitive_path_qrgta",
+            "pk_residual_table_competitive_path_qrgta",
         }
         for run in normal.values()
     )
