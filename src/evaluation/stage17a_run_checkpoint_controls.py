@@ -42,11 +42,15 @@ COMPETITION_CONTROL_MODES = (
     "shuffle_column_parent_table",
     "zero_competition_gates",
 )
+PRIMARY_KEY_CONTROL_MODES = (
+    "downgrade_primary_key_edges",
+)
 ALL_CONTROL_MODES = (
     CONTROL_MODES
     + PATH_CONTROL_MODES
     + PERSISTENT_CONTROL_MODES
     + COMPETITION_CONTROL_MODES
+    + PRIMARY_KEY_CONTROL_MODES
 )
 PRIMARY_METRICS = (
     "complete_coverage@30",
@@ -259,6 +263,15 @@ def main():
         "enhanced_table_competitive_path_qrgta",
     }:
         default_modes.extend(COMPETITION_CONTROL_MODES)
+    graph_relations = {
+        str(edge["type"]) for example in examples for edge in example.get("schema_edges", [])
+    }
+    has_primary_key_relations = {
+        "table_to_primary_key",
+        "primary_key_to_table",
+    }.issubset(graph_relations)
+    if has_primary_key_relations:
+        default_modes.extend(PRIMARY_KEY_CONTROL_MODES)
     modes_text = args.control_modes or ",".join(default_modes)
     modes = [value.strip() for value in modes_text.split(",") if value.strip()]
     unknown = sorted(set(modes) - set(ALL_CONTROL_MODES))
@@ -283,9 +296,10 @@ def main():
             f"checkpoint={model_config['dense_dim']}"
         )
     relations = {str(key): int(value) for key, value in model_config["relations"].items()}
-    graph_relations = {
-        str(edge["type"]) for example in examples for edge in example.get("schema_edges", [])
-    }
+    if set(modes) & set(PRIMARY_KEY_CONTROL_MODES) and not has_primary_key_relations:
+        raise ValueError(
+            "downgrade_primary_key_edges requires a graph with primary-key relations"
+        )
     missing_relations = sorted(graph_relations - set(relations))
     if missing_relations:
         raise ValueError(f"Checkpoint relation map misses graph relations: {missing_relations}")

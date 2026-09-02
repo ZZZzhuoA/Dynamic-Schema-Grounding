@@ -152,7 +152,21 @@ def node_table_name(node):
 
 
 def build_node_maps(nodes, edges):
-    node_by_id = {int(node["id"]): node for node in nodes}
+    primary_key_ids = set()
+    for edge in edges:
+        relation = str(edge.get("type"))
+        if relation == "table_to_primary_key":
+            primary_key_ids.add(int(edge["dst"]))
+        elif relation == "primary_key_to_table":
+            primary_key_ids.add(int(edge["src"]))
+    node_by_id = {
+        int(node["id"]): (
+            {**node, "is_primary_key": True}
+            if int(node["id"]) in primary_key_ids
+            else node
+        )
+        for node in nodes
+    }
     table_id_by_name = {
         str(node.get("name")): int(node["id"])
         for node in nodes

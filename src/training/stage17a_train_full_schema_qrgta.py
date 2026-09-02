@@ -20,6 +20,12 @@ TOP_K_VALUES = (10, 20, 30, 50)
 NEUTRAL_PATH_SIGNATURE = "NEUTRAL"
 DISTANCE_SELF = "self"
 DISTANCE_QUERY = "query_edge"
+REL_TABLE_TO_PRIMARY_KEY = "table_to_primary_key"
+REL_PRIMARY_KEY_TO_TABLE = "primary_key_to_table"
+PRIMARY_KEY_RELATION_DOWNGRADES = {
+    REL_TABLE_TO_PRIMARY_KEY: "table_to_column",
+    REL_PRIMARY_KEY_TO_TABLE: "column_to_table",
+}
 PATH_CONTROL_MODES = {
     "shuffled_distance_buckets",
     "shuffled_path_signatures",
@@ -476,6 +482,20 @@ def deterministic_permutation(count, seed, runtime):
     return torch.randperm(count, generator=generator)
 
 
+def downgrade_primary_key_edges(example):
+    output = dict(example)
+    output["schema_edges"] = [
+        {
+            **edge,
+            "type": PRIMARY_KEY_RELATION_DOWNGRADES.get(
+                str(edge.get("type")), str(edge.get("type"))
+            ),
+        }
+        for edge in example.get("schema_edges", [])
+    ]
+    return output
+
+
 def schema_edge_tensors(example, relations, control_mode, seed, runtime, device):
     torch = runtime["torch"]
     nodes = example["nodes"]
@@ -492,7 +512,12 @@ def schema_edge_tensors(example, relations, control_mode, seed, runtime, device)
             )
         sources.append(id_to_local[src])
         destinations.append(id_to_local[dst])
-        types.append(relations[str(edge["type"])])
+        relation_name = str(edge["type"])
+        if control_mode == "downgrade_primary_key_edges":
+            relation_name = PRIMARY_KEY_RELATION_DOWNGRADES.get(
+                relation_name, relation_name
+            )
+        types.append(relations[relation_name])
     if control_mode == "shuffled_schema_edges" and sources:
         grouped = defaultdict(list)
         self_loop_id = relations.get("self_loop")
@@ -584,7 +609,9 @@ def path_aware_schema_edge_tensors(
 ):
     torch = runtime["torch"]
     path_example = example
-    if control_mode == "shuffled_schema_edges":
+    if control_mode == "downgrade_primary_key_edges":
+        path_example = downgrade_primary_key_edges(example)
+    elif control_mode == "shuffled_schema_edges":
         path_example = dict(example)
         path_example["schema_edges"] = shuffled_schema_edges_for_control(
             example, relations, seed, runtime
@@ -1201,6 +1228,7 @@ def main():
             "zero_table_competition",
             "shuffle_column_parent_table",
             "zero_competition_gates",
+            "downgrade_primary_key_edges",
         ],
         default="normal",
     )
@@ -1294,6 +1322,22 @@ def main():
         "dropout": args.dropout,
         "model_type": args.model_type,
         "relations": relations,
+        "primary_key_relation_encoding": (
+            "typed_table_column_ownership"
+            if {
+                REL_TABLE_TO_PRIMARY_KEY,
+                REL_PRIMARY_KEY_TO_TABLE,
+            }.issubset(relations)
+            else None
+        ),
+        "primary_key_relation_types": (
+            [REL_TABLE_TO_PRIMARY_KEY, REL_PRIMARY_KEY_TO_TABLE]
+            if {
+                REL_TABLE_TO_PRIMARY_KEY,
+                REL_PRIMARY_KEY_TO_TABLE,
+            }.issubset(relations)
+            else []
+        ),
         "distance_bucket_mapping": distance_buckets,
         "path_type_mapping": path_signatures,
         "role_mapping": roles,
@@ -1344,6 +1388,7 @@ def main():
             "zero_table_competition": "Keep path-aware graph propagation but skip table-scoped column competition.",
             "shuffle_column_parent_table": "Shuffle column-to-parent-table assignments while preserving node identity and graph/path edges.",
             "zero_competition_gates": "Compute table-scoped competition features but set competition write gates to zero.",
+            "downgrade_primary_key_edges": "Replace primary-key ownership relations with generic table-column ownership relations while preserving edge indices and node identity.",
         },
     }
     output_dir = Path(args.output_dir)

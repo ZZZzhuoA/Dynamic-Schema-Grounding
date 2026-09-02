@@ -10,6 +10,8 @@ from pathlib import Path
 REL_SELF_LOOP = "self_loop"
 REL_TABLE_TO_COLUMN = "table_to_column"
 REL_COLUMN_TO_TABLE = "column_to_table"
+REL_TABLE_TO_PRIMARY_KEY = "table_to_primary_key"
+REL_PRIMARY_KEY_TO_TABLE = "primary_key_to_table"
 REL_FK_FORWARD = "foreign_key_forward"
 REL_FK_BACKWARD = "foreign_key_backward"
 REL_SAME_TABLE = "same_table_column"
@@ -410,8 +412,51 @@ def add_edge(edges, seen, src, dst, edge_type):
     edges.append({"src": int(src), "dst": int(dst), "type": edge_type})
 
 
-def schema_edges(schema_items, table_entry, include_same_table_edges=False):
+def primary_key_item_ids(table_entry, column_pair_to_id):
+    if not table_entry:
+        return set()
+    tables = table_entry.get("table_names_original", [])
+    columns = table_entry.get("column_names_original", [])
+    item_ids = set()
+    for column_index in sorted(flatten_primary_keys(table_entry.get("primary_keys", []))):
+        if column_index < 0 or column_index >= len(columns):
+            raise ValueError(
+                f"Primary key index out of range for db={table_entry.get('db_id')}: "
+                f"index={column_index} column_count={len(columns)}"
+            )
+        table_index, column_name = columns[column_index]
+        if table_index < 0 or table_index >= len(tables):
+            raise ValueError(
+                f"Primary key references invalid table for db={table_entry.get('db_id')}: "
+                f"column_index={column_index} table_index={table_index}"
+            )
+        pair = (tables[table_index], column_name)
+        item_id = column_pair_to_id.get(pair)
+        if item_id is None:
+            raise ValueError(
+                f"Primary key column is absent from schema items for "
+                f"db={table_entry.get('db_id')}: {pair}"
+            )
+        item_ids.add(int(item_id))
+    return item_ids
+
+
+def schema_edges(
+    schema_items,
+    table_entry,
+    include_same_table_edges=False,
+    encode_primary_keys_as_relations=False,
+):
+    if encode_primary_keys_as_relations and table_entry is None:
+        raise ValueError(
+            "Primary-key relation encoding requires the matching BIRD tables entry"
+        )
     table_to_id, column_pair_to_id, columns_by_table = schema_indexes(schema_items)
+    primary_key_ids = (
+        primary_key_item_ids(table_entry, column_pair_to_id)
+        if encode_primary_keys_as_relations
+        else set()
+    )
     edges = []
     seen = set()
 
@@ -422,8 +467,12 @@ def schema_edges(schema_items, table_entry, include_same_table_edges=False):
         table = item.get("table")
         table_id = table_to_id.get(table)
         if table_id is not None:
-            add_edge(edges, seen, table_id, item["id"], REL_TABLE_TO_COLUMN)
-            add_edge(edges, seen, item["id"], table_id, REL_COLUMN_TO_TABLE)
+            if int(item["id"]) in primary_key_ids:
+                add_edge(edges, seen, table_id, item["id"], REL_TABLE_TO_PRIMARY_KEY)
+                add_edge(edges, seen, item["id"], table_id, REL_PRIMARY_KEY_TO_TABLE)
+            else:
+                add_edge(edges, seen, table_id, item["id"], REL_TABLE_TO_COLUMN)
+                add_edge(edges, seen, item["id"], table_id, REL_COLUMN_TO_TABLE)
 
     if include_same_table_edges:
         for _, column_ids in columns_by_table.items():
@@ -486,9 +535,15 @@ def make_example(
     semantic_cards_by_id=None,
     question_card=None,
     official_metadata=None,
+    encode_primary_keys_as_relations=False,
 ):
     nodes = schema_nodes(record["schema_items"], semantic_cards_by_id, official_metadata)
-    edges = schema_edges(record["schema_items"], table_entry, include_same_table_edges)
+    edges = schema_edges(
+        record["schema_items"],
+        table_entry,
+        include_same_table_edges,
+        encode_primary_keys_as_relations,
+    )
     label_vector = grounding_vector(record)
     table_label_ids, column_label_ids = table_column_label_splits(record)
 
@@ -523,6 +578,7 @@ def make_example(
         "schema_semantic_cards_attached": bool(semantic_cards_by_id),
         "question_card_attached": bool(question_card),
         "official_metadata_attached": bool(official_metadata),
+        "primary_key_relations_enabled": bool(encode_primary_keys_as_relations),
     }
     stable_id = record.get("question_id")
     if stable_id is None:
@@ -542,6 +598,7 @@ def build_split(
     semantic_cards_by_db=None,
     question_cards=None,
     official_metadata_by_db=None,
+    encode_primary_keys_as_relations=False,
 ):
     semantic_cards_by_db = semantic_cards_by_db or {}
     examples = []
@@ -556,6 +613,7 @@ def build_split(
                 semantic_cards_by_db.get(record["db_id"], {}),
                 (question_cards or {}).get(question_card_key(record, index)) or (question_cards or {}).get(("idx", index)),
                 (official_metadata_by_db or {}).get(record["db_id"]),
+                encode_primary_keys_as_relations,
             )
         )
     return examples
@@ -723,6 +781,14 @@ def main():
     parser.add_argument("--train-limit", type=int, default=None)
     parser.add_argument("--dev-limit", type=int, default=None)
     parser.add_argument("--include-same-table-edges", action="store_true")
+    parser.add_argument(
+        "--encode-primary-keys-as-relations",
+        action="store_true",
+        help=(
+            "Replace generic table-column ownership edges for primary-key columns "
+            "with table_to_primary_key/primary_key_to_table relations."
+        ),
+    )
     args = parser.parse_args()
 
     output_dir = Path(args.output_dir)
@@ -756,6 +822,7 @@ def main():
         train_semantic_cards,
         train_question_cards,
         train_official_metadata,
+        args.encode_primary_keys_as_relations,
     )
     dev_examples = build_split(
         dev_records,
@@ -764,6 +831,7 @@ def main():
         dev_semantic_cards,
         dev_question_cards,
         dev_official_metadata,
+        args.encode_primary_keys_as_relations,
     )
 
     write_jsonl(output_dir / "train_examples.jsonl", train_examples)

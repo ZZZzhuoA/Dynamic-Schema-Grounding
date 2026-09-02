@@ -42,6 +42,86 @@ def table_entry():
 
 
 class Stage17FOfficialMetadataTest(unittest.TestCase):
+    def test_primary_keys_replace_generic_ownership_relations_without_node_text_changes(self):
+        schema_items = [
+            {"id": 0, "type": "table", "name": "Schools"},
+            {"id": 1, "type": "table", "name": "Districts"},
+            {
+                "id": 2,
+                "type": "column",
+                "name": "Schools.School_ID",
+                "table": "Schools",
+                "column": "School_ID",
+                "data_type": "number",
+            },
+            {
+                "id": 3,
+                "type": "column",
+                "name": "Schools.Name",
+                "table": "Schools",
+                "column": "Name",
+                "data_type": "text",
+            },
+            {
+                "id": 4,
+                "type": "column",
+                "name": "Districts.District_ID",
+                "table": "Districts",
+                "column": "District_ID",
+                "data_type": "number",
+            },
+        ]
+        generic = GRAPH.schema_edges(schema_items, table_entry())
+        typed = GRAPH.schema_edges(
+            schema_items,
+            table_entry(),
+            encode_primary_keys_as_relations=True,
+        )
+        self.assertEqual(len(generic), len(typed))
+        typed_rows = {(row["src"], row["dst"], row["type"]) for row in typed}
+        self.assertIn((0, 2, "table_to_primary_key"), typed_rows)
+        self.assertIn((2, 0, "primary_key_to_table"), typed_rows)
+        self.assertIn((1, 4, "table_to_primary_key"), typed_rows)
+        self.assertIn((4, 1, "primary_key_to_table"), typed_rows)
+        self.assertIn((0, 3, "table_to_column"), typed_rows)
+        self.assertNotIn((0, 2, "table_to_column"), typed_rows)
+        nodes = GRAPH.schema_nodes(schema_items)
+        self.assertTrue(all("is_primary_key" not in node for node in nodes))
+        self.assertEqual(
+            EMBED.node_embedding_text(nodes[2]),
+            "schema item: Schools.School_ID | type: column | table: Schools | "
+            "column: School_ID | data type: number",
+        )
+
+    def test_primary_key_relation_encoding_requires_valid_table_schema(self):
+        with self.assertRaisesRegex(ValueError, "requires the matching BIRD tables entry"):
+            GRAPH.schema_edges([], None, encode_primary_keys_as_relations=True)
+        broken = table_entry()
+        broken["primary_keys"] = [99]
+        with self.assertRaisesRegex(ValueError, "Primary key index out of range"):
+            GRAPH.schema_edges(
+                [], broken, encode_primary_keys_as_relations=True
+            )
+
+    def test_diagnosis_infers_primary_key_identity_from_typed_edges(self):
+        nodes = [
+            {"id": 0, "type": "table", "name": "Schools"},
+            {
+                "id": 1,
+                "type": "column",
+                "name": "Schools.School_ID",
+                "table": "Schools",
+                "column": "School_ID",
+            },
+        ]
+        edges = [
+            {"src": 0, "dst": 1, "type": "table_to_primary_key"},
+            {"src": 1, "dst": 0, "type": "primary_key_to_table"},
+        ]
+        node_by_id, _, _ = DIAGNOSIS.build_node_maps(nodes, edges)
+        self.assertTrue(node_by_id[1]["is_primary_key"])
+        self.assertNotIn("is_primary_key", nodes[1])
+
     def test_pk_fk_endpoint_and_direction_mapping(self):
         metadata = GRAPH.authoritative_schema_metadata(table_entry())
         school_id = metadata[("schools", "school_id")]

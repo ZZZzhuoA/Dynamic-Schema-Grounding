@@ -33,6 +33,9 @@ COMPETITION_CONTROL_MODES = (
     "shuffle_column_parent_table",
     "zero_competition_gates",
 )
+PRIMARY_KEY_CONTROL_MODES = (
+    "downgrade_primary_key_edges",
+)
 DATA_KEYS = (
     "train_graph_file",
     "dev_graph_file",
@@ -234,6 +237,7 @@ def load_interventions(paths, normal):
                     + PATH_CONTROL_MODES
                     + PERSISTENT_CONTROL_MODES
                     + COMPETITION_CONTROL_MODES
+                    + PRIMARY_KEY_CONTROL_MODES
                 )
                 if mode in summary["metrics"]
             },
@@ -319,6 +323,7 @@ def main():
         | set(PATH_CONTROL_MODES)
         | set(PERSISTENT_CONTROL_MODES)
         | set(COMPETITION_CONTROL_MODES)
+        | set(PRIMARY_KEY_CONTROL_MODES)
     )
     unknown_retrained = sorted(set(retrained_paths) - known_retrained_modes)
     if unknown_retrained:
@@ -377,6 +382,14 @@ def main():
     competition_control_deltas = intervention_deltas(
         normal, interventions, tuple(available_competition_controls)
     ) if available_competition_controls else {}
+    available_primary_key_controls = [
+        mode
+        for mode in PRIMARY_KEY_CONTROL_MODES
+        if all(mode in interventions[seed]["metrics"] for seed in normal)
+    ]
+    primary_key_control_deltas = intervention_deltas(
+        normal, interventions, tuple(available_primary_key_controls)
+    ) if available_primary_key_controls else {}
     complete_drops = {
         mode: control_deltas[mode]["complete_coverage@30"]["mean"]
         for mode in CONTROL_MODES
@@ -456,6 +469,7 @@ def main():
         "path_checkpoint_interventions_normal_minus_control": path_control_deltas,
         "persistent_checkpoint_interventions_normal_minus_control": persistent_control_deltas,
         "competition_checkpoint_interventions_normal_minus_control": competition_control_deltas,
+        "primary_key_checkpoint_interventions_normal_minus_control": primary_key_control_deltas,
         "persistent_diagnostics": persistent_diagnostics,
         "retrained_seed42_controls": retrained,
         "decision_checks": checks,

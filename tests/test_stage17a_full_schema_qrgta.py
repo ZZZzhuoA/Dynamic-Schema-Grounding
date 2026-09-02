@@ -279,6 +279,48 @@ class Stage17AModelTest(unittest.TestCase):
         ]
         self.assertEqual(normal_loops, shuffled_loops)
 
+    def test_primary_key_downgrade_preserves_topology_and_removes_typed_relations(self):
+        torch = self.runtime["torch"]
+        example = self.aligned_example()
+        typed_edges = []
+        for edge in example["schema_edges"]:
+            row = dict(edge)
+            if int(row["src"]) == 0 and int(row["dst"]) == 1:
+                row["type"] = "table_to_primary_key"
+            elif int(row["src"]) == 1 and int(row["dst"]) == 0:
+                row["type"] = "primary_key_to_table"
+            typed_edges.append(row)
+        example = {**example, "schema_edges": typed_edges}
+        relations = TRAINING.relation_mapping([example], [example])
+        normal_args = self.path_args(example, relations)
+        control_args = self.path_args(
+            example, relations, control="downgrade_primary_key_edges"
+        )
+        normal = TRAINING.example_to_tensors(
+            example, self.cache(), relations, normal_args, self.runtime, "cpu"
+        )
+        downgraded = TRAINING.example_to_tensors(
+            example, self.cache(), relations, control_args, self.runtime, "cpu"
+        )
+        self.assertTrue(
+            torch.equal(normal["schema_edge_index"], downgraded["schema_edge_index"])
+        )
+        self.assertEqual(
+            normal["path_stats"]["total_attention_edge_count"],
+            downgraded["path_stats"]["total_attention_edge_count"],
+        )
+        typed_ids = {
+            relations["table_to_primary_key"],
+            relations["primary_key_to_table"],
+        }
+        self.assertTrue(any(value in typed_ids for value in normal["schema_edge_type"].tolist()))
+        self.assertFalse(
+            any(value in typed_ids for value in downgraded["schema_edge_type"].tolist())
+        )
+        self.assertFalse(
+            torch.equal(normal["schema_path_signature"], downgraded["schema_path_signature"])
+        )
+
     def test_shuffled_node_identity_stays_within_schema_type(self):
         example = self.aligned_example()
         relations = TRAINING.relation_mapping([example], [example])
