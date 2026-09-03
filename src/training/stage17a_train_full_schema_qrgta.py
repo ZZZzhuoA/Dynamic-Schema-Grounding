@@ -1054,13 +1054,35 @@ def evaluate(model, examples, cache, relations, args, runtime, device, split, pr
     rows = []
     path_stats = defaultdict(list)
     persistent_stats = defaultdict(list)
+    table_auxiliary_stats = defaultdict(list)
+    table_eligible_count = 0
+    table_pair_count = 0
     with torch.no_grad():
         for example in examples:
             tensors = example_to_tensors(example, cache, relations, args, runtime, device)
             output = forward_model(model, tensors)
             args._current_role_labels = tensors.get("role_labels")
-            losses.append(float(training_loss(output, tensors["labels"], args, runtime).cpu()))
+            loss, table_diagnostics = training_loss(
+                output,
+                tensors["labels"],
+                args,
+                runtime,
+                column_parent_table=tensors.get("column_parent_table"),
+                is_column_node=tensors.get("is_column_node"),
+                return_diagnostics=True,
+            )
+            losses.append(float(loss.cpu()))
             args._current_role_labels = None
+            if table_diagnostics is not None:
+                table_eligible_count += int(table_diagnostics["eligible_table_count"])
+                table_pair_count += int(table_diagnostics["pair_count"])
+                table_auxiliary_stats["auxiliary_loss"].append(
+                    float(table_diagnostics["auxiliary_loss"].cpu())
+                )
+                if int(table_diagnostics["eligible_table_count"]) > 0:
+                    table_auxiliary_stats["boundary_gap"].append(
+                        float(table_diagnostics["boundary_gap"].cpu())
+                    )
             for key, value in tensors.get("path_stats", {}).items():
                 path_stats[key].append(float(value))
             for key, value in output.get("persistent_diagnostics", {}).items():
@@ -1110,6 +1132,13 @@ def evaluate(model, examples, cache, relations, args, runtime, device, split, pr
         metrics["persistent_diagnostics"] = {
             key: _mean(values) for key, values in sorted(persistent_stats.items())
         }
+    if float(getattr(args, "table_multi_positive_weight", 0.0)) > 0:
+        metrics["table_multi_positive_diagnostics"] = {
+            "eligible_table_count": table_eligible_count,
+            "pair_count": table_pair_count,
+            "avg_auxiliary_loss": _mean(table_auxiliary_stats["auxiliary_loss"]),
+            "avg_boundary_gap": _mean(table_auxiliary_stats["boundary_gap"]),
+        }
     return metrics, rows
 
 
@@ -1158,7 +1187,93 @@ def balanced_multilabel_loss(logits, labels, runtime):
     return positive_loss
 
 
-def training_loss(output, labels, args, runtime):
+def table_multi_positive_boundary_loss(
+    logits,
+    labels,
+    column_parent_table,
+    is_column_node,
+    runtime,
+    margin=0.1,
+    hard_negatives=5,
+):
+    """Separate every gold column from hard non-gold siblings, normalized by table."""
+    torch = runtime["torch"]
+    F = runtime["F"]
+    zero = logits.sum() * 0.0
+    if column_parent_table is None or is_column_node is None:
+        return zero, {
+            "eligible_table_count": 0,
+            "pair_count": 0,
+            "boundary_gap": zero.detach(),
+        }
+    hard_negative_count = int(hard_negatives)
+    if hard_negative_count <= 0:
+        raise ValueError("table_multi_positive_hard_negatives must be > 0")
+    valid_columns = is_column_node & column_parent_table.ge(0)
+    gold_columns = valid_columns & labels.gt(0.5)
+    if not bool(gold_columns.any()):
+        return zero, {
+            "eligible_table_count": 0,
+            "pair_count": 0,
+            "boundary_gap": zero.detach(),
+        }
+
+    table_losses = []
+    boundary_gaps = []
+    pair_count = 0
+    parent_ids = torch.unique(column_parent_table[gold_columns], sorted=True)
+    for parent_id in parent_ids:
+        siblings = valid_columns & column_parent_table.eq(parent_id)
+        positive_indices = torch.nonzero(
+            siblings & labels.gt(0.5), as_tuple=False
+        ).reshape(-1)
+        negative_indices = torch.nonzero(
+            siblings & labels.le(0.5), as_tuple=False
+        ).reshape(-1)
+        if positive_indices.numel() == 0 or negative_indices.numel() == 0:
+            continue
+        negative_logits = logits[negative_indices]
+        order = torch.argsort(
+            negative_logits.detach(), descending=True, stable=True
+        )
+        selected_negative_indices = negative_indices[
+            order[: min(hard_negative_count, int(order.numel()))]
+        ]
+        positive_logits = logits[positive_indices]
+        selected_negative_logits = logits[selected_negative_indices]
+        pair_losses = F.softplus(
+            selected_negative_logits.unsqueeze(1)
+            - positive_logits.unsqueeze(0)
+            + float(margin)
+        )
+        table_losses.append(pair_losses.mean())
+        boundary_gaps.append(
+            positive_logits.min() - selected_negative_logits.max()
+        )
+        pair_count += int(pair_losses.numel())
+
+    if not table_losses:
+        return zero, {
+            "eligible_table_count": 0,
+            "pair_count": 0,
+            "boundary_gap": zero.detach(),
+        }
+    return torch.stack(table_losses).mean(), {
+        "eligible_table_count": len(table_losses),
+        "pair_count": pair_count,
+        "boundary_gap": torch.stack(boundary_gaps).mean().detach(),
+    }
+
+
+def training_loss(
+    output,
+    labels,
+    args,
+    runtime,
+    column_parent_table=None,
+    is_column_node=None,
+    return_diagnostics=False,
+):
     loss = runtime["loss"](output["logits"], labels)
     role_weight = float(getattr(args, "role_loss_weight", 0.0))
     role_labels = getattr(args, "_current_role_labels", None)
@@ -1171,16 +1286,33 @@ def training_loss(output, labels, args, runtime):
         loss = loss + role_weight * balanced_multilabel_loss(
             output["role_logits"], role_labels, runtime
         )
-    weight = float(getattr(args, "coverage_surrogate_weight", 0.0))
-    if weight <= 0:
-        return loss
-    coverage_gap = complete_coverage_surrogate_gap(
-        output["logits"],
-        labels,
-        target_k=getattr(args, "coverage_target_k", 30),
-        margin=getattr(args, "coverage_margin", 0.1),
-    )
-    return loss + weight * runtime["F"].softplus(coverage_gap)
+    coverage_weight = float(getattr(args, "coverage_surrogate_weight", 0.0))
+    if coverage_weight > 0:
+        coverage_gap = complete_coverage_surrogate_gap(
+            output["logits"],
+            labels,
+            target_k=getattr(args, "coverage_target_k", 30),
+            margin=getattr(args, "coverage_margin", 0.1),
+        )
+        loss = loss + coverage_weight * runtime["F"].softplus(coverage_gap)
+
+    diagnostics = None
+    table_weight = float(getattr(args, "table_multi_positive_weight", 0.0))
+    if table_weight > 0:
+        table_loss, diagnostics = table_multi_positive_boundary_loss(
+            output["logits"],
+            labels,
+            column_parent_table,
+            is_column_node,
+            runtime,
+            margin=getattr(args, "table_multi_positive_margin", 0.1),
+            hard_negatives=getattr(args, "table_multi_positive_hard_negatives", 5),
+        )
+        diagnostics = {**diagnostics, "auxiliary_loss": table_loss.detach()}
+        loss = loss + table_weight * table_loss
+    if return_diagnostics:
+        return loss, diagnostics
+    return loss
 
 
 def train_epoch(model, examples, cache, relations, args, runtime, device, optimizer, epoch):
@@ -1190,20 +1322,55 @@ def train_epoch(model, examples, cache, relations, args, runtime, device, optimi
     accumulation = max(int(args.gradient_accumulation_steps), 1)
     optimizer.zero_grad(set_to_none=True)
     losses = []
+    table_auxiliary_stats = defaultdict(list)
+    table_eligible_count = 0
+    table_pair_count = 0
     for position, example in enumerate(shuffled, start=1):
         tensors = example_to_tensors(example, cache, relations, args, runtime, device)
         output = forward_model(model, tensors)
         args._current_role_labels = tensors.get("role_labels")
-        loss = training_loss(output, tensors["labels"], args, runtime)
+        loss, table_diagnostics = training_loss(
+            output,
+            tensors["labels"],
+            args,
+            runtime,
+            column_parent_table=tensors.get("column_parent_table"),
+            is_column_node=tensors.get("is_column_node"),
+            return_diagnostics=True,
+        )
         args._current_role_labels = None
         (loss / accumulation).backward()
         losses.append(float(loss.detach().cpu()))
+        if table_diagnostics is not None:
+            table_eligible_count += int(table_diagnostics["eligible_table_count"])
+            table_pair_count += int(table_diagnostics["pair_count"])
+            table_auxiliary_stats["auxiliary_loss"].append(
+                float(table_diagnostics["auxiliary_loss"].cpu())
+            )
+            if int(table_diagnostics["eligible_table_count"]) > 0:
+                table_auxiliary_stats["boundary_gap"].append(
+                    float(table_diagnostics["boundary_gap"].cpu())
+                )
         if position % accumulation == 0 or position == len(shuffled):
             if args.max_grad_norm > 0:
                 runtime["torch"].nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
             optimizer.step()
             optimizer.zero_grad(set_to_none=True)
-    return {"train_loss": _mean(losses), "train_sample_count": len(shuffled)}
+    metrics = {"train_loss": _mean(losses), "train_sample_count": len(shuffled)}
+    if float(getattr(args, "table_multi_positive_weight", 0.0)) > 0:
+        metrics.update(
+            {
+                "train_table_multi_positive_eligible_table_count": table_eligible_count,
+                "train_table_multi_positive_pair_count": table_pair_count,
+                "train_table_multi_positive_loss": _mean(
+                    table_auxiliary_stats["auxiliary_loss"]
+                ),
+                "train_table_multi_positive_boundary_gap": _mean(
+                    table_auxiliary_stats["boundary_gap"]
+                ),
+            }
+        )
+    return metrics
 
 
 def cpu_state_dict(model):
@@ -1289,6 +1456,9 @@ def main():
     parser.add_argument("--coverage-surrogate-weight", type=float, default=0.1)
     parser.add_argument("--coverage-margin", type=float, default=0.1)
     parser.add_argument("--coverage-target-k", type=int, default=30)
+    parser.add_argument("--table-multi-positive-weight", type=float, default=0.0)
+    parser.add_argument("--table-multi-positive-margin", type=float, default=0.1)
+    parser.add_argument("--table-multi-positive-hard-negatives", type=int, default=5)
     parser.add_argument("--role-loss-weight", type=float, default=0.0)
     parser.add_argument(
         "--record-persistent-diagnostics",
@@ -1320,6 +1490,18 @@ def main():
         )
     if args.competition_temperature <= 0.0:
         raise ValueError("--competition-temperature must be > 0")
+    if args.table_multi_positive_weight < 0.0:
+        raise ValueError("--table-multi-positive-weight must be >= 0")
+    if args.table_multi_positive_hard_negatives <= 0:
+        raise ValueError("--table-multi-positive-hard-negatives must be > 0")
+    if (
+        args.table_multi_positive_weight > 0.0
+        and args.model_type != "table_competitive_path_qrgta"
+    ):
+        raise ValueError(
+            "--table-multi-positive-weight > 0 requires the original "
+            "table_competitive_path_qrgta backbone"
+        )
 
     runtime = import_runtime()
     torch = runtime["torch"]
@@ -1449,6 +1631,16 @@ def main():
         "coverage_surrogate_weight": args.coverage_surrogate_weight,
         "coverage_margin": args.coverage_margin,
         "coverage_target_k": args.coverage_target_k,
+        "table_multi_positive_weight": args.table_multi_positive_weight,
+        "table_multi_positive_margin": args.table_multi_positive_margin,
+        "table_multi_positive_hard_negatives": (
+            args.table_multi_positive_hard_negatives
+        ),
+        "table_multi_positive_normalization": (
+            "mean_pairs_per_table_then_mean_tables_per_sample"
+            if args.table_multi_positive_weight > 0.0
+            else None
+        ),
         "competition_scope": (
             "column_within_table"
             if args.model_type in COMPETITION_MODEL_TYPES

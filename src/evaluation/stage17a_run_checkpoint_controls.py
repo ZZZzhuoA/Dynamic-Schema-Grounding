@@ -354,6 +354,15 @@ def main():
             ),
             coverage_margin=float(model_config.get("coverage_margin", 0.1)),
             coverage_target_k=int(model_config.get("coverage_target_k", 30)),
+            table_multi_positive_weight=float(
+                model_config.get("table_multi_positive_weight", 0.0)
+            ),
+            table_multi_positive_margin=float(
+                model_config.get("table_multi_positive_margin", 0.1)
+            ),
+            table_multi_positive_hard_negatives=int(
+                model_config.get("table_multi_positive_hard_negatives", 5)
+            ),
             role_mapping={
                 str(key): int(value)
                 for key, value in model_config.get("role_mapping", {}).items()

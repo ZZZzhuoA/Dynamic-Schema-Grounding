@@ -420,6 +420,160 @@ class Stage17AModelTest(unittest.TestCase):
         self.assertTrue(torch.isfinite(loss))
         self.assertGreater(gradient_total, 0.0)
 
+    def test_table_multi_positive_loss_updates_every_gold_sibling(self):
+        torch = self.runtime["torch"]
+        logits = torch.tensor(
+            [0.0, -0.4, -0.2, 0.7, 0.0, -0.1, 0.5], requires_grad=True
+        )
+        labels = torch.tensor([0.0, 1.0, 1.0, 0.0, 0.0, 1.0, 0.0])
+        parents = torch.tensor([0, 0, 0, 0, 4, 4, 4])
+        is_column = torch.tensor([False, True, True, True, False, True, True])
+        loss, diagnostics = TRAINING.table_multi_positive_boundary_loss(
+            logits,
+            labels,
+            parents,
+            is_column,
+            self.runtime,
+            margin=0.1,
+            hard_negatives=5,
+        )
+        loss.backward()
+        self.assertEqual(diagnostics["eligible_table_count"], 2)
+        self.assertEqual(diagnostics["pair_count"], 3)
+        self.assertTrue(torch.all(logits.grad[torch.tensor([1, 2, 5])] < 0))
+        self.assertTrue(torch.all(logits.grad[torch.tensor([3, 6])] > 0))
+        self.assertEqual(float(logits.grad[0]), 0.0)
+        self.assertEqual(float(logits.grad[4]), 0.0)
+
+    def test_table_multi_positive_hard_negative_selection_is_stable(self):
+        torch = self.runtime["torch"]
+        logits = torch.tensor(
+            [0.0, -0.5, 1.0, 1.0, 1.0, 0.2, -0.3, -1.0],
+            requires_grad=True,
+        )
+        labels = torch.tensor([0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+        parents = torch.zeros(8, dtype=torch.long)
+        is_column = torch.tensor([False, True, True, True, True, True, True, True])
+        loss, diagnostics = TRAINING.table_multi_positive_boundary_loss(
+            logits,
+            labels,
+            parents,
+            is_column,
+            self.runtime,
+            hard_negatives=2,
+        )
+        loss.backward()
+        self.assertEqual(diagnostics["pair_count"], 2)
+        self.assertGreater(float(logits.grad[2]), 0.0)
+        self.assertGreater(float(logits.grad[3]), 0.0)
+        self.assertEqual(float(logits.grad[4]), 0.0)
+        self.assertEqual(float(logits.grad[7]), 0.0)
+
+    def test_table_multi_positive_loss_normalizes_per_table(self):
+        torch = self.runtime["torch"]
+        F = self.runtime["F"]
+        logits = torch.tensor([0.0, 0.2, 0.8, 0.0, -0.3, 0.4, 0.1])
+        labels = torch.tensor([0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0])
+        parents = torch.tensor([0, 0, 0, 3, 3, 3, 3])
+        is_column = torch.tensor([False, True, True, False, True, True, True])
+        margin = 0.1
+        loss, diagnostics = TRAINING.table_multi_positive_boundary_loss(
+            logits,
+            labels,
+            parents,
+            is_column,
+            self.runtime,
+            margin=margin,
+            hard_negatives=5,
+        )
+        table_zero = F.softplus(logits[2] - logits[1] + margin)
+        table_three = torch.stack(
+            [
+                F.softplus(logits[5] - logits[4] + margin),
+                F.softplus(logits[6] - logits[4] + margin),
+            ]
+        ).mean()
+        self.assertTrue(torch.allclose(loss, (table_zero + table_three) / 2))
+        self.assertEqual(diagnostics["eligible_table_count"], 2)
+        self.assertEqual(diagnostics["pair_count"], 3)
+
+    def test_table_multi_positive_empty_and_zero_weight_are_exact(self):
+        torch = self.runtime["torch"]
+        logits = torch.tensor([0.3, -0.2], requires_grad=True)
+        labels = torch.tensor([0.0, 1.0])
+        parents = torch.tensor([0, 0])
+        is_column = torch.tensor([False, True])
+        auxiliary, diagnostics = TRAINING.table_multi_positive_boundary_loss(
+            logits, labels, parents, is_column, self.runtime
+        )
+        self.assertEqual(float(auxiliary), 0.0)
+        self.assertEqual(diagnostics["eligible_table_count"], 0)
+
+        output = {"logits": logits}
+        base_args = SimpleNamespace(
+            role_loss_weight=0.0,
+            coverage_surrogate_weight=0.1,
+            coverage_target_k=30,
+            coverage_margin=0.1,
+        )
+        zero_args = SimpleNamespace(
+            **vars(base_args),
+            table_multi_positive_weight=0.0,
+            table_multi_positive_margin=0.1,
+            table_multi_positive_hard_negatives=5,
+        )
+        base_loss = TRAINING.training_loss(output, labels, base_args, self.runtime)
+        zero_loss = TRAINING.training_loss(
+            output,
+            labels,
+            zero_args,
+            self.runtime,
+            column_parent_table=parents,
+            is_column_node=is_column,
+        )
+        self.assertTrue(torch.equal(base_loss, zero_loss))
+
+    def test_table_multi_positive_diagnostics_do_not_enter_predictions(self):
+        example = {**self.aligned_example(), "gold_ids": [0, 1]}
+        relations = TRAINING.relation_mapping([example], [example])
+        args = self.path_args(
+            example, relations, model_type="table_competitive_path_qrgta"
+        )
+        args.table_multi_positive_weight = 0.1
+        args.table_multi_positive_margin = 0.1
+        args.table_multi_positive_hard_negatives = 5
+        args.role_mapping = {}
+        args.role_loss_weight = 0.0
+        model = self.runtime["model"](
+            dense_dim=16,
+            relation_count=len(relations),
+            hidden_dim=16,
+            num_layers=1,
+            num_heads=4,
+            dropout=0.0,
+            model_type="table_competitive_path_qrgta",
+            distance_bucket_count=len(args.distance_buckets),
+            path_signature_count=len(args.path_signatures),
+            competition_hidden_dim=8,
+            competition_dropout=0.0,
+        )
+        metrics, predictions = TRAINING.evaluate(
+            model,
+            [example],
+            self.cache(),
+            relations,
+            args,
+            self.runtime,
+            "cpu",
+            "dev",
+            predictions=True,
+        )
+        diagnostics = metrics["table_multi_positive_diagnostics"]
+        self.assertEqual(diagnostics["eligible_table_count"], 1)
+        self.assertGreater(diagnostics["pair_count"], 0)
+        self.assertNotIn("table_multi_positive_diagnostics", predictions[0])
+        self.assertNotIn("gold_ids", predictions[0])
+
     def test_column_parent_table_tensor_matches_schema_ownership(self):
         example = self.aligned_example()
         parent, is_column, is_table = TRAINING.column_parent_table_tensor(
